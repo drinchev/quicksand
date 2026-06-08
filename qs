@@ -287,9 +287,12 @@ uninstall() {
     info "Uninstalling sandbox '$SANDBOX_NAME'..."
 
     # Best-effort: tear down any running session for this sandbox user.
+    # `|| true` swallows pipefail-induced ERR when the user is already
+    # gone (dscl exits 56 for "no such record").
     local uid
-    if uid=$(dscl . -read "/Users/$QUICKSAND_USER" UniqueID 2>/dev/null | awk '{print $2}') \
-        && [[ -n "$uid" ]]; then
+    uid=$(dscl . -read "/Users/$QUICKSAND_USER" UniqueID 2>/dev/null \
+        | awk '{print $2}' || true)
+    if [[ -n "$uid" ]]; then
         sudo launchctl bootout "user/$uid" 2>/dev/null || true
         sleep 0.2
     fi

@@ -1,21 +1,19 @@
 #!/bin/bash
-# Install Oh My Zsh inside the sandbox.
+# Install Oh My Zsh in the sandbox, then sync host-provided custom
+# themes/plugins from $SHARED_WORKSPACE/_quicksand/custom/oh-my-zsh/ into
+# ~/.oh-my-zsh/custom/.
 #
-# The official one-liner from https://ohmyz.sh, plus `--unattended` (which
-# the upstream installer translates to RUNZSH=no, CHSH=no,
-# OVERWRITE_CONFIRMATION=no). Without --unattended the installer:
-#   - prompts "overwrite .zshrc? [Y/n]"
-#   - runs `chsh` (would prompt for a password — we don't have one)
-#   - exec's into zsh at the end (would replace this profile.d script)
-# All three break unattended runs.
-#
-# Idempotent guard: the installer drops a marker directory at
-# ~/.oh-my-zsh, so we check for that before doing anything.
+# `--unattended` sets RUNZSH=no, CHSH=no, OVERWRITE_CONFIRMATION=no — the
+# three prompts that would otherwise hang or fail (no password for chsh,
+# exec'd zsh would replace this script, .zshrc overwrite prompt).
 set -Eeuo pipefail
 
-if [[ -d "$HOME/.oh-my-zsh" ]]; then
-    exit 0
+if [[ ! -d "$HOME/.oh-my-zsh" ]]; then
+    echo "Installing Oh My Zsh into sandbox..." >&2
+    sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
 fi
 
-echo "Installing Oh My Zsh into sandbox..." >&2
-sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended
+STAGING="${SHARED_WORKSPACE:-/Users/Shared}/_quicksand/custom/oh-my-zsh"
+if [[ -d "$STAGING" && -d "$HOME/.oh-my-zsh/custom" ]]; then
+    /usr/bin/rsync --checksum --recursive --perms --times "$STAGING/" "$HOME/.oh-my-zsh/custom/"
+fi

@@ -77,11 +77,17 @@ Environment:
   QUICKSAND_ARGS       Default arguments, prepended to the command line.
 
 Customization:
-  ~/.config/quicksand/profile.d/*.sh
-                       Personal scripts overlaid on top of the canonical
-                       profile.d/ at build time, run on every session
-                       entry. Use 50-99 prefixes to avoid clashing with
-                       the canonical 10-49 range.
+  ~/.config/quicksand/custom/<subsystem>/
+                       Host-side personal additions, grouped by subsystem.
+                       Synced into the sandbox at build time. Recognised
+                       subdirs:
+                         profile.d/   .sh scripts run after the canonical
+                                      profile.d/ on every session entry
+                                      (use 50-99 prefixes to continue from
+                                      the 10-49 canonical range)
+                         oh-my-zsh/   themes/, plugins/, etc. copied into
+                                      the sandbox's ~/.oh-my-zsh/custom/
+                                      after install
 EOF
     exit 0
 }
@@ -173,10 +179,12 @@ readonly SUDOERS_FILE="/etc/sudoers.d/50-nopasswd-for-$QUICKSAND_USER"
 readonly SANDBOX_PROFILE="/var/quicksand/sandbox-$QUICKSAND_USER.sb"
 readonly INSTALL_DIR="$HOME/.config/quicksand"
 readonly INSTALL_MARKER="$INSTALL_DIR/install-$SANDBOX_NAME"
-# Host-side personal overlay. Anything dropped here is rsync'd on top of
-# the repo's canonical profile.d/ into every sandbox during build.
-# Convention: 50-99 prefixes for personal scripts; 10-49 are canonical.
-readonly QS_HOST_OVERLAY_DIR="$INSTALL_DIR/profile.d"
+# Host-side personal additions. The whole tree is rsync'd verbatim into
+# the sandbox's _quicksand/custom/. Recognised subdirs:
+#   custom/profile.d/   .sh scripts run after canonical (50-99 prefixes)
+#   custom/oh-my-zsh/   staged for ~/.oh-my-zsh/custom/ (applied by 46-*)
+readonly QS_CUSTOM_DIR="$INSTALL_DIR/custom"
+readonly QS_CUSTOM_SANDBOX_DIR="$QS_PRIVATE_DIR/custom"
 readonly HOST_USER="$USER"
 readonly QS_SESSION_ID="$(/usr/bin/uuidgen)"
 
@@ -485,15 +493,12 @@ EOF
         --checksum --recursive --perms --times \
         "$QS_PROFILE_SOURCE_DIR/" "$QS_PROFILE_DIR/"
 
-    # Host overlay (optional). Personal scripts under $QS_HOST_OVERLAY_DIR
-    # land on top — identical filenames overwrite the canonical ones, new
-    # filenames join the lex-sorted run. Auto-detected; absent dir is a
-    # no-op.
-    if [[ -d "$QS_HOST_OVERLAY_DIR" ]]; then
-        debug "Overlaying $QS_HOST_OVERLAY_DIR/ → $QS_PROFILE_DIR/"
+    if [[ -d "$QS_CUSTOM_DIR" ]]; then
+        debug "Syncing $QS_CUSTOM_DIR/ → $QS_CUSTOM_SANDBOX_DIR/"
+        mkdir -p "$QS_CUSTOM_SANDBOX_DIR"
         /usr/bin/rsync \
             --checksum --recursive --perms --times \
-            "$QS_HOST_OVERLAY_DIR/" "$QS_PROFILE_DIR/"
+            "$QS_CUSTOM_DIR/" "$QS_CUSTOM_SANDBOX_DIR/"
     fi
 
     mkdir -p "$INSTALL_DIR"
@@ -534,12 +539,8 @@ INITIAL_DIR_Q="$(quote_zsh_args "${INITIAL_DIR:-/Users/$QUICKSAND_USER}")"
 # (e.g. /tmp/claude) don't collide across sandbox users.
 ZSH_COMMAND="export TMPDIR=\$(mktemp -d); cd $INITIAL_DIR_Q 2>/dev/null || cd ~"
 
-# Run per-session profile scripts (as the sandbox user, inside the
-# sandbox). `*.sh(N)` matches only .sh files; `(N)` is zsh's null-glob
-# qualifier — empty match when no scripts exist. SHARED_WORKSPACE is
-# built from a validated [A-Za-z0-9_-] name so it needs no further
-# quoting.
-ZSH_COMMAND="$ZSH_COMMAND; for s in $SHARED_WORKSPACE/_quicksand/profile.d/*.sh(N); do [[ -x \"\$s\" ]] && \"\$s\"; done"
+# Run per-session profile scripts as the sandbox user.
+ZSH_COMMAND="$ZSH_COMMAND; setopt null_glob; for s in $SHARED_WORKSPACE/_quicksand/profile.d/*.sh $SHARED_WORKSPACE/_quicksand/custom/profile.d/*.sh; do [[ -f \"\$s\" && -x \"\$s\" ]] && \"\$s\"; done"
 
 if [[ "$COMMAND" == "claude" ]]; then
     # sandbox-exec is already restricting file writes to the sandbox home
@@ -583,7 +584,7 @@ QS_GIT_USER_EMAIL="$(git config --global --get user.email 2>/dev/null || true)"
 SANDBOX_PATH="/Users/$QUICKSAND_USER/.local/bin:/Users/$QUICKSAND_USER/.claude/local:/usr/bin:/bin:/usr/sbin:/sbin"
 
 debug "Entering sandbox $QUICKSAND_USER"
-exec sudo --login --set-home --user="$QUICKSAND_USER" \
+exec sudo --set-home --user="$QUICKSAND_USER" \
     /usr/bin/env -i \
         "HOME=/Users/$QUICKSAND_USER" \
         "USER=$QUICKSAND_USER" \

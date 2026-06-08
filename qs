@@ -57,6 +57,7 @@ Usage:
   qs build     NAME [-r]
   qs shell     NAME [PATH] [-- args ...]
   qs claude    NAME [PATH] [-- args ...]
+  qs clone     NAME URL_OR_PATH
   qs uninstall NAME
   qs list
 
@@ -150,19 +151,25 @@ case "$1" in
     l|list)      list_sandboxes; exit 0 ;;
     s|shell)     COMMAND=shell;  needs_name=true  ;;
     cl|claude)   COMMAND=claude; needs_name=true  ;;
+    c|clone)     COMMAND=clone;  needs_name=true  ;;
     b|build)     COMMAND=build;  needs_name=true  ;;
     u|uninstall) COMMAND=uninstall; needs_name=true ;;
     *)           abort "Unknown command: $1 (try: qs --help)" ;;
 esac
 readonly COMMAND
 
+CLONE_SOURCE=""
 if [[ "${needs_name:-false}" == "true" ]]; then
     [[ $# -ge 2 ]] || abort "sandbox name required after '$1' (try: qs --help)"
     validate_sandbox_name "$2"
     SANDBOX_NAME="$2"
-    if [[ "$COMMAND" == "shell" || "$COMMAND" == "claude" ]]; then
-        INITIAL_DIR="${3:-}"
-    fi
+    case "$COMMAND" in
+        shell|claude) INITIAL_DIR="${3:-}" ;;
+        clone)
+            [[ $# -ge 3 ]] || abort "qs clone requires URL or local path (try: qs --help)"
+            CLONE_SOURCE="$3"
+            ;;
+    esac
 fi
 
 
@@ -185,6 +192,8 @@ readonly INSTALL_MARKER="$INSTALL_DIR/install-$SANDBOX_NAME"
 #   custom/oh-my-zsh/   staged for ~/.oh-my-zsh/custom/ (applied by 46-*)
 readonly QS_CUSTOM_DIR="$INSTALL_DIR/custom"
 readonly QS_CUSTOM_SANDBOX_DIR="$QS_PRIVATE_DIR/custom"
+readonly QS_REPOS_DIR="$SHARED_WORKSPACE/repos"
+readonly QS_SSH_DIR="$QS_PRIVATE_DIR/.ssh"
 readonly HOST_USER="$USER"
 readonly QS_SESSION_ID="$(/usr/bin/uuidgen)"
 
@@ -306,6 +315,115 @@ uninstall() {
     rmdir "$SHARED_WORKSPACE" 2>/dev/null || true
     [[ -d "$SHARED_WORKSPACE" ]] && info "Keeping $SHARED_WORKSPACE (not empty)"
     info "Sandbox '$SANDBOX_NAME' removed."
+}
+
+# Clone a git repo into $QS_REPOS_DIR/<reponame>. For GitHub SSH URLs,
+# generates a per-repo ed25519 deploy key and registers it via `gh` (or
+# prints it for manual upload). For local-path sources, derives the URL
+# from the local repo's origin and adds a `quicksand` remote on the host
+# repo pointing at the sandbox copy. Sets CLONE_DEST as a side effect.
+do_clone() {
+    local source="$CLONE_SOURCE"
+    local local_repo="" url
+
+    if [[ -d "$source" ]]; then
+        local_repo="$(cd "$source" && pwd -P)"
+        url="$(git -C "$local_repo" remote get-url origin 2>/dev/null || true)"
+        [[ -n "$url" ]] || abort "Local repo $local_repo has no 'origin' remote — can't clone via network"
+    else
+        url="$source"
+    fi
+
+    # Auto-convert HTTPS GitHub → SSH so deploy-key auth works.
+    if [[ "$url" == https://github.com/* ]]; then
+        local rest="${url#https://github.com/}"
+        rest="${rest%/}"; rest="${rest%.git}"
+        if [[ "$rest" =~ ^([^/]+)/([^/]+)$ ]]; then
+            url="git@github.com:${BASH_REMATCH[1]}/${BASH_REMATCH[2]}.git"
+            debug "Converted to SSH URL: $url"
+        fi
+    fi
+
+    local repo_name
+    repo_name="$(basename "$url" .git)"
+    [[ -n "$repo_name" && "$repo_name" != "/" ]] \
+        || abort "Could not determine repo name from $url"
+
+    CLONE_DEST="$QS_REPOS_DIR/$repo_name"
+    CLONE_LINK="/Users/$QUICKSAND_USER/$repo_name"
+    [[ ! -e "$CLONE_DEST" ]] \
+        || abort "Destination $CLONE_DEST already exists. Run 'qs uninstall $SANDBOX_NAME' to start over, or use a different sandbox name."
+    [[ ! -e "$CLONE_LINK" && ! -L "$CLONE_LINK" ]] \
+        || abort "$CLONE_LINK already exists in the sandbox home — rename it or run 'qs uninstall $SANDBOX_NAME'."
+
+    local ssh_cmd=""
+    if [[ "$url" =~ ^git@github\.com:([^/]+)/([^/]+)\.git$ ]]; then
+        local owner="${BASH_REMATCH[1]}" gh_repo="${BASH_REMATCH[2]}"
+        local owner_repo="$owner/$gh_repo"
+        local key_path="$QS_SSH_DIR/id_ed25519_$repo_name"
+        local pub_path="$key_path.pub"
+
+        mkdir -p "$QS_SSH_DIR"
+        chmod 0700 "$QS_SSH_DIR"
+
+        if [[ ! -f "$key_path" ]]; then
+            info "Generating deploy key for $owner_repo..."
+            ssh-keygen -t ed25519 -f "$key_path" -N "" -q \
+                -C "qs-deploy-${repo_name}@$(hostname)"
+        fi
+        chmod 0600 "$key_path"
+
+        ssh_cmd="ssh -i $key_path -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+
+        local uploaded=false
+        if command -v gh &>/dev/null; then
+            info "Registering deploy key with $owner_repo (write access)..."
+            if gh repo deploy-key add "$pub_path" -R "$owner_repo" \
+                    --title "qs:$SANDBOX_NAME:$repo_name" --allow-write &>/dev/null; then
+                uploaded=true
+            else
+                warn "gh repo deploy-key add failed — gh may not be authenticated, you may lack admin on the repo, or a key with this title already exists."
+            fi
+        fi
+
+        if [[ "$uploaded" == "false" ]]; then
+            echo
+            echo "Add this public key as a deploy key (with write access) at:"
+            echo "  https://github.com/$owner_repo/settings/keys/new"
+            echo
+            cat "$pub_path"
+            echo
+            if [[ -t 0 ]]; then
+                read -r -p "Press Enter once added, or Ctrl-C to abort... " _
+            fi
+        fi
+    else
+        debug "Non-GitHub URL; skipping deploy-key generation"
+    fi
+
+    info "Cloning $url → $CLONE_DEST"
+    mkdir -p "$QS_REPOS_DIR"
+    if [[ -n "$ssh_cmd" ]]; then
+        GIT_SSH_COMMAND="$ssh_cmd" git clone "$url" "$CLONE_DEST"
+        git -C "$CLONE_DEST" config core.sshCommand "$ssh_cmd"
+    else
+        git clone "$url" "$CLONE_DEST"
+    fi
+
+    if [[ -n "$local_repo" ]]; then
+        if git -C "$local_repo" remote | grep -qx quicksand; then
+            git -C "$local_repo" remote set-url quicksand "$CLONE_DEST"
+        else
+            git -C "$local_repo" remote add quicksand "$CLONE_DEST"
+        fi
+        info "Added 'quicksand' remote on $local_repo → $CLONE_DEST"
+    fi
+
+    # Symlink the clone into the sandbox user's home so the in-sandbox
+    # path is short (~/repo). /Users/$QUICKSAND_USER is sandbox-owned
+    # 0750, so we create the link as the sandbox user via the existing
+    # NOPASSWD env entry.
+    sudo --user="$QUICKSAND_USER" /usr/bin/env ln -sfn "$CLONE_DEST" "$CLONE_LINK"
 }
 
 
@@ -507,6 +625,20 @@ fi
 
 if [[ "$COMMAND" == "build" ]]; then
     info "Sandbox '$SANDBOX_NAME' ready."
+    exit 0
+fi
+
+if [[ "$COMMAND" == "clone" ]]; then
+    (( ${#COMMAND_ARGS[@]} == 0 )) \
+        || abort "qs clone doesn't accept '--' args; clone returns to the host shell"
+    do_clone
+    info ""
+    info "Cloned to:    $CLONE_DEST"
+    info "Sandbox path: $CLONE_LINK (symlink)"
+    info ""
+    info "Enter the sandbox with:"
+    info "  qs shell  $SANDBOX_NAME $CLONE_LINK"
+    info "  qs claude $SANDBOX_NAME $CLONE_LINK"
     exit 0
 fi
 

@@ -1,0 +1,54 @@
+;; quicksand sandbox-exec profile
+;; Edit this file in the repo. qs renders a per-sandbox copy under
+;; /var/quicksand/ on every build; the rendered copy is overwritten.
+
+(version 1)
+(allow default)
+
+;; Block all writes by default, then re-allow specific subpaths below.
+(deny file-write*
+    (subpath "/"))
+
+;; Hide removable volumes; keep the boot volume readable via /Volumes.
+(deny file-read*
+    (subpath "/Volumes"))
+(allow file-read*
+    (subpath "/Volumes/Macintosh HD"))
+
+;; Raw disks and packet capture — denied even though POSIX perms already
+;; block them. Defense in depth.
+(deny file-read* file-write*
+    (regex #"^/dev/r?disk")
+    (regex #"^/private/dev/r?disk")
+    (regex #"^/dev/bpf"))
+
+;; Hide other users' homes; re-allow only this sandbox user's home and
+;; the shared workspace. The literal /Users and /Users/Shared re-allows
+;; grant lookup so path traversal into the allowed subpaths still works.
+(deny file-read*
+    (subpath "/Users"))
+(allow file-read*
+    (literal "/Users")
+    (literal "/Users/Shared")
+    (subpath "@SHARED_WORKSPACE@")
+    (subpath "@QUICKSAND_USER_HOME@"))
+
+;; System.keychain is world-readable on stock macOS; deny is load-bearing.
+(deny file-read*
+    (subpath "/Library/Keychains"))
+
+(allow file-write*
+    (subpath "@SHARED_WORKSPACE@")
+    (subpath "@QUICKSAND_USER_HOME@")
+    (subpath "/tmp")
+    (subpath "/private/tmp")
+    (subpath "/var/folders")
+    (subpath "/private/var/folders")
+    (subpath "/dev"))
+
+(allow process-info*)
+(allow sysctl-read)
+(allow process*)
+(allow process-exec
+    (literal "/bin/ps")
+    (with no-sandbox))

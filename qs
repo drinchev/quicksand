@@ -19,6 +19,7 @@ while [[ -L "$QS_SOURCE" ]]; do
 done
 readonly QS_REPO_DIR="$(cd -P "$(dirname "$QS_SOURCE")" && pwd -P)"
 readonly QS_PROFILE_SOURCE_DIR="$QS_REPO_DIR/profile.d"
+readonly QS_SANDBOX_PROFILE_TEMPLATE="$QS_REPO_DIR/config/sandbox.sb"
 
 QS_VERBOSE="${QS_VERBOSE:-0}"
 abort() { echo >&2 "ERROR: $*"; exit 1; }
@@ -524,65 +525,17 @@ EOF
         abort "Failed to create valid sudoers file"
     fi
 
-    # Sandbox profile
+    # Sandbox profile — render from config/sandbox.sb template into
+    # /var/quicksand/sandbox-qs-NAME.sb with per-sandbox paths substituted.
     debug "Writing sandbox profile"
+    [[ -f "$QS_SANDBOX_PROFILE_TEMPLATE" ]] \
+        || abort "Sandbox profile template missing at $QS_SANDBOX_PROFILE_TEMPLATE"
     sudo mkdir -p "$(dirname "$SANDBOX_PROFILE")"
     sudo /bin/chmod 0755 "$(dirname "$SANDBOX_PROFILE")"
-    heredoc SANDBOX_PROFILE_CONTENT <<EOF
-;; quicksand sandbox profile for $QUICKSAND_USER
-(version 1)
-(allow default)
-
-;; Block all writes by default, then re-allow specific subpaths below.
-(deny file-write*
-    (subpath "/"))
-
-;; Hide removable volumes; keep the boot volume readable via /Volumes.
-(deny file-read*
-    (subpath "/Volumes"))
-(allow file-read*
-    (subpath "/Volumes/Macintosh HD"))
-
-;; Raw disks and packet capture — denied even though POSIX perms already
-;; block them. Defense in depth.
-(deny file-read* file-write*
-    (regex #"^/dev/r?disk")
-    (regex #"^/private/dev/r?disk")
-    (regex #"^/dev/bpf"))
-
-;; Hide other users' homes; re-allow only this sandbox user's home and the
-;; shared workspace. The literal /Users and /Users/Shared re-allows grant
-;; lookup so path traversal into the allowed subpaths still works.
-(deny file-read*
-    (subpath "/Users"))
-(allow file-read*
-    (literal "/Users")
-    (literal "/Users/Shared")
-    (subpath "$SHARED_WORKSPACE")
-    (subpath "/Users/$QUICKSAND_USER"))
-
-;; System.keychain is world-readable on stock macOS; deny is load-bearing.
-(deny file-read*
-    (subpath "/Library/Keychains"))
-
-(allow file-write*
-    (subpath "$SHARED_WORKSPACE")
-    (subpath "/Users/$QUICKSAND_USER")
-    (subpath "/tmp")
-    (subpath "/private/tmp")
-    (subpath "/var/folders")
-    (subpath "/private/var/folders")
-    (subpath "/dev"))
-
-(allow process-info*)
-(allow sysctl-read)
-(allow process*)
-(allow process-exec
-    (literal "/bin/ps")
-    (with no-sandbox))
-EOF
-    # shellcheck disable=SC2154 # set by heredoc above
-    echo "$SANDBOX_PROFILE_CONTENT" | sudo tee "$SANDBOX_PROFILE" > /dev/null
+    sed -e "s|@SHARED_WORKSPACE@|$SHARED_WORKSPACE|g" \
+        -e "s|@QUICKSAND_USER_HOME@|/Users/$QUICKSAND_USER|g" \
+        "$QS_SANDBOX_PROFILE_TEMPLATE" \
+        | sudo tee "$SANDBOX_PROFILE" > /dev/null
     sudo /bin/chmod 0444 "$SANDBOX_PROFILE"
 
     # Home directory

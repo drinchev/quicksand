@@ -187,6 +187,11 @@ readonly SUDOERS_FILE="/etc/sudoers.d/50-nopasswd-for-$QUICKSAND_USER"
 readonly SANDBOX_PROFILE="/var/quicksand/sandbox-$QUICKSAND_USER.sb"
 readonly INSTALL_DIR="$HOME/.config/quicksand"
 readonly INSTALL_MARKER="$INSTALL_DIR/install-$SANDBOX_NAME"
+# Host-side record of `qs clone` artifacts that outlive the sandbox (GitHub
+# deploy keys, `quicksand` remotes on host repos), consumed by uninstall.
+# One tab-separated line per clone: REPO_NAME\tOWNER/REPO\tLOCAL_REPO_PATH
+# (fields 2 and 3 may be empty).
+readonly QS_CLONES_MANIFEST="$INSTALL_DIR/clones-$SANDBOX_NAME"
 # Host-side personal additions. The whole tree is rsync'd verbatim into
 # the sandbox's _quicksand/custom/. Recognised subdirs:
 #   custom/profile.d/   .sh scripts run after canonical (50-99 prefixes)
@@ -284,8 +289,59 @@ acquire_id_lock() {
 }
 release_id_lock() { rm -rf "$QS_ID_LOCK_DIR"; trap - EXIT; }
 
+# Best-effort: delete the deploy key with exactly this title from a GitHub
+# repo. Never fails the caller — on any problem, points at the repo's key
+# settings page so the user can finish by hand.
+delete_deploy_key() {
+    local owner_repo="$1" title="$2"
+    local keys_url="https://github.com/$owner_repo/settings/keys"
+    if ! command -v gh &>/dev/null; then
+        warn "gh not available — if a deploy key '$title' exists, remove it at $keys_url"
+        return 0
+    fi
+    local listing
+    if ! listing="$(gh repo deploy-key list -R "$owner_repo" \
+            --json id,title --jq '.[] | [.id, .title] | @tsv' 2>/dev/null)"; then
+        warn "Could not list deploy keys for $owner_repo — if '$title' exists, remove it at $keys_url"
+        return 0
+    fi
+    local key_id key_title
+    while IFS=$'\t' read -r key_id key_title; do
+        [[ "$key_title" == "$title" ]] || continue
+        if gh repo deploy-key delete "$key_id" -R "$owner_repo" &>/dev/null; then
+            info "Removed deploy key '$title' from $owner_repo"
+        else
+            warn "Failed to delete deploy key '$title' (id $key_id) from $owner_repo — remove it at $keys_url"
+        fi
+    done <<< "$listing"
+}
+
+# Undo host-side artifacts recorded at clone time: deploy keys registered
+# on GitHub and `quicksand` remotes added to host repos.
+cleanup_clone_artifacts() {
+    [[ -f "$QS_CLONES_MANIFEST" ]] || return 0
+    local repo_name owner_repo local_repo remote_url
+    while IFS=$'\t' read -r repo_name owner_repo local_repo; do
+        [[ -n "$repo_name" ]] || continue
+        [[ -z "$owner_repo" ]] \
+            || delete_deploy_key "$owner_repo" "qs:$SANDBOX_NAME:$repo_name"
+        if [[ -n "$local_repo" && -d "$local_repo" ]]; then
+            # Only touch the remote if it still points into this sandbox.
+            remote_url="$(git -C "$local_repo" remote get-url quicksand 2>/dev/null || true)"
+            if [[ "$remote_url" == "$QS_REPOS_DIR/"* ]]; then
+                git -C "$local_repo" remote remove quicksand 2>/dev/null \
+                    && info "Removed 'quicksand' remote from $local_repo" \
+                    || warn "Could not remove 'quicksand' remote from $local_repo"
+            fi
+        fi
+    done < "$QS_CLONES_MANIFEST"
+    rm -f "$QS_CLONES_MANIFEST"
+}
+
 uninstall() {
     info "Uninstalling sandbox '$SANDBOX_NAME'..."
+
+    cleanup_clone_artifacts
 
     # Best-effort: tear down any running session for this sandbox user.
     # `|| true` swallows pipefail-induced ERR when the user is already
@@ -319,6 +375,16 @@ uninstall() {
     rmdir "$SHARED_WORKSPACE" 2>/dev/null || true
     [[ -d "$SHARED_WORKSPACE" ]] && info "Keeping $SHARED_WORKSPACE (not empty)"
     info "Sandbox '$SANDBOX_NAME' removed."
+}
+
+# Append a clone record to the manifest (see QS_CLONES_MANIFEST) so
+# uninstall can clean up after it. Idempotent: skips exact duplicates.
+record_clone() {
+    local entry
+    entry="$(printf '%s\t%s\t%s' "$1" "$2" "$3")"
+    mkdir -p "$INSTALL_DIR"
+    grep -qxF "$entry" "$QS_CLONES_MANIFEST" 2>/dev/null \
+        || echo "$entry" >> "$QS_CLONES_MANIFEST"
 }
 
 # Clone a git repo into $QS_REPOS_DIR/<reponame>. For GitHub SSH URLs,
@@ -360,10 +426,10 @@ do_clone() {
     [[ ! -e "$CLONE_LINK" && ! -L "$CLONE_LINK" ]] \
         || abort "$CLONE_LINK already exists in the sandbox home — rename it or run 'qs uninstall $SANDBOX_NAME'."
 
-    local ssh_cmd=""
+    local ssh_cmd="" owner_repo=""
     if [[ "$url" =~ ^git@github\.com:([^/]+)/([^/]+)\.git$ ]]; then
         local owner="${BASH_REMATCH[1]}" gh_repo="${BASH_REMATCH[2]}"
-        local owner_repo="$owner/$gh_repo"
+        owner_repo="$owner/$gh_repo"
         local key_path="$QS_SSH_DIR/id_ed25519_$repo_name"
         local pub_path="$key_path.pub"
 
@@ -404,6 +470,10 @@ do_clone() {
     else
         debug "Non-GitHub URL; skipping deploy-key generation"
     fi
+
+    # Recorded before the clone so a failed clone still leaves a manifest
+    # entry covering the deploy key registered above.
+    record_clone "$repo_name" "$owner_repo" "$local_repo"
 
     info "Cloning $url → $CLONE_DEST"
     mkdir -p "$QS_REPOS_DIR"

@@ -600,10 +600,25 @@ EOF
     debug "Writing sandbox profile"
     [[ -f "$QS_SANDBOX_PROFILE_TEMPLATE" ]] \
         || abort "Sandbox profile template missing at $QS_SANDBOX_PROFILE_TEMPLATE"
+
+    # The boot volume's /Volumes entry must survive the profile's
+    # /Volumes deny, and the volume can be renamed or localized.
+    # A name with a double quote would corrupt the rendered profile;
+    # fall back to the stock name rather than break sandbox-exec.
+    BOOT_VOLUME="$(diskutil info -plist / 2>/dev/null \
+        | plutil -extract VolumeName raw - 2>/dev/null || true)"
+    if [[ -z "$BOOT_VOLUME" || "$BOOT_VOLUME" == *'"'* ]]; then
+        warn "Could not determine boot volume name; assuming 'Macintosh HD'"
+        BOOT_VOLUME="Macintosh HD"
+    fi
+    # Escape sed-replacement metacharacters (\ & and the | delimiter).
+    BOOT_VOLUME_SED="$(printf '%s' "$BOOT_VOLUME" | sed -e 's/[\\&|]/\\&/g')"
+
     sudo mkdir -p "$(dirname "$SANDBOX_PROFILE")"
     sudo /bin/chmod 0755 "$(dirname "$SANDBOX_PROFILE")"
     sed -e "s|@SHARED_WORKSPACE@|$SHARED_WORKSPACE|g" \
         -e "s|@QUICKSAND_USER_HOME@|/Users/$QUICKSAND_USER|g" \
+        -e "s|@BOOT_VOLUME@|$BOOT_VOLUME_SED|g" \
         "$QS_SANDBOX_PROFILE_TEMPLATE" \
         | sudo tee "$SANDBOX_PROFILE" > /dev/null
     sudo /bin/chmod 0444 "$SANDBOX_PROFILE"

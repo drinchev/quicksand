@@ -10,10 +10,12 @@
     (subpath "/"))
 
 ;; Hide removable volumes; keep the boot volume readable via /Volumes.
+;; The volume name is resolved at build time (it can be renamed by the
+;; user or localized by macOS).
 (deny file-read*
     (subpath "/Volumes"))
 (allow file-read*
-    (subpath "/Volumes/Macintosh HD"))
+    (subpath "/Volumes/@BOOT_VOLUME@"))
 
 ;; Raw disks and packet capture — denied even though POSIX perms already
 ;; block them. Defense in depth.

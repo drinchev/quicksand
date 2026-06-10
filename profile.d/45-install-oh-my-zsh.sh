@@ -17,3 +17,18 @@ STAGING="${SHARED_WORKSPACE:-/Users/Shared}/_quicksand/custom/oh-my-zsh"
 if [[ -d "$STAGING" && -d "$HOME/.oh-my-zsh/custom" ]]; then
     /usr/bin/rsync --checksum --recursive --perms --times "$STAGING/" "$HOME/.oh-my-zsh/custom/"
 fi
+
+# Disable omz's automatic terminal/tab title. Its termsupport library
+# re-asserts the title on every prompt, which would clobber a title you
+# set by hand (e.g. printf '\e]0;my tab\a'). The installer's default
+# .zshrc ships this setting commented out, so uncomment it; if it isn't
+# present (e.g. a hand-edited .zshrc), append it. Runs every session — not
+# just on first install — so existing sandboxes pick it up too. Idempotent.
+ZSHRC="$HOME/.zshrc"
+if [[ -f "$ZSHRC" ]] && ! grep -q '^[[:space:]]*DISABLE_AUTO_TITLE="true"' "$ZSHRC"; then
+    if grep -q '^[[:space:]]*#[[:space:]]*DISABLE_AUTO_TITLE="true"' "$ZSHRC"; then
+        sed -i '' 's/^[[:space:]]*#[[:space:]]*DISABLE_AUTO_TITLE="true"/DISABLE_AUTO_TITLE="true"/' "$ZSHRC"
+    else
+        printf '\nDISABLE_AUTO_TITLE="true"\n' >> "$ZSHRC"
+    fi
+fi

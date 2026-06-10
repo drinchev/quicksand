@@ -9,6 +9,7 @@ setup() {
     mkdir -p "$REPO_COPY"
     cp "$BATS_TEST_DIRNAME/../qs" "$REPO_COPY/qs"
     cp -R "$BATS_TEST_DIRNAME/../profile.d" "$REPO_COPY/profile.d"
+    cp -R "$BATS_TEST_DIRNAME/../logout.d" "$REPO_COPY/logout.d"
     cp -R "$BATS_TEST_DIRNAME/../config" "$REPO_COPY/config"
     QS="$REPO_COPY/qs"
     STUBS="$BATS_TEST_TMPDIR/stubs"

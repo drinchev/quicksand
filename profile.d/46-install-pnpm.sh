@@ -9,31 +9,34 @@
 # clobbered by omz's rewrite.
 set -Eeuo pipefail
 
-needs_install=true
-command -v pnpm >/dev/null 2>&1 && needs_install=false
-for p in "$HOME/Library/pnpm/pnpm" "$HOME/.local/share/pnpm/pnpm" "$HOME/.pnpm/pnpm"; do
-    [[ -x "$p" ]] && { needs_install=false; break; }
-done
+# One source of truth for locating pnpm, used both for the "already
+# installed?" check and for invoking it afterwards. pnpm ≥10 installs
+# the CLI at $PNPM_HOME/bin/pnpm; older standalone installers used
+# $PNPM_HOME/pnpm directly.
+find_pnpm() {
+    command -v pnpm 2>/dev/null && return 0
+    local p
+    for p in "$HOME/Library/pnpm/bin/pnpm" "$HOME/Library/pnpm/pnpm" \
+             "$HOME/.local/share/pnpm/pnpm" "$HOME/.pnpm/pnpm"; do
+        [[ -x "$p" ]] && { echo "$p"; return 0; }
+    done
+    return 1
+}
 
-if [[ "$needs_install" == "true" ]]; then
+PNPM="$(find_pnpm || true)"
+if [[ -z "$PNPM" ]]; then
     echo "Installing pnpm into sandbox..." >&2
     curl -fsSL https://get.pnpm.io/install.sh | sh -
+    PNPM="$(find_pnpm || true)"
 fi
+
+[[ -n "$PNPM" ]] || { echo "pnpm not found after install" >&2; exit 1; }
 
 export PNPM_HOME="$HOME/Library/pnpm"
 case ":$PATH:" in
   *":$PNPM_HOME/bin:"*) ;;
   *) export PATH="$PNPM_HOME/bin:$PATH" ;;
 esac
-
-PNPM="$(command -v pnpm 2>/dev/null || true)"
-if [[ -z "$PNPM" ]]; then
-    for p in "$HOME/Library/pnpm/bin/pnpm" "$HOME/.local/share/pnpm/pnpm" "$HOME/.pnpm/pnpm"; do
-        [[ -x "$p" ]] && { PNPM="$p"; break; }
-    done
-fi
-
-[[ -n "$PNPM" ]] || { echo "pnpm not found after install" >&2; exit 1; }
 
 # Node already provisioned by a previous session — skip the (network)
 # call to pnpm entirely.

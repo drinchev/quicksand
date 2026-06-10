@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  ci:
+    # qs is macOS-only (dscl, sandbox-exec, BSD stat); the tests stub the
+    # privileged parts but still need the BSD userland.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: brew install shellcheck bats-core
+
+      - name: Lint
+        run: shellcheck qs profile.d/*.sh
+
+      - name: Test
+        run: bats tests

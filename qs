@@ -20,7 +20,8 @@ while [[ -L "$QS_SOURCE" ]]; do
     QS_SOURCE="$(readlink "$QS_SOURCE")"
     [[ "$QS_SOURCE" = /* ]] || QS_SOURCE="$QS_SOURCE_DIR/$QS_SOURCE"
 done
-readonly QS_REPO_DIR="$(cd -P "$(dirname "$QS_SOURCE")" && pwd -P)"
+QS_REPO_DIR="$(cd -P "$(dirname "$QS_SOURCE")" && pwd -P)"
+readonly QS_REPO_DIR
 readonly QS_PROFILE_SOURCE_DIR="$QS_REPO_DIR/profile.d"
 readonly QS_SANDBOX_PROFILE_TEMPLATE="$QS_REPO_DIR/config/sandbox.sb"
 
@@ -221,7 +222,8 @@ derive_constants() {
     readonly QS_REPOS_DIR="$SHARED_WORKSPACE/repos"
     readonly QS_SSH_DIR="$QS_PRIVATE_DIR/.ssh"
     readonly HOST_USER="$USER"
-    readonly QS_SESSION_ID="$(/usr/bin/uuidgen)"
+    QS_SESSION_ID="$(/usr/bin/uuidgen)"
+    readonly QS_SESSION_ID
 
     # Two ACEs per directory + one per file: prevents files from inheriting
     # search/list (which on a file means execute) from their parent.
@@ -230,6 +232,7 @@ derive_constants() {
     readonly QS_FILE_RIGHTS="group:$QUICKSAND_GROUP allow read,write,append,delete,readattr,writeattr,readextattr,writeextattr,readsecurity,writesecurity,chown"
 
     # Translate ~ in PATH arg to the sandbox user's home, then resolve symlinks.
+    # shellcheck disable=SC2088 # literal-tilde comparison is the point
     if [[ "$INITIAL_DIR" == "~" ]]; then
         INITIAL_DIR="/Users/$QUICKSAND_USER"
     elif [[ "${INITIAL_DIR:0:2}" == "~/" ]]; then
@@ -240,7 +243,8 @@ derive_constants() {
 
     # Force a (re)build when the marker is missing or the recorded config
     # fingerprint no longer matches the repo (except when uninstalling).
-    readonly QS_CONFIG_FINGERPRINT="$(config_fingerprint)"
+    QS_CONFIG_FINGERPRINT="$(config_fingerprint)"
+    readonly QS_CONFIG_FINGERPRINT
     REBUILD_REASON=""
     if [[ "$COMMAND" != "uninstall" ]]; then
         if [[ "$REBUILD" == "true" ]]; then
@@ -353,8 +357,16 @@ delete_deploy_key() {
 # on GitHub and `quicksand` remotes added to host repos.
 cleanup_clone_artifacts() {
     [[ -f "$QS_CLONES_MANIFEST" ]] || return 0
-    local repo_name owner_repo local_repo remote_url
-    while IFS=$'\t' read -r repo_name owner_repo local_repo; do
+    local line rest repo_name owner_repo local_repo remote_url
+    while IFS= read -r line; do
+        # Split by hand: tab is IFS whitespace, so `IFS=$'\t' read` would
+        # collapse an empty middle field (non-GitHub clone with a local
+        # source path) and shift the remaining fields left.
+        [[ "$line" == *$'\t'*$'\t'* ]] || continue
+        repo_name="${line%%$'\t'*}"
+        rest="${line#*$'\t'}"
+        owner_repo="${rest%%$'\t'*}"
+        local_repo="${rest#*$'\t'}"
         [[ -n "$repo_name" ]] || continue
         [[ -z "$owner_repo" ]] \
             || delete_deploy_key "$owner_repo" "qs:$SANDBOX_NAME:$repo_name"
@@ -362,9 +374,11 @@ cleanup_clone_artifacts() {
             # Only touch the remote if it still points into this sandbox.
             remote_url="$(git -C "$local_repo" remote get-url quicksand 2>/dev/null || true)"
             if [[ "$remote_url" == "$QS_REPOS_DIR/"* ]]; then
-                git -C "$local_repo" remote remove quicksand 2>/dev/null \
-                    && info "Removed 'quicksand' remote from $local_repo" \
-                    || warn "Could not remove 'quicksand' remote from $local_repo"
+                if git -C "$local_repo" remote remove quicksand 2>/dev/null; then
+                    info "Removed 'quicksand' remote from $local_repo"
+                else
+                    warn "Could not remove 'quicksand' remote from $local_repo"
+                fi
             fi
         fi
     done < "$QS_CLONES_MANIFEST"
@@ -863,4 +877,8 @@ main() {
     esac
 }
 
-main "$@"
+# Run only when executed, not when sourced (the test suite sources qs
+# to call individual functions directly).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

@@ -3,6 +3,9 @@
 # Creates a per-named sandbox user (qs-NAME) and runs zsh as that user
 # under sandbox-exec with read/write restricted to its home and a shared
 # workspace.
+#
+# Structure: prelude (runs at load) → helpers → parse_args →
+# derive_constants → shared helpers → cmd_* functions → main (at bottom).
 set -Eeuo pipefail
 trap 'echo >&2 "${BASH_SOURCE[0]}: line $LINENO: $BASH_COMMAND: exitcode $?"' ERR
 
@@ -32,6 +35,10 @@ trace() { (( QS_VERBOSE >= 3 )) && echo "$*" || true; }
 [[ $EUID -ne 0 ]]               || abort "this script should not be run as root"
 [[ -z "${QS_SESSION_ID:-}" ]]   || abort "already inside a quicksand sandbox"
 
+
+###############################################################################
+# Generic helpers
+###############################################################################
 heredoc() { IFS=$'\n' read -r -d '' "${1}" || true; }
 
 # Quote args for safe interpolation into a `/bin/zsh -c` string.
@@ -115,23 +122,10 @@ EOF
     exit 0
 }
 
-list_sandboxes() {
-    echo "Sandboxes:"
-    local home name found=false
-    shopt -s nullglob
-    for home in /Users/qs-*/; do
-        name="${home#/Users/qs-}"
-        name="${name%/}"
-        printf "  %s\n" "$name"
-        found=true
-    done
-    shopt -u nullglob
-    [[ "$found" == "true" ]] || echo "  (none — run 'qs build <NAME>')"
-}
-
 
 ###############################################################################
-# Argument parsing
+# Argument parsing — sets COMMAND, SANDBOX_NAME, CLONE_SOURCE, INITIAL_DIR,
+# COMMAND_ARGS and the option flags as globals.
 ###############################################################################
 REBUILD=false
 NO_BUILD=false
@@ -140,133 +134,139 @@ SANDBOX_NAME=""
 COMMAND=""
 COMMAND_ARGS=()
 INITIAL_DIR=""
-
-if [[ -n "${QUICKSAND_ARGS:-}" ]]; then
-    qs_args_array=()
-    while IFS= read -r arg; do qs_args_array+=("$arg"); done \
-        < <(xargs -n1 printf '%s\n' <<< "$QUICKSAND_ARGS")
-    set -- "${qs_args_array[@]}" "$@"
-fi
-
-NEW_ARGS=()
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --) shift; while [[ $# -gt 0 ]]; do COMMAND_ARGS+=("$1"); shift; done; break ;;
-        -r|--rebuild)    REBUILD=true; shift ;;
-        -n|--no-build)   NO_BUILD=true; shift ;;
-        -x|--no-sandbox) USE_SANDBOX=false; shift ;;
-        -v|--verbose)    ((QS_VERBOSE++)) || true; shift ;;
-        -vv)             ((QS_VERBOSE+=2)) || true; shift ;;
-        -vvv)            ((QS_VERBOSE+=3)) || true; shift ;;
-        --version) show_version ;;
-        -h|--help) show_help ;;
-        -*) abort "Unknown option: $1" ;;
-        *)  NEW_ARGS+=("$1"); shift ;;
-    esac
-done
-if (( ${#NEW_ARGS[@]} > 0 )); then set -- "${NEW_ARGS[@]}"; else set --; fi
-
-# Form: qs COMMAND [NAME [PATH]]
-[[ $# -ge 1 ]] || show_help
-
-case "$1" in
-    l|list)      list_sandboxes; exit 0 ;;
-    s|shell)     COMMAND=shell;  needs_name=true  ;;
-    cl|claude)   COMMAND=claude; needs_name=true  ;;
-    c|clone)     COMMAND=clone;  needs_name=true  ;;
-    b|build)     COMMAND=build;  needs_name=true  ;;
-    u|uninstall) COMMAND=uninstall; needs_name=true ;;
-    *)           abort "Unknown command: $1 (try: qs --help)" ;;
-esac
-readonly COMMAND
-
 CLONE_SOURCE=""
-if [[ "${needs_name:-false}" == "true" ]]; then
-    [[ $# -ge 2 ]] || abort "sandbox name required after '$1' (try: qs --help)"
-    validate_sandbox_name "$2"
-    SANDBOX_NAME="$2"
-    case "$COMMAND" in
-        shell|claude) INITIAL_DIR="${3:-}" ;;
-        clone)
-            [[ $# -ge 3 ]] || abort "qs clone requires URL or local path (try: qs --help)"
-            CLONE_SOURCE="$3"
-            ;;
-    esac
-fi
 
-
-###############################################################################
-# Sandbox identifiers
-###############################################################################
-readonly SANDBOX_NAME
-readonly QUICKSAND_USER="qs-$SANDBOX_NAME"
-readonly QUICKSAND_GROUP="qs-$SANDBOX_NAME"
-readonly SHARED_WORKSPACE="/Users/Shared/qs-$SANDBOX_NAME"
-readonly QS_PRIVATE_DIR="$SHARED_WORKSPACE/_quicksand"
-readonly QS_PROFILE_DIR="$QS_PRIVATE_DIR/profile.d"
-readonly SUDOERS_FILE="/etc/sudoers.d/50-nopasswd-for-$QUICKSAND_USER"
-readonly SANDBOX_PROFILE="/var/quicksand/sandbox-$QUICKSAND_USER.sb"
-readonly INSTALL_DIR="$HOME/.config/quicksand"
-readonly INSTALL_MARKER="$INSTALL_DIR/install-$SANDBOX_NAME"
-# Host-side record of `qs clone` artifacts that outlive the sandbox (GitHub
-# deploy keys, `quicksand` remotes on host repos), consumed by uninstall.
-# One tab-separated line per clone: REPO_NAME\tOWNER/REPO\tLOCAL_REPO_PATH
-# (fields 2 and 3 may be empty).
-readonly QS_CLONES_MANIFEST="$INSTALL_DIR/clones-$SANDBOX_NAME"
-# Host-side personal additions. The whole tree is rsync'd verbatim into
-# the sandbox's _quicksand/custom/. Recognised subdirs:
-#   custom/profile.d/   .sh scripts run after canonical (50-99 prefixes)
-#   custom/oh-my-zsh/   staged for ~/.oh-my-zsh/custom/ (applied by 46-*)
-readonly QS_CUSTOM_DIR="$INSTALL_DIR/custom"
-readonly QS_CUSTOM_SANDBOX_DIR="$QS_PRIVATE_DIR/custom"
-readonly QS_REPOS_DIR="$SHARED_WORKSPACE/repos"
-readonly QS_SSH_DIR="$QS_PRIVATE_DIR/.ssh"
-readonly HOST_USER="$USER"
-readonly QS_SESSION_ID="$(/usr/bin/uuidgen)"
-
-# Two ACEs per directory + one per file: prevents files from inheriting
-# search/list (which on a file means execute) from their parent.
-readonly QS_DIR_RIGHTS="group:$QUICKSAND_GROUP allow read,write,append,delete,delete_child,readattr,writeattr,readextattr,writeextattr,readsecurity,writesecurity,chown,search,list,directory_inherit"
-readonly QS_FILE_INHERIT_RIGHTS="group:$QUICKSAND_GROUP allow read,write,append,delete,readattr,writeattr,readextattr,writeextattr,readsecurity,writesecurity,chown,file_inherit,directory_inherit,only_inherit"
-readonly QS_FILE_RIGHTS="group:$QUICKSAND_GROUP allow read,write,append,delete,readattr,writeattr,readextattr,writeextattr,readsecurity,writesecurity,chown"
-
-# Translate ~ in PATH arg to the sandbox user's home, then resolve symlinks.
-if [[ "$INITIAL_DIR" == "~" ]]; then
-    INITIAL_DIR="/Users/$QUICKSAND_USER"
-elif [[ "${INITIAL_DIR:0:2}" == "~/" ]]; then
-    INITIAL_DIR="/Users/$QUICKSAND_USER/${INITIAL_DIR:2}"
-fi
-INITIAL_DIR="$(cd "${INITIAL_DIR:-$PWD}" 2>/dev/null && pwd -P || echo "$INITIAL_DIR")"
-readonly INITIAL_DIR
-
-# Force a (re)build when the marker is missing or the recorded config
-# fingerprint no longer matches the repo (except when uninstalling).
-readonly QS_CONFIG_FINGERPRINT="$(config_fingerprint)"
-REBUILD_REASON=""
-if [[ "$COMMAND" != "uninstall" ]]; then
-    if [[ "$REBUILD" == "true" ]]; then
-        REBUILD_REASON="rebuild requested"
-    elif [[ ! -f "$INSTALL_MARKER" ]]; then
-        REBUILD=true
-        REBUILD_REASON="not installed yet"
-        QS_VERBOSE=$(( QS_VERBOSE > 1 ? QS_VERBOSE : 1 ))
-    elif [[ "$(head -n1 "$INSTALL_MARKER" 2>/dev/null)" != "$QS_CONFIG_FINGERPRINT" ]]; then
-        REBUILD=true
-        REBUILD_REASON="configuration changed since last build"
+parse_args() {
+    if [[ -n "${QUICKSAND_ARGS:-}" ]]; then
+        local qs_args_array=() arg
+        while IFS= read -r arg; do qs_args_array+=("$arg"); done \
+            < <(xargs -n1 printf '%s\n' <<< "$QUICKSAND_ARGS")
+        set -- "${qs_args_array[@]}" "$@"
     fi
-fi
 
-if [[ "$NO_BUILD" == "true" ]]; then
-    [[ "$COMMAND" != "build" ]]    || abort "refusing build with --no-build set"
-    [[ "$COMMAND" != "uninstall" ]] || abort "refusing uninstall with --no-build set"
-    [[ "$REBUILD" == "false" ]] \
-        || abort "sandbox '$SANDBOX_NAME' needs a build ($REBUILD_REASON) but --no-build is set"
-fi
-readonly NO_BUILD REBUILD REBUILD_REASON USE_SANDBOX
+    local new_args=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --) shift; while [[ $# -gt 0 ]]; do COMMAND_ARGS+=("$1"); shift; done; break ;;
+            -r|--rebuild)    REBUILD=true; shift ;;
+            -n|--no-build)   NO_BUILD=true; shift ;;
+            -x|--no-sandbox) USE_SANDBOX=false; shift ;;
+            -v|--verbose)    ((QS_VERBOSE++)) || true; shift ;;
+            -vv)             ((QS_VERBOSE+=2)) || true; shift ;;
+            -vvv)            ((QS_VERBOSE+=3)) || true; shift ;;
+            --version) show_version ;;
+            -h|--help) show_help ;;
+            -*) abort "Unknown option: $1" ;;
+            *)  new_args+=("$1"); shift ;;
+        esac
+    done
+    if (( ${#new_args[@]} > 0 )); then set -- "${new_args[@]}"; else set --; fi
+
+    # Form: qs COMMAND [NAME [PATH]]
+    [[ $# -ge 1 ]] || show_help
+
+    local needs_name=false
+    case "$1" in
+        l|list)      COMMAND=list ;;
+        s|shell)     COMMAND=shell;  needs_name=true ;;
+        cl|claude)   COMMAND=claude; needs_name=true ;;
+        c|clone)     COMMAND=clone;  needs_name=true ;;
+        b|build)     COMMAND=build;  needs_name=true ;;
+        u|uninstall) COMMAND=uninstall; needs_name=true ;;
+        *)           abort "Unknown command: $1 (try: qs --help)" ;;
+    esac
+    readonly COMMAND
+
+    if [[ "$needs_name" == "true" ]]; then
+        [[ $# -ge 2 ]] || abort "sandbox name required after '$1' (try: qs --help)"
+        validate_sandbox_name "$2"
+        SANDBOX_NAME="$2"
+        case "$COMMAND" in
+            shell|claude) INITIAL_DIR="${3:-}" ;;
+            clone)
+                [[ $# -ge 3 ]] || abort "qs clone requires URL or local path (try: qs --help)"
+                CLONE_SOURCE="$3"
+                ;;
+        esac
+    fi
+}
 
 
 ###############################################################################
-# Shared helpers (after constants)
+# Derived constants — sandbox identifiers, ACLs, rebuild state. Everything
+# here is global and readonly; requires parse_args to have run.
+###############################################################################
+derive_constants() {
+    readonly SANDBOX_NAME
+    readonly QUICKSAND_USER="qs-$SANDBOX_NAME"
+    readonly QUICKSAND_GROUP="qs-$SANDBOX_NAME"
+    readonly SHARED_WORKSPACE="/Users/Shared/qs-$SANDBOX_NAME"
+    readonly QS_PRIVATE_DIR="$SHARED_WORKSPACE/_quicksand"
+    readonly QS_PROFILE_DIR="$QS_PRIVATE_DIR/profile.d"
+    readonly SUDOERS_FILE="/etc/sudoers.d/50-nopasswd-for-$QUICKSAND_USER"
+    readonly SANDBOX_PROFILE="/var/quicksand/sandbox-$QUICKSAND_USER.sb"
+    readonly INSTALL_DIR="$HOME/.config/quicksand"
+    readonly INSTALL_MARKER="$INSTALL_DIR/install-$SANDBOX_NAME"
+    # Host-side record of `qs clone` artifacts that outlive the sandbox (GitHub
+    # deploy keys, `quicksand` remotes on host repos), consumed by uninstall.
+    # One tab-separated line per clone: REPO_NAME\tOWNER/REPO\tLOCAL_REPO_PATH
+    # (fields 2 and 3 may be empty).
+    readonly QS_CLONES_MANIFEST="$INSTALL_DIR/clones-$SANDBOX_NAME"
+    # Host-side personal additions. The whole tree is rsync'd verbatim into
+    # the sandbox's _quicksand/custom/. Recognised subdirs:
+    #   custom/profile.d/   .sh scripts run after canonical (50-99 prefixes)
+    #   custom/oh-my-zsh/   staged for ~/.oh-my-zsh/custom/ (applied by 46-*)
+    readonly QS_CUSTOM_DIR="$INSTALL_DIR/custom"
+    readonly QS_CUSTOM_SANDBOX_DIR="$QS_PRIVATE_DIR/custom"
+    readonly QS_REPOS_DIR="$SHARED_WORKSPACE/repos"
+    readonly QS_SSH_DIR="$QS_PRIVATE_DIR/.ssh"
+    readonly HOST_USER="$USER"
+    readonly QS_SESSION_ID="$(/usr/bin/uuidgen)"
+
+    # Two ACEs per directory + one per file: prevents files from inheriting
+    # search/list (which on a file means execute) from their parent.
+    readonly QS_DIR_RIGHTS="group:$QUICKSAND_GROUP allow read,write,append,delete,delete_child,readattr,writeattr,readextattr,writeextattr,readsecurity,writesecurity,chown,search,list,directory_inherit"
+    readonly QS_FILE_INHERIT_RIGHTS="group:$QUICKSAND_GROUP allow read,write,append,delete,readattr,writeattr,readextattr,writeextattr,readsecurity,writesecurity,chown,file_inherit,directory_inherit,only_inherit"
+    readonly QS_FILE_RIGHTS="group:$QUICKSAND_GROUP allow read,write,append,delete,readattr,writeattr,readextattr,writeextattr,readsecurity,writesecurity,chown"
+
+    # Translate ~ in PATH arg to the sandbox user's home, then resolve symlinks.
+    if [[ "$INITIAL_DIR" == "~" ]]; then
+        INITIAL_DIR="/Users/$QUICKSAND_USER"
+    elif [[ "${INITIAL_DIR:0:2}" == "~/" ]]; then
+        INITIAL_DIR="/Users/$QUICKSAND_USER/${INITIAL_DIR:2}"
+    fi
+    INITIAL_DIR="$(cd "${INITIAL_DIR:-$PWD}" 2>/dev/null && pwd -P || echo "$INITIAL_DIR")"
+    readonly INITIAL_DIR
+
+    # Force a (re)build when the marker is missing or the recorded config
+    # fingerprint no longer matches the repo (except when uninstalling).
+    readonly QS_CONFIG_FINGERPRINT="$(config_fingerprint)"
+    REBUILD_REASON=""
+    if [[ "$COMMAND" != "uninstall" ]]; then
+        if [[ "$REBUILD" == "true" ]]; then
+            REBUILD_REASON="rebuild requested"
+        elif [[ ! -f "$INSTALL_MARKER" ]]; then
+            REBUILD=true
+            REBUILD_REASON="not installed yet"
+            QS_VERBOSE=$(( QS_VERBOSE > 1 ? QS_VERBOSE : 1 ))
+        elif [[ "$(head -n1 "$INSTALL_MARKER" 2>/dev/null)" != "$QS_CONFIG_FINGERPRINT" ]]; then
+            REBUILD=true
+            REBUILD_REASON="configuration changed since last build"
+        fi
+    fi
+
+    if [[ "$NO_BUILD" == "true" ]]; then
+        [[ "$COMMAND" != "build" ]]    || abort "refusing build with --no-build set"
+        [[ "$COMMAND" != "uninstall" ]] || abort "refusing uninstall with --no-build set"
+        [[ "$REBUILD" == "false" ]] \
+            || abort "sandbox '$SANDBOX_NAME' needs a build ($REBUILD_REASON) but --no-build is set"
+    fi
+    readonly NO_BUILD REBUILD REBUILD_REASON USE_SANDBOX
+}
+
+
+###############################################################################
+# Shared helpers (need the derived constants)
 ###############################################################################
 configure_shared_folder_permissions() {
     local enable="$1"
@@ -369,45 +369,6 @@ cleanup_clone_artifacts() {
         fi
     done < "$QS_CLONES_MANIFEST"
     rm -f "$QS_CLONES_MANIFEST"
-}
-
-uninstall() {
-    info "Uninstalling sandbox '$SANDBOX_NAME'..."
-
-    cleanup_clone_artifacts
-
-    # Best-effort: tear down any running session for this sandbox user.
-    # `|| true` swallows pipefail-induced ERR when the user is already
-    # gone (dscl exits 56 for "no such record").
-    local uid
-    uid=$(dscl . -read "/Users/$QUICKSAND_USER" UniqueID 2>/dev/null \
-        | awk '{print $2}' || true)
-    if [[ -n "$uid" ]]; then
-        sudo launchctl bootout "user/$uid" 2>/dev/null || true
-        sleep 0.2
-    fi
-    if pgrep -u "$QUICKSAND_USER" >/dev/null 2>&1; then
-        sudo pkill -9 -u "$QUICKSAND_USER" 2>/dev/null || true
-    fi
-
-    rm -f  "$INSTALL_MARKER"
-    rmdir  "$INSTALL_DIR" 2>/dev/null || true
-    sudo rm -f "$SUDOERS_FILE" "$SANDBOX_PROFILE"
-    sudo rmdir "$(dirname "$SANDBOX_PROFILE")" 2>/dev/null || true
-
-    if [[ -d "$SHARED_WORKSPACE" ]]; then
-        configure_shared_folder_permissions false
-    fi
-
-    sudo dseditgroup -o edit -d "$HOST_USER" -t user "$QUICKSAND_GROUP" 2>/dev/null || true
-    sudo dscl . -delete "/Users/$QUICKSAND_USER"  &>/dev/null || true
-    sudo dscl . -delete "/Groups/$QUICKSAND_GROUP" &>/dev/null || true
-    sudo rm -rf "/Users/$QUICKSAND_USER"
-
-    rm -rf "$QS_PRIVATE_DIR"
-    rmdir "$SHARED_WORKSPACE" 2>/dev/null || true
-    [[ -d "$SHARED_WORKSPACE" ]] && info "Keeping $SHARED_WORKSPACE (not empty)"
-    info "Sandbox '$SANDBOX_NAME' removed."
 }
 
 # Append a clone record to the manifest (see QS_CLONES_MANIFEST) so
@@ -533,20 +494,12 @@ do_clone() {
     sudo --user="$QUICKSAND_USER" /usr/bin/env ln -sfn "$CLONE_DEST" "$CLONE_LINK"
 }
 
+# Build (or repair) the sandbox: user/group, shared workspace, sudoers,
+# rendered sandbox profile, home dir, profile script sync. No-op unless
+# a (re)build was requested or detected by derive_constants.
+ensure_built() {
+    [[ "$REBUILD" == "true" ]] || return 0
 
-###############################################################################
-# Uninstall short-circuit
-###############################################################################
-if [[ "$COMMAND" == "uninstall" ]]; then
-    uninstall
-    exit 0
-fi
-
-
-###############################################################################
-# Build
-###############################################################################
-if [[ "$REBUILD" == "true" ]]; then
     info "Building sandbox '$SANDBOX_NAME'...${REBUILD_REASON:+ ($REBUILD_REASON)}"
 
     # A restrictive host umask leaves /var/quicksand and the sandbox profile
@@ -558,6 +511,7 @@ if [[ "$REBUILD" == "true" ]]; then
 
     acquire_id_lock
 
+    local GROUP_ID USER_ID
     if ! dscl . -read "/Groups/$QUICKSAND_GROUP" &>/dev/null; then
         trace "Creating group $QUICKSAND_GROUP"
         sudo dscl . -create "/Groups/$QUICKSAND_GROUP"
@@ -591,6 +545,7 @@ if [[ "$REBUILD" == "true" ]]; then
     # by default on macOS. macOS keeps two parallel membership representations
     # (username + GeneratedUID); clear both.
     trace "Removing $QUICKSAND_USER from staff"
+    local QS_GUID
     QS_GUID="$(dscl . -read "/Users/$QUICKSAND_USER" GeneratedUID 2>/dev/null \
         | awk '/^GeneratedUID:/ {print $2}' || true)"
     sudo dseditgroup -o edit -d "$QUICKSAND_USER" -t user staff 2>/dev/null || true
@@ -610,6 +565,7 @@ if [[ "$REBUILD" == "true" ]]; then
 
     # Sudoers
     debug "Writing sudoers"
+    local SUDOERS_CONTENT SUDOERS_TMP
     heredoc SUDOERS_CONTENT <<EOF
 # Allow $HOST_USER to switch to $QUICKSAND_USER without a password
 $HOST_USER ALL=($QUICKSAND_USER) NOPASSWD: /bin/zsh
@@ -638,6 +594,7 @@ EOF
     # /Volumes deny, and the volume can be renamed or localized.
     # A name with a double quote would corrupt the rendered profile;
     # fall back to the stock name rather than break sandbox-exec.
+    local BOOT_VOLUME BOOT_VOLUME_SED
     BOOT_VOLUME="$(diskutil info -plist / 2>/dev/null \
         | plutil -extract VolumeName raw - 2>/dev/null || true)"
     if [[ -z "$BOOT_VOLUME" || "$BOOT_VOLUME" == *'"'* ]]; then
@@ -651,6 +608,7 @@ EOF
     # resolved as the sandbox user (which also creates them). The paths
     # are a deterministic function of the UID, so baking them into the
     # rendered profile is safe. Uses the NOPASSWD env rule written above.
+    local QS_USER_TEMP_DIR QS_USER_CACHE_DIR
     QS_USER_TEMP_DIR="$(sudo --user="$QUICKSAND_USER" /usr/bin/env \
         getconf DARWIN_USER_TEMP_DIR)"
     QS_USER_CACHE_DIR="$(sudo --user="$QUICKSAND_USER" /usr/bin/env \
@@ -679,7 +637,7 @@ EOF
 
     # Per-session profile scripts live in profile.d/ at the repo root, are
     # synced into the sandbox's shared workspace here, and run as the
-    # sandbox user on every session start (see the loop in ZSH_COMMAND).
+    # sandbox user on every session start (see the loop in cmd_launch).
     # Each is responsible for being idempotent so re-runs are no-ops.
     [[ -d "$QS_PROFILE_SOURCE_DIR" ]] \
         || abort "profile.d directory missing at $QS_PROFILE_SOURCE_DIR"
@@ -704,14 +662,66 @@ EOF
     # build time, for humans.
     mkdir -p "$INSTALL_DIR"
     { echo "$QS_CONFIG_FINGERPRINT"; date; } > "$INSTALL_MARKER"
-fi
+}
 
-if [[ "$COMMAND" == "build" ]]; then
-    info "Sandbox '$SANDBOX_NAME' ready."
-    exit 0
-fi
 
-if [[ "$COMMAND" == "clone" ]]; then
+###############################################################################
+# Commands
+###############################################################################
+cmd_list() {
+    echo "Sandboxes:"
+    local home name found=false
+    shopt -s nullglob
+    for home in /Users/qs-*/; do
+        name="${home#/Users/qs-}"
+        name="${name%/}"
+        printf "  %s\n" "$name"
+        found=true
+    done
+    shopt -u nullglob
+    [[ "$found" == "true" ]] || echo "  (none — run 'qs build <NAME>')"
+}
+
+cmd_uninstall() {
+    info "Uninstalling sandbox '$SANDBOX_NAME'..."
+
+    cleanup_clone_artifacts
+
+    # Best-effort: tear down any running session for this sandbox user.
+    # `|| true` swallows pipefail-induced ERR when the user is already
+    # gone (dscl exits 56 for "no such record").
+    local uid
+    uid=$(dscl . -read "/Users/$QUICKSAND_USER" UniqueID 2>/dev/null \
+        | awk '{print $2}' || true)
+    if [[ -n "$uid" ]]; then
+        sudo launchctl bootout "user/$uid" 2>/dev/null || true
+        sleep 0.2
+    fi
+    if pgrep -u "$QUICKSAND_USER" >/dev/null 2>&1; then
+        sudo pkill -9 -u "$QUICKSAND_USER" 2>/dev/null || true
+    fi
+
+    rm -f  "$INSTALL_MARKER"
+    rmdir  "$INSTALL_DIR" 2>/dev/null || true
+    sudo rm -f "$SUDOERS_FILE" "$SANDBOX_PROFILE"
+    sudo rmdir "$(dirname "$SANDBOX_PROFILE")" 2>/dev/null || true
+
+    if [[ -d "$SHARED_WORKSPACE" ]]; then
+        configure_shared_folder_permissions false
+    fi
+
+    sudo dseditgroup -o edit -d "$HOST_USER" -t user "$QUICKSAND_GROUP" 2>/dev/null || true
+    sudo dscl . -delete "/Users/$QUICKSAND_USER"  &>/dev/null || true
+    sudo dscl . -delete "/Groups/$QUICKSAND_GROUP" &>/dev/null || true
+    sudo rm -rf "/Users/$QUICKSAND_USER"
+
+    rm -rf "$QS_PRIVATE_DIR"
+    rmdir "$SHARED_WORKSPACE" 2>/dev/null || true
+    [[ -d "$SHARED_WORKSPACE" ]] && info "Keeping $SHARED_WORKSPACE (not empty)"
+    info "Sandbox '$SANDBOX_NAME' removed."
+}
+
+cmd_clone() {
     (( ${#COMMAND_ARGS[@]} == 0 )) \
         || abort "qs clone doesn't accept '--' args; clone returns to the host shell"
     do_clone
@@ -722,102 +732,135 @@ if [[ "$COMMAND" == "clone" ]]; then
     info "Enter the sandbox with:"
     info "  qs shell  $SANDBOX_NAME $CLONE_LINK"
     info "  qs claude $SANDBOX_NAME $CLONE_LINK"
-    exit 0
-fi
+}
 
-
-###############################################################################
-# Pre-launch sanity checks
-###############################################################################
-SV_DIR="$(dirname "$SANDBOX_PROFILE")"
-if [[ -d "$SV_DIR" ]]; then
-    perms=$(/usr/bin/stat -f "%Lp" "$SV_DIR")
-    if [[ "$((8#$perms & 8#0005))" -eq 0 ]]; then
-        warn "$SV_DIR has restrictive permissions ($perms). Run: qs build $SANDBOX_NAME --rebuild"
+# Enter the sandbox: sanity-check the build artifacts, assemble the
+# in-sandbox zsh command line, and exec into it (never returns).
+cmd_launch() {
+    local sb_dir perms
+    sb_dir="$(dirname "$SANDBOX_PROFILE")"
+    if [[ -d "$sb_dir" ]]; then
+        perms=$(/usr/bin/stat -f "%Lp" "$sb_dir")
+        if [[ "$((8#$perms & 8#0005))" -eq 0 ]]; then
+            warn "$sb_dir has restrictive permissions ($perms). Run: qs build $SANDBOX_NAME --rebuild"
+        fi
     fi
-fi
-if [[ -f "$SANDBOX_PROFILE" && ! -r "$SANDBOX_PROFILE" ]]; then
-    warn "Cannot read $SANDBOX_PROFILE. Run: qs build $SANDBOX_NAME --rebuild"
-fi
+    if [[ -f "$SANDBOX_PROFILE" && ! -r "$SANDBOX_PROFILE" ]]; then
+        warn "Cannot read $SANDBOX_PROFILE. Run: qs build $SANDBOX_NAME --rebuild"
+    fi
 
-trace "Checking passwordless sudo"
-if ! sudo --non-interactive --user="$QUICKSAND_USER" /usr/bin/true; then
-    abort "Passwordless sudo to $QUICKSAND_USER not configured. Run: qs build $SANDBOX_NAME --rebuild"
-fi
+    trace "Checking passwordless sudo"
+    if ! sudo --non-interactive --user="$QUICKSAND_USER" /usr/bin/true; then
+        abort "Passwordless sudo to $QUICKSAND_USER not configured. Run: qs build $SANDBOX_NAME --rebuild"
+    fi
+
+    local INITIAL_DIR_Q ZSH_COMMAND
+    INITIAL_DIR_Q="$(quote_zsh_args "${INITIAL_DIR:-/Users/$QUICKSAND_USER}")"
+    # TMPDIR is per-session so tools that name temp dirs after themselves
+    # (e.g. /tmp/claude) don't collide across sandbox users, and lives in
+    # the sandbox user's private /var/folders tree rather than world-listable
+    # /tmp (falling back to /tmp if confstr resolution ever fails).
+    ZSH_COMMAND="export TMPDIR=\$(mktemp -d \"\$(getconf DARWIN_USER_TEMP_DIR)/qs.XXXXXX\" 2>/dev/null || mktemp -d); cd $INITIAL_DIR_Q 2>/dev/null || cd ~"
+
+    # Run per-session profile scripts as the sandbox user.
+    ZSH_COMMAND="$ZSH_COMMAND; setopt null_glob; for s in $SHARED_WORKSPACE/_quicksand/profile.d/*.sh $SHARED_WORKSPACE/_quicksand/custom/profile.d/*.sh; do [[ -f \"\$s\" && -x \"\$s\" ]] && \"\$s\"; done"
+
+    if [[ "$COMMAND" == "claude" ]]; then
+        # sandbox-exec is already restricting file writes to the sandbox home
+        # plus the shared workspace, so claude's per-action permission prompts
+        # are redundant. `bypassPermissionsModeAccepted: true` (seeded by the
+        # 30-claude-json.sh profile script) is the on-disk acknowledgement.
+        ZSH_COMMAND="$ZSH_COMMAND; exec $(quote_zsh_args claude --dangerously-skip-permissions "${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}")"
+    elif (( ${#COMMAND_ARGS[@]} > 0 )); then
+        ZSH_COMMAND="$ZSH_COMMAND; exec $(quote_zsh_args "${COMMAND_ARGS[@]}")"
+    elif [[ -t 0 ]]; then
+        ZSH_COMMAND="$ZSH_COMMAND; exec /bin/zsh -i"
+    else
+        # Piped stdin: non-interactive zsh, no prompt or interactive hooks.
+        ZSH_COMMAND="$ZSH_COMMAND; exec /bin/zsh"
+    fi
+
+    SANDBOX_EXEC=()
+    if [[ "$USE_SANDBOX" == "true" ]]; then
+        SANDBOX_EXEC=(/usr/bin/sandbox-exec -f "$SANDBOX_PROFILE")
+    else
+        debug "Sandbox disabled (--no-sandbox)"
+    fi
+
+    EXTRA_ENV=()
+    [[ -n "${COLORTERM:-}" ]] && EXTRA_ENV+=("COLORTERM=$COLORTERM")
+    # Locale: `env -i` below would otherwise leave the sandbox in the C
+    # locale, degrading multibyte line editing in zsh and UTF-8 handling
+    # in git and python.
+    [[ -n "${LANG:-}" ]]   && EXTRA_ENV+=("LANG=$LANG")
+    [[ -n "${LC_ALL:-}" ]] && EXTRA_ENV+=("LC_ALL=$LC_ALL")
+
+    # Host git identity, consumed by profile.d/40-gitconfig.sh inside the sandbox.
+    # Resolved at every invocation (not pinned at build time) so updates to
+    # `git config --global` on the host propagate on the next session — but
+    # only into sandboxes that don't already have ~/.gitconfig (the profile
+    # script is idempotent).
+    local QS_GIT_USER_NAME QS_GIT_USER_EMAIL
+    QS_GIT_USER_NAME="$(git config --global --get user.name  2>/dev/null || true)"
+    QS_GIT_USER_EMAIL="$(git config --global --get user.email 2>/dev/null || true)"
+    [[ -n "$QS_GIT_USER_NAME"  ]] && EXTRA_ENV+=("QS_GIT_USER_NAME=$QS_GIT_USER_NAME")
+    [[ -n "$QS_GIT_USER_EMAIL" ]] && EXTRA_ENV+=("QS_GIT_USER_EMAIL=$QS_GIT_USER_EMAIL")
+
+    # PATH inside the sandbox: only system binaries plus the sandbox user's
+    # own install locations. Host Homebrew is intentionally *not* on this PATH
+    # — tools belong inside the sandbox, where the install-claude profile
+    # script (and anything else you add) places them.
+    local SANDBOX_PATH="/Users/$QUICKSAND_USER/.local/bin:/Users/$QUICKSAND_USER/.claude/local:/usr/bin:/bin:/usr/sbin:/sbin"
+
+    debug "Entering sandbox $QUICKSAND_USER"
+    exec sudo --set-home --user="$QUICKSAND_USER" \
+        /usr/bin/env -i \
+            "HOME=/Users/$QUICKSAND_USER" \
+            "USER=$QUICKSAND_USER" \
+            "SHELL=/bin/zsh" \
+            "TERM=${TERM:-}" \
+            "SHARED_WORKSPACE=$SHARED_WORKSPACE" \
+            "QS_SESSION_ID=$QS_SESSION_ID" \
+            "QS_SANDBOX_NAME=$SANDBOX_NAME" \
+            "QS_HOST_USER=$HOST_USER" \
+            "QS_VERBOSE=$QS_VERBOSE" \
+            "PATH=$SANDBOX_PATH" \
+            "${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"}" \
+            "${SANDBOX_EXEC[@]+"${SANDBOX_EXEC[@]}"}" \
+            /bin/zsh -c "$ZSH_COMMAND"
+}
 
 
 ###############################################################################
-# Launch
+# Main
 ###############################################################################
-INITIAL_DIR_Q="$(quote_zsh_args "${INITIAL_DIR:-/Users/$QUICKSAND_USER}")"
-# TMPDIR is per-session so tools that name temp dirs after themselves
-# (e.g. /tmp/claude) don't collide across sandbox users, and lives in
-# the sandbox user's private /var/folders tree rather than world-listable
-# /tmp (falling back to /tmp if confstr resolution ever fails).
-ZSH_COMMAND="export TMPDIR=\$(mktemp -d \"\$(getconf DARWIN_USER_TEMP_DIR)/qs.XXXXXX\" 2>/dev/null || mktemp -d); cd $INITIAL_DIR_Q 2>/dev/null || cd ~"
+main() {
+    parse_args "$@"
 
-# Run per-session profile scripts as the sandbox user.
-ZSH_COMMAND="$ZSH_COMMAND; setopt null_glob; for s in $SHARED_WORKSPACE/_quicksand/profile.d/*.sh $SHARED_WORKSPACE/_quicksand/custom/profile.d/*.sh; do [[ -f \"\$s\" && -x \"\$s\" ]] && \"\$s\"; done"
+    if [[ "$COMMAND" == "list" ]]; then
+        cmd_list
+        exit 0
+    fi
 
-if [[ "$COMMAND" == "claude" ]]; then
-    # sandbox-exec is already restricting file writes to the sandbox home
-    # plus the shared workspace, so claude's per-action permission prompts
-    # are redundant. `bypassPermissionsModeAccepted: true` (seeded by the
-    # 30-claude-json.sh profile script) is the on-disk acknowledgement.
-    ZSH_COMMAND="$ZSH_COMMAND; exec $(quote_zsh_args claude --dangerously-skip-permissions "${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}")"
-elif (( ${#COMMAND_ARGS[@]} > 0 )); then
-    ZSH_COMMAND="$ZSH_COMMAND; exec $(quote_zsh_args "${COMMAND_ARGS[@]}")"
-elif [[ -t 0 ]]; then
-    ZSH_COMMAND="$ZSH_COMMAND; exec /bin/zsh -i"
-else
-    # Piped stdin: non-interactive zsh, no prompt or interactive hooks.
-    ZSH_COMMAND="$ZSH_COMMAND; exec /bin/zsh"
-fi
+    derive_constants
 
-SANDBOX_EXEC=()
-if [[ "$USE_SANDBOX" == "true" ]]; then
-    SANDBOX_EXEC=(/usr/bin/sandbox-exec -f "$SANDBOX_PROFILE")
-else
-    debug "Sandbox disabled (--no-sandbox)"
-fi
+    case "$COMMAND" in
+        uninstall)
+            cmd_uninstall
+            ;;
+        build)
+            ensure_built
+            info "Sandbox '$SANDBOX_NAME' ready."
+            ;;
+        clone)
+            ensure_built
+            cmd_clone
+            ;;
+        shell|claude)
+            ensure_built
+            cmd_launch
+            ;;
+    esac
+}
 
-EXTRA_ENV=()
-[[ -n "${COLORTERM:-}" ]] && EXTRA_ENV+=("COLORTERM=$COLORTERM")
-# Locale: `env -i` below would otherwise leave the sandbox in the C
-# locale, degrading multibyte line editing in zsh and UTF-8 handling
-# in git and python.
-[[ -n "${LANG:-}" ]]   && EXTRA_ENV+=("LANG=$LANG")
-[[ -n "${LC_ALL:-}" ]] && EXTRA_ENV+=("LC_ALL=$LC_ALL")
-
-# Host git identity, consumed by profile.d/40-gitconfig.sh inside the sandbox.
-# Resolved at every invocation (not pinned at build time) so updates to
-# `git config --global` on the host propagate on the next session — but
-# only into sandboxes that don't already have ~/.gitconfig (the profile
-# script is idempotent).
-QS_GIT_USER_NAME="$(git config --global --get user.name  2>/dev/null || true)"
-QS_GIT_USER_EMAIL="$(git config --global --get user.email 2>/dev/null || true)"
-[[ -n "$QS_GIT_USER_NAME"  ]] && EXTRA_ENV+=("QS_GIT_USER_NAME=$QS_GIT_USER_NAME")
-[[ -n "$QS_GIT_USER_EMAIL" ]] && EXTRA_ENV+=("QS_GIT_USER_EMAIL=$QS_GIT_USER_EMAIL")
-
-# PATH inside the sandbox: only system binaries plus the sandbox user's
-# own install locations. Host Homebrew is intentionally *not* on this PATH
-# — tools belong inside the sandbox, where the install-claude profile
-# script (and anything else you add) places them.
-SANDBOX_PATH="/Users/$QUICKSAND_USER/.local/bin:/Users/$QUICKSAND_USER/.claude/local:/usr/bin:/bin:/usr/sbin:/sbin"
-
-debug "Entering sandbox $QUICKSAND_USER"
-exec sudo --set-home --user="$QUICKSAND_USER" \
-    /usr/bin/env -i \
-        "HOME=/Users/$QUICKSAND_USER" \
-        "USER=$QUICKSAND_USER" \
-        "SHELL=/bin/zsh" \
-        "TERM=${TERM:-}" \
-        "SHARED_WORKSPACE=$SHARED_WORKSPACE" \
-        "QS_SESSION_ID=$QS_SESSION_ID" \
-        "QS_SANDBOX_NAME=$SANDBOX_NAME" \
-        "QS_HOST_USER=$HOST_USER" \
-        "QS_VERBOSE=$QS_VERBOSE" \
-        "PATH=$SANDBOX_PATH" \
-        "${EXTRA_ENV[@]+"${EXTRA_ENV[@]}"}" \
-        "${SANDBOX_EXEC[@]+"${SANDBOX_EXEC[@]}"}" \
-        /bin/zsh -c "$ZSH_COMMAND"
+main "$@"

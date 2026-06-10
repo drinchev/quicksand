@@ -92,6 +92,11 @@ Usage:
 NAME is required for everything except 'list'.
 Up to ${SANDBOX_NAME_MAX_LEN} chars, [A-Za-z0-9_-].
 
+PATH is where the session starts, inside the sandbox: relative paths
+(and ~/...) are resolved against the sandbox home, so 'qs claude NAME
+repo' starts in ~/repo — where 'qs clone' links each repo. Absolute
+paths are used as-is; omitted, the session starts in the sandbox home.
+
 Options:
   -r, --rebuild        Rebuild configuration and file permissions/ACLs.
   -n, --no-build       Refuse to make sandbox changes; error if any are needed.
@@ -235,12 +240,16 @@ derive_constants() {
     readonly QS_FILE_INHERIT_RIGHTS="group:$QUICKSAND_GROUP allow read,write,append,delete,readattr,writeattr,readextattr,writeextattr,readsecurity,writesecurity,chown,file_inherit,directory_inherit,only_inherit"
     readonly QS_FILE_RIGHTS="group:$QUICKSAND_GROUP allow read,write,append,delete,readattr,writeattr,readextattr,writeextattr,readsecurity,writesecurity,chown"
 
-    # Translate ~ in PATH arg to the sandbox user's home, then resolve symlinks.
+    # Translate the PATH arg: ~ means the sandbox user's home, and a
+    # relative path is sandbox-home-relative too (host-relative would be
+    # useless — the sandbox can't read host paths). Then resolve symlinks.
     # shellcheck disable=SC2088 # literal-tilde comparison is the point
     if [[ "$INITIAL_DIR" == "~" ]]; then
         INITIAL_DIR="/Users/$QUICKSAND_USER"
     elif [[ "${INITIAL_DIR:0:2}" == "~/" ]]; then
         INITIAL_DIR="/Users/$QUICKSAND_USER/${INITIAL_DIR:2}"
+    elif [[ -n "$INITIAL_DIR" && "${INITIAL_DIR:0:1}" != "/" ]]; then
+        INITIAL_DIR="/Users/$QUICKSAND_USER/$INITIAL_DIR"
     fi
     INITIAL_DIR="$(cd "${INITIAL_DIR:-$PWD}" 2>/dev/null && pwd -P || echo "$INITIAL_DIR")"
     readonly INITIAL_DIR
@@ -654,6 +663,19 @@ EOF
     sudo mkdir -p "/Users/$QUICKSAND_USER"
     sudo chown "$QUICKSAND_USER:$QUICKSAND_GROUP" "/Users/$QUICKSAND_USER"
     sudo /bin/chmod 0750 "/Users/$QUICKSAND_USER"
+
+    # Re-link workspace repos into the home (~/<repo> → repos/<repo>).
+    # qs clone links at clone time, but the workspace survives an
+    # uninstall/rebuild cycle while the home starts over. Never clobbers
+    # an existing entry.
+    local repo link
+    for repo in "$QS_REPOS_DIR"/*/; do
+        [[ -d "$repo" ]] || continue
+        repo="${repo%/}"
+        link="/Users/$QUICKSAND_USER/$(basename "$repo")"
+        [[ -e "$link" || -L "$link" ]] \
+            || sudo --user="$QUICKSAND_USER" /usr/bin/env ln -s "$repo" "$link"
+    done
 
     # Per-session profile scripts live in profile.d/ at the repo root, are
     # synced into the sandbox's shared workspace here, and run as the

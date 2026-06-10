@@ -315,6 +315,35 @@ qs_run() {
 
 
 ###############################################################################
+# INITIAL_DIR translation (via derive_constants)
+###############################################################################
+
+@test "relative PATH resolves against the sandbox home" {
+    qs_run 'parse_args shell relpathtest metadata
+            derive_constants
+            echo "$INITIAL_DIR"'
+    [ "$status" -eq 0 ]
+    [ "$output" == "/Users/qs-relpathtest/metadata" ]
+}
+
+@test "tilde PATH resolves against the sandbox home" {
+    qs_run 'parse_args shell relpathtest "~/sub/dir"
+            derive_constants
+            echo "$INITIAL_DIR"'
+    [ "$status" -eq 0 ]
+    [ "$output" == "/Users/qs-relpathtest/sub/dir" ]
+}
+
+@test "absolute PATH is kept as-is" {
+    qs_run 'parse_args shell relpathtest /Users
+            derive_constants
+            echo "$INITIAL_DIR"'
+    [ "$status" -eq 0 ]
+    [ "$output" == "/Users" ]
+}
+
+
+###############################################################################
 # do_clone (git/gh/ssh-keygen/sudo stubbed)
 ###############################################################################
 

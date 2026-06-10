@@ -19,3 +19,12 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
+---
+
+Third-party notices
+
+Portions of this software are derived from SandVault
+(https://github.com/webcoyote/sandvault), Copyright (C) 2026 Patrick Wyatt,
+licensed under the Apache License, Version 2.0. A copy of that license is
+included in this repository as LICENSE-APACHE.

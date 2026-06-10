@@ -225,8 +225,9 @@ parts but need BSD userland).
 
 ## License
 
-[MIT](LICENSE) © Ivan Drinchev. SandVault, which quicksand's design is based
-on, is © Patrick Wyatt, Apache License 2.0.
+[MIT](LICENSE) © Ivan Drinchev. Portions are derived from
+[SandVault](https://github.com/webcoyote/sandvault) © Patrick Wyatt, licensed
+under the [Apache License 2.0](LICENSE-APACHE).
 
 ## Why quicksand, and thanks
 

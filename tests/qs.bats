@@ -291,6 +291,16 @@ qs_run() {
     [ "$output" == "false" ]
 }
 
+@test "parse_args QUICKSAND_ARGS preserves quoted args with spaces" {
+    QUICKSAND_ARGS='-x shell foo -- run "a b"' qs_run 'parse_args
+            echo "$COMMAND $SANDBOX_NAME $USE_SANDBOX"
+            printf "%s\n" "${COMMAND_ARGS[@]}"'
+    [ "$status" -eq 0 ]
+    [ "${lines[0]}" == "shell foo false" ]
+    [ "${lines[1]}" == "run" ]
+    [ "${lines[2]}" == "a b" ]
+}
+
 @test "parse_args requires a name for name-taking commands" {
     qs_run 'parse_args shell'
     [ "$status" -eq 1 ]
@@ -332,4 +342,30 @@ qs_run() {
     grep -q "git clone git@github.com:me/proj.git" "$STUB_LOG"
     grep -q "deploy-key add" "$STUB_LOG"
     grep -q "$(printf 'proj\tme/proj\t')" "$MANIFEST"
+}
+
+@test "do_clone escapes the deploy key path for shell re-parsing" {
+    make_stub git 'echo "git $*" >> "$STUB_LOG"
+        [[ "$1" == "clone" ]] && mkdir -p "$3"
+        exit 0'
+    make_stub gh 'exit 0'
+    make_stub ssh-keygen 'while [[ $# -gt 0 ]]; do
+            [[ "$1" == "-f" ]] && keyfile="$2"
+            shift
+        done
+        touch "$keyfile" "$keyfile.pub"'
+    make_stub sudo 'exit 0'
+
+    qs_run 'PATH="$STUBS:$PATH"
+            CLONE_SOURCE="https://github.com/me/proj"
+            SANDBOX_NAME=demo QUICKSAND_USER=qs-bats-nonexistent
+            QS_REPOS_DIR="$BATS_TEST_TMPDIR/ws dir/repos"
+            QS_SSH_DIR="$BATS_TEST_TMPDIR/ws dir/.ssh"
+            INSTALL_DIR="$BATS_TEST_TMPDIR"
+            QS_CLONES_MANIFEST="$BATS_TEST_TMPDIR/manifest"
+            do_clone'
+    [ "$status" -eq 0 ]
+    local esc
+    esc="$(printf '%q' "$BATS_TEST_TMPDIR/ws dir/.ssh/id_ed25519_proj")"
+    grep -qF "ssh -i $esc" "$STUB_LOG"
 }

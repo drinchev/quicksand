@@ -40,8 +40,6 @@ trace() { (( QS_VERBOSE >= 3 )) && echo "$*" || true; }
 ###############################################################################
 # Generic helpers
 ###############################################################################
-heredoc() { IFS=$'\n' read -r -d '' "${1}" || true; }
-
 # Quote args for safe interpolation into a `/bin/zsh -c` string.
 quote_zsh_args() {
     /bin/zsh -fc 'for arg; do printf "%s " "${(q)arg}"; done' -- "$@"
@@ -139,10 +137,16 @@ CLONE_SOURCE=""
 
 parse_args() {
     if [[ -n "${QUICKSAND_ARGS:-}" ]]; then
+        # Split with shell semantics ((z) tokenizes, (Q) strips quotes) so
+        # quoted args with spaces survive — xargs has its own quote and
+        # backslash rules that diverge from the shell's.
         local qs_args_array=() arg
-        while IFS= read -r arg; do qs_args_array+=("$arg"); done \
-            < <(xargs -n1 printf '%s\n' <<< "$QUICKSAND_ARGS")
-        set -- "${qs_args_array[@]}" "$@"
+        while IFS= read -r arg; do
+            [[ -n "$arg" ]] && qs_args_array+=("$arg")
+        done < <(/bin/zsh -fc 'print -rl -- "${(@Q)${(z)1}}"' -- "$QUICKSAND_ARGS")
+        if (( ${#qs_args_array[@]} > 0 )); then
+            set -- "${qs_args_array[@]}" "$@"
+        fi
     fi
 
     local new_args=()
@@ -451,7 +455,9 @@ do_clone() {
         fi
         chmod 0600 "$key_path"
 
-        ssh_cmd="ssh -i $key_path -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
+        # %q-escape the key path: the string is re-parsed by a shell both
+        # via GIT_SSH_COMMAND and from core.sshCommand.
+        ssh_cmd="ssh -i $(printf '%q' "$key_path") -o IdentitiesOnly=yes -o StrictHostKeyChecking=accept-new"
 
         local uploaded=false
         if command -v gh &>/dev/null; then
@@ -580,15 +586,15 @@ ensure_built() {
     # Sudoers
     debug "Writing sudoers"
     local SUDOERS_CONTENT SUDOERS_TMP
-    heredoc SUDOERS_CONTENT <<EOF
+    SUDOERS_CONTENT="$(cat <<EOF
 # Allow $HOST_USER to switch to $QUICKSAND_USER without a password
 $HOST_USER ALL=($QUICKSAND_USER) NOPASSWD: /bin/zsh
 $HOST_USER ALL=($QUICKSAND_USER) NOPASSWD: /usr/bin/env
 $HOST_USER ALL=($QUICKSAND_USER) NOPASSWD: /usr/bin/true
 EOF
+)"
     # Validate via visudo on a temp file, then atomically move into place.
     SUDOERS_TMP="$(sudo /usr/bin/mktemp "$(dirname "$SUDOERS_FILE")/.sudoers.XXXXXX")"
-    # shellcheck disable=SC2154 # set by heredoc above
     echo "$SUDOERS_CONTENT" | sudo tee "$SUDOERS_TMP" > /dev/null
     sudo /bin/chmod 0440 "$SUDOERS_TMP"
     if sudo visudo -c -f "$SUDOERS_TMP" &>/dev/null; then

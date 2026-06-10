@@ -223,6 +223,11 @@ bats tests                      # unit tests (no sudo required)
 CI runs both on every push (macOS runner — the tests stub the privileged
 parts but need BSD userland).
 
+## License
+
+[MIT](LICENSE) © Ivan Drinchev. SandVault, which quicksand's design is based
+on, is © Patrick Wyatt, Apache License 2.0.
+
 ## Why quicksand, and thanks
 
 The idea, the architecture, and most of the hard-won macOS details here —

@@ -3,8 +3,8 @@
 #
 # pnpm's installer delegates to `pnpm setup --force` (non-interactive)
 # and writes PNPM_HOME + PATH exports to ~/.zshrc. After install, we use
-# pnpm itself as a Node version manager via `pnpm env use --global 24`,
-# which downloads Node 24, symlinks it from PNPM_HOME, and makes it the
+# pnpm itself as a Node version manager via `pnpm runtime set node 24 -g`,
+# which downloads Node 24, links it into $PNPM_HOME/bin, and makes it the
 # default `node` on PATH. Runs after omz so ~/.zshrc additions aren't
 # clobbered by omz's rewrite.
 set -Eeuo pipefail
@@ -34,6 +34,12 @@ if [[ -z "$PNPM" ]]; then
 fi
 
 [[ -n "$PNPM" ]] || { echo "pnpm not found after install" >&2; exit 1; }
+
+# Node already provisioned by a previous session — skip the (network)
+# call to pnpm entirely.
+if command -v node >/dev/null 2>&1 || [[ -x "$PNPM_HOME/bin/node" ]]; then
+    exit 0
+fi
 
 echo "Installing Node.js v24 via pnpm..." >&2
 "$PNPM" runtime set node 24 -g

@@ -766,6 +766,11 @@ fi
 
 EXTRA_ENV=()
 [[ -n "${COLORTERM:-}" ]] && EXTRA_ENV+=("COLORTERM=$COLORTERM")
+# Locale: `env -i` below would otherwise leave the sandbox in the C
+# locale, degrading multibyte line editing in zsh and UTF-8 handling
+# in git and python.
+[[ -n "${LANG:-}" ]]   && EXTRA_ENV+=("LANG=$LANG")
+[[ -n "${LC_ALL:-}" ]] && EXTRA_ENV+=("LC_ALL=$LC_ALL")
 
 # Host git identity, consumed by profile.d/40-gitconfig.sh inside the sandbox.
 # Resolved at every invocation (not pinned at build time) so updates to

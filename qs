@@ -23,6 +23,7 @@ done
 QS_REPO_DIR="$(cd -P "$(dirname "$QS_SOURCE")" && pwd -P)"
 readonly QS_REPO_DIR
 readonly QS_PROFILE_SOURCE_DIR="$QS_REPO_DIR/profile.d"
+readonly QS_LOGOUT_SOURCE_DIR="$QS_REPO_DIR/logout.d"
 readonly QS_SANDBOX_PROFILE_TEMPLATE="$QS_REPO_DIR/config/sandbox.sb"
 
 QS_VERBOSE="${QS_VERBOSE:-0}"
@@ -46,16 +47,16 @@ quote_zsh_args() {
 }
 
 # Fingerprint of everything a build bakes into a sandbox: qs version,
-# sandbox profile template, canonical profile.d/, and the host-side
-# custom overlay (contents, relative names, and file modes — the exec
-# bit decides whether a profile script runs). A sandbox whose install
-# marker doesn't match is stale and gets rebuilt automatically.
+# sandbox profile template, canonical profile.d/ and logout.d/, and the
+# host-side custom overlay (contents, relative names, and file modes — the
+# exec bit decides whether a script runs). A sandbox whose install marker
+# doesn't match is stale and gets rebuilt automatically.
 config_fingerprint() {
     {
         echo "$VERSION"
         /usr/bin/shasum -a 256 < "$QS_SANDBOX_PROFILE_TEMPLATE" 2>/dev/null || true
         local dir
-        for dir in "$QS_PROFILE_SOURCE_DIR" "$QS_CUSTOM_DIR"; do
+        for dir in "$QS_PROFILE_SOURCE_DIR" "$QS_LOGOUT_SOURCE_DIR" "$QS_CUSTOM_DIR"; do
             [[ -d "$dir" ]] || continue
             (cd "$dir" \
                 && find . -type f -print0 | sort -z \
@@ -119,6 +120,8 @@ Customization:
                                       profile.d/ on every session entry
                                       (use 50-99 prefixes to continue from
                                       the 10-49 canonical range)
+                         logout.d/    .sh scripts run after the canonical
+                                      logout.d/ when the session ends
                          oh-my-zsh/   themes/, plugins/, etc. copied into
                                       the sandbox's ~/.oh-my-zsh/custom/
                                       after install
@@ -213,6 +216,7 @@ derive_constants() {
     readonly SHARED_WORKSPACE="/Users/Shared/qs-$SANDBOX_NAME"
     readonly QS_PRIVATE_DIR="$SHARED_WORKSPACE/_quicksand"
     readonly QS_PROFILE_DIR="$QS_PRIVATE_DIR/profile.d"
+    readonly QS_LOGOUT_DIR="$QS_PRIVATE_DIR/logout.d"
     readonly SUDOERS_FILE="/etc/sudoers.d/50-nopasswd-for-$QUICKSAND_USER"
     readonly SANDBOX_PROFILE="/var/quicksand/sandbox-$QUICKSAND_USER.sb"
     readonly INSTALL_DIR="$HOME/.config/quicksand"
@@ -225,6 +229,7 @@ derive_constants() {
     # Host-side personal additions. The whole tree is rsync'd verbatim into
     # the sandbox's _quicksand/custom/. Recognised subdirs:
     #   custom/profile.d/   .sh scripts run after canonical (50-99 prefixes)
+    #   custom/logout.d/    .sh scripts run at session exit after canonical
     #   custom/oh-my-zsh/   staged for ~/.oh-my-zsh/custom/ (applied by 46-*)
     readonly QS_CUSTOM_DIR="$INSTALL_DIR/custom"
     readonly QS_CUSTOM_SANDBOX_DIR="$QS_PRIVATE_DIR/custom"
@@ -692,6 +697,18 @@ EOF
         --checksum --recursive --perms --times \
         "$QS_PROFILE_SOURCE_DIR/" "$QS_PROFILE_DIR/"
 
+    # Per-session logout scripts (logout.d/) are the exit-time counterpart of
+    # profile.d/: synced the same way and run as the sandbox user when the
+    # session ends (see the EXIT trap in cmd_launch). Optional — unlike
+    # profile.d/ the directory may be absent.
+    if [[ -d "$QS_LOGOUT_SOURCE_DIR" ]]; then
+        debug "Syncing $QS_LOGOUT_SOURCE_DIR/ → $QS_LOGOUT_DIR/"
+        mkdir -p "$QS_LOGOUT_DIR"
+        /usr/bin/rsync \
+            --checksum --recursive --perms --times \
+            "$QS_LOGOUT_SOURCE_DIR/" "$QS_LOGOUT_DIR/"
+    fi
+
     if [[ -d "$QS_CUSTOM_DIR" ]]; then
         debug "Syncing $QS_CUSTOM_DIR/ → $QS_CUSTOM_SANDBOX_DIR/"
         mkdir -p "$QS_CUSTOM_SANDBOX_DIR"
@@ -807,19 +824,31 @@ cmd_launch() {
     # Run per-session profile scripts as the sandbox user.
     ZSH_COMMAND="$ZSH_COMMAND; setopt null_glob; for s in $SHARED_WORKSPACE/_quicksand/profile.d/*.sh $SHARED_WORKSPACE/_quicksand/custom/profile.d/*.sh; do [[ -f \"\$s\" && -x \"\$s\" ]] && \"\$s\"; done"
 
+    # Register logout.d scripts as an EXIT trap, the exit-time counterpart of
+    # the profile.d loop above. The trap body is single-quoted so $s expands
+    # when the trap fires, not now. Because the session command below is NOT
+    # exec'd, control returns to this shell when the session ends and the trap
+    # runs. zsh keeps waiting while a foreground child handles its own SIGINT
+    # (interactive zsh, claude), so an ordinary Ctrl-C won't fire it early;
+    # the trap does not run if this shell is killed by an uncaught signal
+    # (e.g. SIGHUP when the terminal closes), which is fine — the tab is gone.
+    ZSH_COMMAND="$ZSH_COMMAND; trap 'for s in $SHARED_WORKSPACE/_quicksand/logout.d/*.sh $SHARED_WORKSPACE/_quicksand/custom/logout.d/*.sh; do [[ -f \"\$s\" && -x \"\$s\" ]] && \"\$s\"; done' EXIT"
+
     if [[ "$COMMAND" == "claude" ]]; then
         # sandbox-exec is already restricting file writes to the sandbox home
         # plus the shared workspace, so claude's per-action permission prompts
         # are redundant. `bypassPermissionsModeAccepted: true` (seeded by the
         # 30-claude-json.sh profile script) is the on-disk acknowledgement.
-        ZSH_COMMAND="$ZSH_COMMAND; exec $(quote_zsh_args claude --dangerously-skip-permissions "${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}")"
+        # Not exec'd (unlike a bare launch) so the EXIT trap's logout.d hooks
+        # run when claude quits.
+        ZSH_COMMAND="$ZSH_COMMAND; $(quote_zsh_args claude --dangerously-skip-permissions "${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}")"
     elif (( ${#COMMAND_ARGS[@]} > 0 )); then
-        ZSH_COMMAND="$ZSH_COMMAND; exec $(quote_zsh_args "${COMMAND_ARGS[@]}")"
+        ZSH_COMMAND="$ZSH_COMMAND; $(quote_zsh_args "${COMMAND_ARGS[@]}")"
     elif [[ -t 0 ]]; then
-        ZSH_COMMAND="$ZSH_COMMAND; exec /bin/zsh -i"
+        ZSH_COMMAND="$ZSH_COMMAND; /bin/zsh -i"
     else
         # Piped stdin: non-interactive zsh, no prompt or interactive hooks.
-        ZSH_COMMAND="$ZSH_COMMAND; exec /bin/zsh"
+        ZSH_COMMAND="$ZSH_COMMAND; /bin/zsh"
     fi
 
     SANDBOX_EXEC=()
@@ -831,6 +860,10 @@ cmd_launch() {
 
     EXTRA_ENV=()
     [[ -n "${COLORTERM:-}" ]] && EXTRA_ENV+=("COLORTERM=$COLORTERM")
+    # Forwarded so cosmetic profile scripts can detect the host terminal —
+    # e.g. profile.d/50-tab-color.sh only emits its iTerm2-proprietary
+    # tab-color escape when TERM_PROGRAM is iTerm.app.
+    [[ -n "${TERM_PROGRAM:-}" ]] && EXTRA_ENV+=("TERM_PROGRAM=$TERM_PROGRAM")
     # Locale: `env -i` below would otherwise leave the sandbox in the C
     # locale, degrading multibyte line editing in zsh and UTF-8 handling
     # in git and python.

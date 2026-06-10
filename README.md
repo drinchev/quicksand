@@ -143,7 +143,7 @@ delete the deploy key from GitHub and remove the `quicksand` remote again.
 
 The install marker stores a fingerprint of everything a build bakes into a
 sandbox: the qs version, the `sandbox-exec` profile template, `profile.d/`,
-and your personal overlay — contents, names, and file modes. When any of it
+`logout.d/`, and your personal overlay — contents, names, and file modes. When any of it
 changes (a `git pull` of this repo, an edit to your overlay), the next
 `qs shell`/`qs claude` rebuilds the sandbox automatically and tells you why.
 
@@ -162,6 +162,13 @@ sandbox (first run installs, later runs are no-ops):
 | `46-install-pnpm.sh` | pnpm + Node.js 24 (pnpm as the version manager) |
 | `47-install-python.sh` | uv + a managed Python 3.12 |
 | `48-install-gcloud.sh` | Google Cloud SDK (`gcloud`, `gsutil`, `bq`) |
+| `50-tab-color.sh` | tint the iTerm2 tab green so a sandbox tab is obvious |
+
+Scripts in `logout.d/` are the exit-time counterpart: they run as the sandbox
+user when the session ends (a normal `exit`, Ctrl-D, or quitting Claude Code),
+via an `EXIT` trap in the launcher. Use them to undo anything a `profile.d/`
+script set up for the host terminal — the bundled pair tints the iTerm2 tab on
+entry and resets it on exit.
 
 ## Personal overlay (`~/.config/quicksand/custom/`)
 
@@ -172,6 +179,8 @@ repo:
 ~/.config/quicksand/custom/
 ├── profile.d/    # .sh scripts run after the canonical ones on every
 │                 # session entry (use 50-99 prefixes; canonical is 10-49)
+├── logout.d/     # .sh scripts run after the canonical ones when the
+│                 # session ends
 └── oh-my-zsh/    # themes/, plugins/, etc. copied into the sandbox's
                   # ~/.oh-my-zsh/custom/ after install
 ```
@@ -216,7 +225,7 @@ same applies here.
 ## Development
 
 ```bash
-shellcheck qs profile.d/*.sh    # lint
+shellcheck qs profile.d/*.sh logout.d/*.sh    # lint
 bats tests                      # unit tests (no sudo required)
 ```
 

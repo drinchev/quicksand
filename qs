@@ -39,6 +39,27 @@ quote_zsh_args() {
     /bin/zsh -fc 'for arg; do printf "%s " "${(q)arg}"; done' -- "$@"
 }
 
+# Fingerprint of everything a build bakes into a sandbox: qs version,
+# sandbox profile template, canonical profile.d/, and the host-side
+# custom overlay (contents, relative names, and file modes — the exec
+# bit decides whether a profile script runs). A sandbox whose install
+# marker doesn't match is stale and gets rebuilt automatically.
+config_fingerprint() {
+    {
+        echo "$VERSION"
+        /usr/bin/shasum -a 256 < "$QS_SANDBOX_PROFILE_TEMPLATE" 2>/dev/null || true
+        local dir
+        for dir in "$QS_PROFILE_SOURCE_DIR" "$QS_CUSTOM_DIR"; do
+            [[ -d "$dir" ]] || continue
+            (cd "$dir" \
+                && find . -type f -print0 | sort -z \
+                    | xargs -0 /usr/bin/shasum -a 256 \
+                && find . -type f -print0 | sort -z \
+                    | xargs -0 /usr/bin/stat -f '%Lp %N') 2>/dev/null || true
+        done
+    } | /usr/bin/shasum -a 256 | awk '{print $1}'
+}
+
 validate_sandbox_name() {
     local name="$1"
     [[ -n "$name" ]] || abort "sandbox name required"
@@ -218,18 +239,30 @@ fi
 INITIAL_DIR="$(cd "${INITIAL_DIR:-$PWD}" 2>/dev/null && pwd -P || echo "$INITIAL_DIR")"
 readonly INITIAL_DIR
 
-# Missing install marker → force a (re)build, except when uninstalling.
-if [[ ! -f "$INSTALL_MARKER" && "$COMMAND" != "uninstall" ]]; then
-    REBUILD=true
-    QS_VERBOSE=$(( QS_VERBOSE > 1 ? QS_VERBOSE : 1 ))
+# Force a (re)build when the marker is missing or the recorded config
+# fingerprint no longer matches the repo (except when uninstalling).
+readonly QS_CONFIG_FINGERPRINT="$(config_fingerprint)"
+REBUILD_REASON=""
+if [[ "$COMMAND" != "uninstall" ]]; then
+    if [[ "$REBUILD" == "true" ]]; then
+        REBUILD_REASON="rebuild requested"
+    elif [[ ! -f "$INSTALL_MARKER" ]]; then
+        REBUILD=true
+        REBUILD_REASON="not installed yet"
+        QS_VERBOSE=$(( QS_VERBOSE > 1 ? QS_VERBOSE : 1 ))
+    elif [[ "$(head -n1 "$INSTALL_MARKER" 2>/dev/null)" != "$QS_CONFIG_FINGERPRINT" ]]; then
+        REBUILD=true
+        REBUILD_REASON="configuration changed since last build"
+    fi
 fi
 
 if [[ "$NO_BUILD" == "true" ]]; then
     [[ "$COMMAND" != "build" ]]    || abort "refusing build with --no-build set"
     [[ "$COMMAND" != "uninstall" ]] || abort "refusing uninstall with --no-build set"
-    [[ "$REBUILD" == "false" ]]    || abort "sandbox '$SANDBOX_NAME' is not installed"
+    [[ "$REBUILD" == "false" ]] \
+        || abort "sandbox '$SANDBOX_NAME' needs a build ($REBUILD_REASON) but --no-build is set"
 fi
-readonly NO_BUILD REBUILD USE_SANDBOX
+readonly NO_BUILD REBUILD REBUILD_REASON USE_SANDBOX
 
 
 ###############################################################################
@@ -514,7 +547,7 @@ fi
 # Build
 ###############################################################################
 if [[ "$REBUILD" == "true" ]]; then
-    info "Building sandbox '$SANDBOX_NAME'..."
+    info "Building sandbox '$SANDBOX_NAME'...${REBUILD_REASON:+ ($REBUILD_REASON)}"
 
     # A restrictive host umask leaves /var/quicksand and the sandbox profile
     # unreadable by the sandbox user. Force the standard mask for the duration
@@ -652,8 +685,10 @@ EOF
             "$QS_CUSTOM_DIR/" "$QS_CUSTOM_SANDBOX_DIR/"
     fi
 
+    # First line: config fingerprint (compared on every run); second:
+    # build time, for humans.
     mkdir -p "$INSTALL_DIR"
-    date > "$INSTALL_MARKER"
+    { echo "$QS_CONFIG_FINGERPRINT"; date; } > "$INSTALL_MARKER"
 fi
 
 if [[ "$COMMAND" == "build" ]]; then

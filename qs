@@ -871,6 +871,9 @@ cmd_launch() {
     # e.g. profile.d/50-tab-color.sh only emits its iTerm2-proprietary
     # tab-color escape when TERM_PROGRAM is iTerm.app.
     [[ -n "${TERM_PROGRAM:-}" ]] && EXTRA_ENV+=("TERM_PROGRAM=$TERM_PROGRAM")
+    # Stop Claude Code from rewriting the title so the name set by
+    # profile.d/51-tab-name.sh ("<sandbox> | Claude") sticks for the session.
+    [[ "$COMMAND" == "claude" ]] && EXTRA_ENV+=("CLAUDE_CODE_DISABLE_TERMINAL_TITLE=1")
     # Locale: `env -i` below would otherwise leave the sandbox in the C
     # locale, degrading multibyte line editing in zsh and UTF-8 handling
     # in git and python.

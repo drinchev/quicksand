@@ -158,11 +158,12 @@ sandbox (first run installs, later runs are no-ops):
 | `20-install-claude.sh` | install Claude Code via its native installer |
 | `30-claude-json.sh` | seed onboarding flags so the first session isn't interactive |
 | `40-gitconfig.sh` | seed the host's git identity + `safe.directory` |
-| `45-install-oh-my-zsh.sh` | Oh My Zsh, plus your custom themes/plugins |
+| `45-install-oh-my-zsh.sh` | Oh My Zsh + custom themes/plugins; disables auto-title so a manual tab name sticks |
 | `46-install-pnpm.sh` | pnpm + Node.js 24 (pnpm as the version manager) |
 | `47-install-python.sh` | uv + a managed Python 3.12 |
 | `48-install-gcloud.sh` | Google Cloud SDK (`gcloud`, `gsutil`, `bq`) |
 | `50-tab-color.sh` | tint the iTerm2 tab green so a sandbox tab is obvious |
+| `51-tab-name.sh` | name the tab `<sandbox> \| Claude` or `<sandbox> \| Shell` |
 
 Scripts in `logout.d/` are the exit-time counterpart: they run as the sandbox
 user when the session ends (a normal `exit`, Ctrl-D, or quitting Claude Code),

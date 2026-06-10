@@ -834,7 +834,13 @@ cmd_launch() {
     # (e.g. SIGHUP when the terminal closes), which is fine — the tab is gone.
     ZSH_COMMAND="$ZSH_COMMAND; trap 'for s in $SHARED_WORKSPACE/_quicksand/logout.d/*.sh $SHARED_WORKSPACE/_quicksand/custom/logout.d/*.sh; do [[ -f \"\$s\" && -x \"\$s\" ]] && \"\$s\"; done' EXIT"
 
+    # Session kind, consumed by profile.d/51-tab-name.sh to label the tab as
+    # "<sandbox> | Claude" or "<sandbox> | Shell". Only the two interactive
+    # (tty) modes get a label; one-off command and piped sessions are left
+    # blank so the script no-ops.
+    local QS_SESSION_KIND=""
     if [[ "$COMMAND" == "claude" ]]; then
+        QS_SESSION_KIND="Claude"
         # sandbox-exec is already restricting file writes to the sandbox home
         # plus the shared workspace, so claude's per-action permission prompts
         # are redundant. `bypassPermissionsModeAccepted: true` (seeded by the
@@ -845,6 +851,7 @@ cmd_launch() {
     elif (( ${#COMMAND_ARGS[@]} > 0 )); then
         ZSH_COMMAND="$ZSH_COMMAND; $(quote_zsh_args "${COMMAND_ARGS[@]}")"
     elif [[ -t 0 ]]; then
+        QS_SESSION_KIND="Shell"
         ZSH_COMMAND="$ZSH_COMMAND; /bin/zsh -i"
     else
         # Piped stdin: non-interactive zsh, no prompt or interactive hooks.
@@ -897,6 +904,7 @@ cmd_launch() {
             "SHARED_WORKSPACE=$SHARED_WORKSPACE" \
             "QS_SESSION_ID=$QS_SESSION_ID" \
             "QS_SANDBOX_NAME=$SANDBOX_NAME" \
+            "QS_SESSION_KIND=$QS_SESSION_KIND" \
             "QS_HOST_USER=$HOST_USER" \
             "QS_VERBOSE=$QS_VERBOSE" \
             "PATH=$SANDBOX_PATH" \

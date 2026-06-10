@@ -93,10 +93,11 @@ qs build     NAME [-r]                   build (or repair) a sandbox
 qs shell     NAME [PATH] [-- args ...]   zsh session in the sandbox
 qs claude    NAME [PATH] [-- args ...]   Claude Code in the sandbox
 qs clone     NAME URL_OR_PATH            clone a repo into the sandbox
+qs gh-auth   NAME [OWNER/REPO]           set up a repo-scoped gh token
 qs uninstall NAME                        remove the sandbox completely
 qs list                                  list sandboxes
 
-Short aliases: b, s, cl, c, u, l.
+Short aliases: b, s, cl, c, g, u, l.
 ```
 
 PATH is where the session starts, *inside* the sandbox: relative paths and
@@ -139,6 +140,40 @@ the repo at `~/<repo>` inside the sandbox:
 Every clone is recorded in a host-side manifest; `qs uninstall` uses it to
 delete the deploy key from GitHub and remove the `quicksand` remote again.
 
+## GitHub API access (`gh`)
+
+The deploy key handles git transport, but not the GitHub *API* — opening PRs,
+writing PR comments, reading commits, branches and CI runs. For that the
+sandbox needs a token, and `qs gh-auth` sets one up scoped to a single repo
+(not your whole account), using a **fine-grained personal access token**:
+
+```bash
+qs gh-auth work you/project     # or omit the repo if the sandbox has one clone
+```
+
+`qs clone` offers this automatically after registering the deploy key. The
+flow is a guided manual one, because fine-grained PATs can't be minted via
+API:
+
+1. `qs` prints a GitHub token-creation link with the name, resource owner,
+   90-day expiry and permissions **prefilled**. GitHub can't preselect the
+   repository itself, so you pick it from the "Only select repositories"
+   dropdown and confirm the owner before generating.
+2. You paste the token back (input hidden); `qs` validates it against the
+   repo and saves it to the workspace.
+3. On the next session, `gh` signs in automatically inside the sandbox.
+
+Permissions requested are least-privilege and **read-only except PR writes**:
+`Pull requests: write` (PRs + PR comments) plus read-only `Contents`
+(commits/branches), `Actions`, `Checks` and `Commit statuses` (CI). The token
+is API-only — `git push`/`pull` stay on the deploy key, so it never needs
+write access to repository contents.
+
+Fine-grained PATs have **no revoke API**, so `qs uninstall` can't delete one
+for you; it prints a reminder with the [token settings
+link](https://github.com/settings/tokens?type=beta). The short expiry is the
+real backstop — re-run `qs gh-auth` to refresh.
+
 ## Automatic rebuilds
 
 The install marker stores a fingerprint of everything a build bakes into a
@@ -156,6 +191,7 @@ sandbox (first run installs, later runs are no-ops):
 |---|---|
 | `10-keychain.sh` | create/unlock a login keychain (fresh users have none) |
 | `20-install-claude.sh` | install Claude Code via its native installer |
+| `21-install-gh.sh` | install the GitHub CLI (`gh`) from its release tarball |
 | `30-claude-json.sh` | seed onboarding flags so the first session isn't interactive |
 | `40-gitconfig.sh` | seed the host's git identity + `safe.directory` |
 | `45-install-oh-my-zsh.sh` | Oh My Zsh + custom themes/plugins; disables auto-title so a manual tab name sticks |
@@ -164,6 +200,7 @@ sandbox (first run installs, later runs are no-ops):
 | `48-install-gcloud.sh` | Google Cloud SDK (`gcloud`, `gsutil`, `bq`) |
 | `50-tab-color.sh` | tint the iTerm2 tab green so a sandbox tab is obvious |
 | `51-tab-name.sh` | name the tab `<sandbox> \| Claude` or `<sandbox> \| Shell` |
+| `60-gh-auth.sh` | sign `gh` in with the repo-scoped token from `qs gh-auth` |
 
 Scripts in `logout.d/` are the exit-time counterpart: they run as the sandbox
 user when the session ends (a normal `exit`, Ctrl-D, or quitting Claude Code),
@@ -198,6 +235,7 @@ existing sandboxes automatically on next entry.
 | Shared workspace | `/Users/Shared/qs-NAME` |
 | Cloned repos | `/Users/Shared/qs-NAME/repos/<repo>` (linked at `~/<repo>`) |
 | Deploy keys | `/Users/Shared/qs-NAME/_quicksand/.ssh/` |
+| gh tokens | `/Users/Shared/qs-NAME/_quicksand/gh-token-<repo>` |
 | Sudoers | `/etc/sudoers.d/50-nopasswd-for-qs-NAME` |
 | Sandbox profile | `/var/quicksand/sandbox-qs-NAME.sb` |
 | Install marker & clone manifest | `~/.config/quicksand/` |

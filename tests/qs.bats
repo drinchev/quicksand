@@ -399,3 +399,98 @@ qs_run() {
     esc="$(printf '%q' "$BATS_TEST_TMPDIR/ws dir/.ssh/id_ed25519_proj")"
     grep -qF "ssh -i $esc" "$STUB_LOG"
 }
+
+
+###############################################################################
+# gh token integration
+###############################################################################
+
+@test "parse_args resolves gh-auth and its optional repo arg" {
+    qs_run 'parse_args gh-auth foo owner/repo
+            echo "$COMMAND $SANDBOX_NAME $GH_AUTH_REPO"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == "gh-auth foo owner/repo" ]]
+}
+
+@test "parse_args resolves the g alias for gh-auth" {
+    qs_run 'parse_args g foo; echo "$COMMAND"'
+    [[ "$output" == "gh-auth" ]]
+}
+
+@test "gh-auth repo arg is optional" {
+    qs_run 'parse_args gh-auth foo; echo "$COMMAND [$GH_AUTH_REPO]"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == "gh-auth []" ]]
+}
+
+@test "parse_github_repo handles OWNER/REPO, https and git URLs" {
+    qs_run 'for r in octo/Hi https://github.com/octo/Hi.git \
+                     https://github.com/octo/Hi git@github.com:octo/Hi.git; do
+                parse_github_repo "$r" && echo "$PG_OWNER/$PG_REPO/$PG_NAME"
+            done'
+    [ "$status" -eq 0 ]
+    [[ "$(echo "$output" | sort -u)" == "octo/Hi/Hi" ]]
+}
+
+@test "parse_github_repo rejects a non-repo string" {
+    qs_run 'parse_github_repo "not-a-repo"'
+    [ "$status" -ne 0 ]
+}
+
+@test "url_encode percent-encodes reserved characters" {
+    qs_run 'url_encode "qs:demo:my repo"'
+    [[ "$output" == "qs%3Ademo%3Amy%20repo" ]]
+}
+
+@test "detect_single_github_clone picks the lone GitHub clone" {
+    export MANIFEST="$BATS_TEST_TMPDIR/manifest"
+    printf 'proj\tme/proj\t\n' > "$MANIFEST"
+    qs_run 'QS_CLONES_MANIFEST="$MANIFEST"
+            detect_single_github_clone && echo "$PG_OWNER/$PG_REPO/$PG_NAME"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == "me/proj/proj" ]]
+}
+
+@test "detect_single_github_clone fails when there are several clones" {
+    export MANIFEST="$BATS_TEST_TMPDIR/manifest"
+    printf 'a\tme/a\t\nb\tme/b\t\n' > "$MANIFEST"
+    qs_run 'QS_CLONES_MANIFEST="$MANIFEST"; detect_single_github_clone'
+    [ "$status" -ne 0 ]
+}
+
+@test "detect_single_github_clone ignores non-GitHub (no owner) clones" {
+    export MANIFEST="$BATS_TEST_TMPDIR/manifest"
+    printf 'local\t\t/some/path\n' > "$MANIFEST"
+    qs_run 'QS_CLONES_MANIFEST="$MANIFEST"; detect_single_github_clone'
+    [ "$status" -ne 0 ]
+}
+
+@test "gh_token_setup is a no-op on non-interactive stdin" {
+    qs_run 'QS_PRIVATE_DIR="$BATS_TEST_TMPDIR/priv" SANDBOX_NAME=demo
+            gh_token_setup owner repo repo < /dev/null
+            ls "$BATS_TEST_TMPDIR/priv" 2>/dev/null || echo no-file'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"no-file"* ]]
+}
+
+@test "cmd_gh_auth requires a repo when none can be detected" {
+    qs_run 'COMMAND_ARGS=(); GH_AUTH_REPO=""; SANDBOX_NAME=demo
+            QS_CLONES_MANIFEST="$BATS_TEST_TMPDIR/none"
+            cmd_gh_auth'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Specify which repo"* ]]
+}
+
+@test "cleanup reminds about a saved gh token that can't be API-revoked" {
+    make_stub gh 'exit 0'
+    export MANIFEST="$BATS_TEST_TMPDIR/manifest"
+    export PRIV="$BATS_TEST_TMPDIR/priv"
+    mkdir -p "$PRIV"; touch "$PRIV/gh-token-repo"
+    printf 'repo\towner/repo\t\n' > "$MANIFEST"
+    qs_run 'PATH="$STUBS:$PATH"; SANDBOX_NAME=demo
+            QS_CLONES_MANIFEST="$MANIFEST" QS_PRIVATE_DIR="$PRIV"
+            QS_REPOS_DIR=/nonexistent/repos
+            cleanup_clone_artifacts'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"can't be revoked via API"* ]]
+}

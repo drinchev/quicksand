@@ -647,11 +647,26 @@ EOF
     # Escape sed-replacement metacharacters (\ & and the | delimiter).
     BOOT_VOLUME_SED="$(printf '%s' "$BOOT_VOLUME" | sed -e 's/[\\&|]/\\&/g')"
 
+    # This sandbox user's confstr temp/cache dirs under /var/folders,
+    # resolved as the sandbox user (which also creates them). The paths
+    # are a deterministic function of the UID, so baking them into the
+    # rendered profile is safe. Uses the NOPASSWD env rule written above.
+    QS_USER_TEMP_DIR="$(sudo --user="$QUICKSAND_USER" /usr/bin/env \
+        getconf DARWIN_USER_TEMP_DIR)"
+    QS_USER_CACHE_DIR="$(sudo --user="$QUICKSAND_USER" /usr/bin/env \
+        getconf DARWIN_USER_CACHE_DIR)"
+    QS_USER_TEMP_DIR="${QS_USER_TEMP_DIR%/}"
+    QS_USER_CACHE_DIR="${QS_USER_CACHE_DIR%/}"
+    [[ "$QS_USER_TEMP_DIR" == /var/folders/* && "$QS_USER_CACHE_DIR" == /var/folders/* ]] \
+        || abort "Could not resolve per-user temp dirs for $QUICKSAND_USER (got: '$QS_USER_TEMP_DIR', '$QS_USER_CACHE_DIR')"
+
     sudo mkdir -p "$(dirname "$SANDBOX_PROFILE")"
     sudo /bin/chmod 0755 "$(dirname "$SANDBOX_PROFILE")"
     sed -e "s|@SHARED_WORKSPACE@|$SHARED_WORKSPACE|g" \
         -e "s|@QUICKSAND_USER_HOME@|/Users/$QUICKSAND_USER|g" \
         -e "s|@BOOT_VOLUME@|$BOOT_VOLUME_SED|g" \
+        -e "s|@DARWIN_USER_TEMP_DIR@|$QS_USER_TEMP_DIR|g" \
+        -e "s|@DARWIN_USER_CACHE_DIR@|$QS_USER_CACHE_DIR|g" \
         "$QS_SANDBOX_PROFILE_TEMPLATE" \
         | sudo tee "$SANDBOX_PROFILE" > /dev/null
     sudo /bin/chmod 0444 "$SANDBOX_PROFILE"
@@ -736,8 +751,10 @@ fi
 ###############################################################################
 INITIAL_DIR_Q="$(quote_zsh_args "${INITIAL_DIR:-/Users/$QUICKSAND_USER}")"
 # TMPDIR is per-session so tools that name temp dirs after themselves
-# (e.g. /tmp/claude) don't collide across sandbox users.
-ZSH_COMMAND="export TMPDIR=\$(mktemp -d); cd $INITIAL_DIR_Q 2>/dev/null || cd ~"
+# (e.g. /tmp/claude) don't collide across sandbox users, and lives in
+# the sandbox user's private /var/folders tree rather than world-listable
+# /tmp (falling back to /tmp if confstr resolution ever fails).
+ZSH_COMMAND="export TMPDIR=\$(mktemp -d \"\$(getconf DARWIN_USER_TEMP_DIR)/qs.XXXXXX\" 2>/dev/null || mktemp -d); cd $INITIAL_DIR_Q 2>/dev/null || cd ~"
 
 # Run per-session profile scripts as the sandbox user.
 ZSH_COMMAND="$ZSH_COMMAND; setopt null_glob; for s in $SHARED_WORKSPACE/_quicksand/profile.d/*.sh $SHARED_WORKSPACE/_quicksand/custom/profile.d/*.sh; do [[ -f \"\$s\" && -x \"\$s\" ]] && \"\$s\"; done"

@@ -39,18 +39,25 @@
 (deny file-read*
     (subpath "/Library/Keychains"))
 
+;; /tmp stays writable: too many tools hardcode it, and the sticky bit
+;; plus 0700 mktemp dirs already guard cross-user tampering. /var/folders
+;; is narrowed to this sandbox user's own confstr dirs (resolved at build
+;; time; deterministic per UID) so other users' temp/cache stay off
+;; limits. Both spellings are needed: /var is a symlink to /private/var
+;; and the kernel may report either form.
 (allow file-write*
     (subpath "@SHARED_WORKSPACE@")
     (subpath "@QUICKSAND_USER_HOME@")
     (subpath "/tmp")
     (subpath "/private/tmp")
-    (subpath "/var/folders")
-    (subpath "/private/var/folders")
+    (subpath "@DARWIN_USER_TEMP_DIR@")
+    (subpath "/private@DARWIN_USER_TEMP_DIR@")
+    (subpath "@DARWIN_USER_CACHE_DIR@")
+    (subpath "/private@DARWIN_USER_CACHE_DIR@")
     (subpath "/dev"))
 
-(allow process-info*)
-(allow sysctl-read)
-(allow process*)
+;; `ps` runs unsandboxed so it can enumerate processes; everything else
+;; about process handling is already permitted by (allow default).
 (allow process-exec
     (literal "/bin/ps")
     (with no-sandbox))

@@ -180,26 +180,30 @@ real backstop — re-run `qs gh-auth` to refresh.
 
 The Cloud SDK is installed in every sandbox (`48-install-gcloud.sh`), but it
 needs credentials to do anything. `qs gcp-auth` provisions a **per-sandbox
-service account** scoped to one project — your host gcloud identity never
-enters the sandbox, mirroring the deploy-key/PAT split for GitHub:
+service account** scoped to one or more projects — your host gcloud identity
+never enters the sandbox, mirroring the deploy-key/PAT split for GitHub:
 
 ```bash
 qs gcp-auth work metadata-dev-4d18
+# or span several projects (e.g. the sandbox's project + a shared registry):
+qs gcp-auth work metadata-dev-4d18 shared-packages-fad1
 ```
 
-The argument is the **target project** to grant read access on. The service
-account's own **owner project** (where it's created) is prompted, defaulting
-to your active gcloud project — press Enter to accept. The flow then:
+The arguments are the **target projects** to grant read access on — pass more
+than one when the resources you need live in different projects (a common case:
+an Artifact Registry / npm repo hosted in a separate shared-packages project).
+The service account's own **owner project** (where it's created) is prompted,
+defaulting to your active gcloud project — press Enter to accept. The flow then:
 
 1. Creates the service account `qs-NAME` in the owner project (display name
    `Quicksand sandbox: NAME`). The sandbox name is lowercased and `_`→`-` to
    satisfy GCP's account-id rules; idempotent if it already exists.
-2. Grants `roles/viewer` and `roles/artifactregistry.reader` on the target
+2. Grants `roles/viewer` and `roles/artifactregistry.reader` on **each** target
    project (override with `QS_GCP_ROLES="role1,role2"`).
 3. Grants your host's active identity `roles/iam.serviceAccountTokenCreator`
    on the SA, then mints a short-lived access token by impersonating it and
    writes the token to the workspace (`chmod 600`).
-4. Pins the target project as the sandbox's default.
+4. Pins the **first** target project as the sandbox's default.
 
 On the next session, `61-gcp-auth.sh` points gcloud at the token file
 (`gcloud config set auth/access_token_file`, which `gsutil` and `gcloud
@@ -226,7 +230,7 @@ quicksand handles the expiry for you in two ways:
   ```
 
 Your host must be logged in (`gcloud auth login`) with permission to create
-service accounts in the owner project, set IAM policy on the target project,
+service accounts in the owner project, set IAM policy on each target project,
 and set IAM policy on the SA itself (to grant token-creator). `qs uninstall`
 removes the IAM bindings and deletes the service account (which drops the
 token-creator binding with it).

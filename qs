@@ -12,6 +12,10 @@ trap 'echo >&2 "${BASH_SOURCE[0]}: line $LINENO: $BASH_COMMAND: exitcode $?"' ER
 readonly VERSION="0.1.0"
 readonly SANDBOX_NAME_MAX_LEN=16
 
+# IAM roles granted to a sandbox's service account on the target project by
+# `qs gcp-auth`. Override per-invocation with QS_GCP_ROLES="role1,role2".
+readonly QS_GCP_DEFAULT_ROLES=(roles/viewer roles/artifactregistry.reader)
+
 # Resolve the directory holding qs (and its sibling profile.d/) following
 # any chain of symlinks. Mirrors `readlink -f`, which macOS bash lacks.
 QS_SOURCE="${BASH_SOURCE[0]}"
@@ -88,6 +92,8 @@ Usage:
   qs claude    NAME [PATH] [-- args ...]
   qs clone     NAME URL_OR_PATH
   qs gh-auth   NAME [OWNER/REPO]
+  qs gcp-auth  NAME TARGET_PROJECT
+  qs gcp-token NAME
   qs uninstall NAME
   qs list
 
@@ -104,6 +110,17 @@ the sandbox (open PRs and comments, read commits, branches and CI). It
 opens a prefilled fine-grained PAT creation page and stores the token you
 paste back; git push/pull keeps using the deploy key. 'clone' offers this
 automatically. OWNER/REPO may be omitted when the sandbox has one clone.
+
+'gcp-auth' provisions a per-sandbox Google Cloud service account so
+'gcloud'/'gsutil' work inside the sandbox. TARGET_PROJECT is the project to
+grant read access on; the service account's own (owner) project is prompted,
+defaulting to your active gcloud project. It creates the SA 'qs-NAME', grants
+roles/viewer + roles/artifactregistry.reader on TARGET_PROJECT (override with
+QS_GCP_ROLES), lets your host impersonate the SA, mints a short-lived access
+token into the sandbox, and pins TARGET_PROJECT as the default. 'uninstall'
+unbinds the roles and deletes the SA. Downloadable keys are intentionally not
+used (orgs commonly disable them); the token lasts ~1h, so 'gcp-token' re-mints
+one without redoing the SA/role setup.
 
 Options:
   -r, --rebuild        Rebuild configuration and file permissions/ACLs.
@@ -150,6 +167,7 @@ COMMAND_ARGS=()
 INITIAL_DIR=""
 CLONE_SOURCE=""
 GH_AUTH_REPO=""
+GCP_TARGET_PROJECT=""
 
 parse_args() {
     if [[ -n "${QUICKSAND_ARGS:-}" ]]; then
@@ -193,6 +211,8 @@ parse_args() {
         cl|claude)   COMMAND=claude; needs_name=true ;;
         c|clone)     COMMAND=clone;  needs_name=true ;;
         g|gh-auth)   COMMAND=gh-auth; needs_name=true ;;
+        gp|gcp-auth) COMMAND=gcp-auth; needs_name=true ;;
+        gt|gcp-token) COMMAND=gcp-token; needs_name=true ;;
         b|build)     COMMAND=build;  needs_name=true ;;
         u|uninstall) COMMAND=uninstall; needs_name=true ;;
         *)           abort "Unknown command: $1 (try: qs --help)" ;;
@@ -210,6 +230,7 @@ parse_args() {
                 CLONE_SOURCE="$3"
                 ;;
             gh-auth) GH_AUTH_REPO="${3:-}" ;;
+            gcp-auth) GCP_TARGET_PROJECT="${3:-}" ;;
         esac
     fi
 }
@@ -236,6 +257,10 @@ derive_constants() {
     # One tab-separated line per clone: REPO_NAME\tOWNER/REPO\tLOCAL_REPO_PATH
     # (fields 2 and 3 may be empty).
     readonly QS_CLONES_MANIFEST="$INSTALL_DIR/clones-$SANDBOX_NAME"
+    # Host-side record of `qs gcp-auth` IAM bindings, consumed by uninstall to
+    # reverse them. One tab-separated line per granted role:
+    # OWNER_PROJECT\tSA_EMAIL\tTARGET_PROJECT\tROLE
+    readonly QS_GCP_MANIFEST="$INSTALL_DIR/gcp-$SANDBOX_NAME"
     # Host-side personal additions. The whole tree is rsync'd verbatim into
     # the sandbox's _quicksand/custom/. Recognised subdirs:
     #   custom/profile.d/   .sh scripts run after canonical (50-99 prefixes)
@@ -417,6 +442,48 @@ cleanup_clone_artifacts() {
     rm -f "$QS_CLONES_MANIFEST"
 }
 
+# Reverse what `qs gcp-auth` provisioned: remove each recorded IAM binding on
+# its target project, then delete each service account (which also deletes its
+# keys). Best-effort — warns and continues so uninstall always completes.
+cleanup_gcp() {
+    [[ -f "$QS_GCP_MANIFEST" ]] || return 0
+    if ! command -v gcloud >/dev/null 2>&1; then
+        warn "gcloud not on host — remove the service account(s) recorded in $QS_GCP_MANIFEST by hand."
+        return 0
+    fi
+
+    local owner sa target role
+    local sa_owners=()   # deduplicated "OWNER<TAB>SA" pairs, deleted after unbinding
+    while IFS=$'\t' read -r owner sa target role; do
+        [[ -n "$sa" && -n "$target" && -n "$role" ]] || continue
+        if gcloud projects remove-iam-policy-binding "$target" \
+                --member="serviceAccount:$sa" \
+                --role="$role" --condition=None >/dev/null 2>&1; then
+            info "Removed $role on $target from $sa"
+        else
+            warn "Could not remove $role on $target from $sa — remove it by hand if it remains."
+        fi
+        local pair="$owner"$'\t'"$sa" seen=false existing
+        for existing in "${sa_owners[@]+"${sa_owners[@]}"}"; do
+            [[ "$existing" == "$pair" ]] && { seen=true; break; }
+        done
+        [[ "$seen" == "true" ]] || sa_owners+=("$pair")
+    done < "$QS_GCP_MANIFEST"
+
+    local pair
+    for pair in "${sa_owners[@]+"${sa_owners[@]}"}"; do
+        owner="${pair%%$'\t'*}"; sa="${pair#*$'\t'}"
+        if gcloud iam service-accounts delete "$sa" \
+                --project="$owner" --quiet >/dev/null 2>&1; then
+            info "Deleted service account $sa"
+        else
+            warn "Could not delete service account $sa from $owner — delete it by hand if it remains."
+        fi
+    done
+
+    rm -f "$QS_GCP_MANIFEST"
+}
+
 # Append a clone record to the manifest (see QS_CLONES_MANIFEST) so
 # uninstall can clean up after it. Idempotent: skips exact duplicates.
 record_clone() {
@@ -542,6 +609,150 @@ EOF
     ( umask 077; printf '%s\n' "$token" > "$token_file" )
     chmod 0600 "$token_file"
     info "Token saved for $owner_repo — 'gh' signs in automatically inside the sandbox."
+}
+
+# Derive a GCP service-account account ID from the sandbox name. GCP IDs are
+# stricter than sandbox names (lowercase, digits, hyphens, 6–30 chars, must
+# start with a letter and end alphanumeric), so we lowercase, map '_' → '-',
+# and validate. Sets GCP_SA_ID; aborts with guidance if it can't be valid.
+GCP_SA_ID=""
+gcp_sa_id_from_name() {
+    local name="$1" id
+    id="qs-$(printf '%s' "$name" | tr 'A-Z_' 'a-z-')"
+    [[ "$id" =~ ^[a-z][a-z0-9-]{4,28}[a-z0-9]$ ]] \
+        || abort "Can't derive a valid GCP service-account id from '$name' (got '$id'). GCP requires 6–30 chars [a-z0-9-], starting with a letter and ending alphanumeric — try a longer sandbox name."
+    GCP_SA_ID="$id"
+}
+
+# Mint a short-lived access token by impersonating SA_EMAIL and write it where
+# 61-gcp-auth.sh points gcloud at it. Downloadable SA keys are blocked by the
+# org policy iam.disableServiceAccountKeyCreation, so the sandbox runs on
+# impersonated tokens (which expire in ~1h — refreshed automatically on launch,
+# or manually with `qs gcp-token`). Returns nonzero (without aborting) on
+# failure so callers decide whether it's fatal; a "quiet" second arg suppresses
+# the normal progress lines (used by the launch-time auto-refresh).
+gcp_mint_token() {
+    local sa_email="$1" quiet="${2:-}" token
+    [[ "$quiet" == quiet ]] || info "Minting access token for $sa_email (impersonation)..."
+    if ! token="$(gcloud auth print-access-token \
+            --impersonate-service-account="$sa_email" 2>/dev/null)" \
+        || [[ -z "$token" ]]; then
+        warn "Could not mint a GCP token for $sa_email — confirm the host has roles/iam.serviceAccountTokenCreator on it."
+        return 1
+    fi
+    mkdir -p "$QS_PRIVATE_DIR"
+    local token_file="$QS_PRIVATE_DIR/gcp-token"
+    ( umask 077; printf '%s\n' "$token" > "$token_file" )
+    chmod 0600 "$token_file"
+    [[ "$quiet" == quiet ]] || info "Token written (valid ~1h) — refresh with: qs gcp-token $SANDBOX_NAME"
+}
+
+# Best-effort: refresh the sandbox's GCP token on the host just before entering
+# an interactive session, so it starts with a fresh ~1h credential. No-op for
+# sandboxes without GCP (no recorded SA). Skips when the current token is still
+# young (minted under 50 minutes ago) to avoid a needless API call on every
+# entry, and never blocks or fails the launch — minting needs host gcloud auth,
+# which may be offline or lapsed (in which case the existing token still works
+# until it expires, or this session simply has no GCP).
+gcp_auto_refresh() {
+    local sa_file="$QS_PRIVATE_DIR/gcp-sa"
+    [[ -f "$sa_file" ]] || return 0
+    command -v gcloud >/dev/null 2>&1 || return 0
+
+    local token_file="$QS_PRIVATE_DIR/gcp-token"
+    if [[ -f "$token_file" && -z "$(find "$token_file" -mmin +50 2>/dev/null)" ]]; then
+        debug "GCP token is fresh; skipping launch refresh"
+        return 0
+    fi
+
+    local sa_email
+    sa_email="$(<"$sa_file")"
+    [[ -n "$sa_email" ]] || return 0
+    info "Refreshing GCP access token for $sa_email..."
+    gcp_mint_token "$sa_email" quiet || true
+}
+
+# Provision a per-sandbox GCP service account the sandbox uses for
+# gcloud/gsutil. Idempotently creates the SA 'qs-<name>' in OWNER_PROJECT,
+# grants the configured read roles on TARGET_PROJECT, lets the host impersonate
+# the SA (token-creator), mints the first access token into the workspace,
+# pins TARGET_PROJECT as the sandbox default, and records every binding so
+# uninstall can reverse it. Uses the host's own gcloud identity, which must be
+# able to create SAs in OWNER_PROJECT, set IAM policy on TARGET_PROJECT, and
+# set IAM policy on the SA itself.
+gcp_sa_setup() {
+    local owner_project="$1" target_project="$2" sandbox_name="$3"
+
+    command -v gcloud >/dev/null 2>&1 \
+        || abort "gcloud not found on host — install the Google Cloud SDK and run 'gcloud auth login' first."
+
+    gcp_sa_id_from_name "$sandbox_name"
+    local sa_id="$GCP_SA_ID"
+    local sa_email="${sa_id}@${owner_project}.iam.gserviceaccount.com"
+
+    # Roles: env override (comma-separated) or the built-in defaults.
+    local roles=()
+    if [[ -n "${QS_GCP_ROLES:-}" ]]; then
+        IFS=',' read -r -a roles <<< "$QS_GCP_ROLES"
+    else
+        roles=("${QS_GCP_DEFAULT_ROLES[@]}")
+    fi
+
+    # 1. Ensure the service account exists (idempotent across re-runs).
+    if gcloud iam service-accounts describe "$sa_email" \
+            --project="$owner_project" >/dev/null 2>&1; then
+        info "Service account $sa_email already exists."
+    else
+        info "Creating service account $sa_email..."
+        gcloud iam service-accounts create "$sa_id" \
+            --project="$owner_project" \
+            --display-name="Quicksand sandbox: $sandbox_name" >/dev/null \
+            || abort "Failed to create service account $sa_id in $owner_project"
+    fi
+
+    # 2. Grant each role on the target project, recording it for teardown.
+    mkdir -p "$INSTALL_DIR"
+    local role entry
+    for role in "${roles[@]}"; do
+        [[ -n "$role" ]] || continue
+        info "Granting $role on $target_project to $sa_email..."
+        if gcloud projects add-iam-policy-binding "$target_project" \
+                --member="serviceAccount:$sa_email" \
+                --role="$role" --condition=None >/dev/null 2>&1; then
+            entry="$(printf '%s\t%s\t%s\t%s' \
+                "$owner_project" "$sa_email" "$target_project" "$role")"
+            grep -qxF "$entry" "$QS_GCP_MANIFEST" 2>/dev/null \
+                || echo "$entry" >> "$QS_GCP_MANIFEST"
+        else
+            warn "Failed to grant $role on $target_project — you may lack setIamPolicy there. Continuing; the token is still minted."
+        fi
+    done
+
+    # 3. Let the host's active identity impersonate the SA (the org blocks
+    #    downloadable keys), so it can mint access tokens for the sandbox.
+    local host_account member
+    host_account="$(gcloud auth list --filter=status:ACTIVE \
+        --format='value(account)' 2>/dev/null | head -n1)"
+    [[ -n "$host_account" ]] \
+        || abort "No active gcloud account on host — run 'gcloud auth login' first."
+    if [[ "$host_account" == *.gserviceaccount.com ]]; then
+        member="serviceAccount:$host_account"
+    else
+        member="user:$host_account"
+    fi
+    info "Allowing $host_account to impersonate $sa_email..."
+    gcloud iam service-accounts add-iam-policy-binding "$sa_email" \
+        --member="$member" --role="roles/iam.serviceAccountTokenCreator" \
+        --project="$owner_project" >/dev/null \
+        || abort "Failed to grant token-creator on $sa_email to $host_account"
+
+    # 4. Record the SA + default project, then mint the first token.
+    mkdir -p "$QS_PRIVATE_DIR"
+    printf '%s\n' "$sa_email"       > "$QS_PRIVATE_DIR/gcp-sa"
+    printf '%s\n' "$target_project" > "$QS_PRIVATE_DIR/gcp-project"
+    gcp_mint_token "$sa_email" || abort "Failed to mint the initial access token for $sa_email."
+
+    info "Service account ready — gcloud/gsutil run as $sa_email inside the sandbox (default project $target_project)."
 }
 
 # Clone a git repo into $QS_REPOS_DIR/<reponame>. For GitHub SSH URLs,
@@ -879,6 +1090,7 @@ cmd_uninstall() {
     info "Uninstalling sandbox '$SANDBOX_NAME'..."
 
     cleanup_clone_artifacts
+    cleanup_gcp
 
     # Best-effort: tear down any running session for this sandbox user.
     # `|| true` swallows pipefail-induced ERR when the user is already
@@ -942,6 +1154,51 @@ cmd_gh_auth() {
     gh_token_setup "$PG_OWNER" "$PG_REPO" "$PG_NAME"
 }
 
+# Provision (or refresh) the GCP service account for a sandbox. The required
+# argument is the *target* project to grant read access on; the *owner*
+# project (where the SA lives) is prompted, defaulting to the host's active
+# gcloud project.
+cmd_gcp_auth() {
+    (( ${#COMMAND_ARGS[@]} == 0 )) \
+        || abort "qs gcp-auth doesn't accept '--' args"
+    [[ -n "$GCP_TARGET_PROJECT" ]] \
+        || abort "Specify the project to grant access on: qs gcp-auth $SANDBOX_NAME TARGET_PROJECT"
+    command -v gcloud >/dev/null 2>&1 \
+        || abort "gcloud not found on host — install the Google Cloud SDK and run 'gcloud auth login' first."
+    [[ -t 0 ]] \
+        || abort "qs gcp-auth needs an interactive terminal to confirm the owner project."
+
+    local default_owner owner_project
+    default_owner="$(gcloud config get-value project 2>/dev/null || true)"
+    [[ "$default_owner" == "(unset)" ]] && default_owner=""
+    if [[ -n "$default_owner" ]]; then
+        read -r -p "Service-account owner project [$default_owner]: " owner_project
+        owner_project="${owner_project:-$default_owner}"
+    else
+        read -r -p "Service-account owner project: " owner_project
+    fi
+    [[ -n "$owner_project" ]] || abort "Owner project required."
+
+    gcp_sa_setup "$owner_project" "$GCP_TARGET_PROJECT" "$SANDBOX_NAME"
+}
+
+# Refresh the sandbox's GCP access token. Impersonated tokens expire in ~1h;
+# this re-mints one for the SA recorded by `qs gcp-auth`, skipping the SA and
+# role provisioning. The sandbox picks up the new token on its next gcloud call.
+cmd_gcp_token() {
+    (( ${#COMMAND_ARGS[@]} == 0 )) \
+        || abort "qs gcp-token doesn't accept '--' args"
+    command -v gcloud >/dev/null 2>&1 \
+        || abort "gcloud not found on host — install the Google Cloud SDK and run 'gcloud auth login' first."
+    local sa_file="$QS_PRIVATE_DIR/gcp-sa"
+    [[ -f "$sa_file" ]] \
+        || abort "No GCP service account recorded for '$SANDBOX_NAME' — run: qs gcp-auth $SANDBOX_NAME TARGET_PROJECT"
+    local sa_email
+    sa_email="$(<"$sa_file")"
+    [[ -n "$sa_email" ]] || abort "Empty $sa_file — re-run: qs gcp-auth $SANDBOX_NAME TARGET_PROJECT"
+    gcp_mint_token "$sa_email" || exit 1
+}
+
 # Enter the sandbox: sanity-check the build artifacts, assemble the
 # in-sandbox zsh command line, and exec into it (never returns).
 cmd_launch() {
@@ -961,6 +1218,9 @@ cmd_launch() {
     if ! sudo --non-interactive --user="$QUICKSAND_USER" /usr/bin/true; then
         abort "Passwordless sudo to $QUICKSAND_USER not configured. Run: qs build $SANDBOX_NAME --rebuild"
     fi
+
+    # Hand the session a fresh GCP token if this sandbox uses one (best-effort).
+    gcp_auto_refresh
 
     local INITIAL_DIR_Q ZSH_COMMAND
     INITIAL_DIR_Q="$(quote_zsh_args "${INITIAL_DIR:-/Users/$QUICKSAND_USER}")"
@@ -1094,6 +1354,14 @@ main() {
         gh-auth)
             ensure_built
             cmd_gh_auth
+            ;;
+        gcp-auth)
+            ensure_built
+            cmd_gcp_auth
+            ;;
+        gcp-token)
+            ensure_built
+            cmd_gcp_token
             ;;
         shell|claude)
             ensure_built

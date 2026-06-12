@@ -94,10 +94,12 @@ qs shell     NAME [PATH] [-- args ...]   zsh session in the sandbox
 qs claude    NAME [PATH] [-- args ...]   Claude Code in the sandbox
 qs clone     NAME URL_OR_PATH            clone a repo into the sandbox
 qs gh-auth   NAME [OWNER/REPO]           set up a repo-scoped gh token
+qs gcp-auth  NAME TARGET_PROJECT         provision a scoped GCP service account
+qs gcp-token NAME                        refresh the GCP access token (~1h)
 qs uninstall NAME                        remove the sandbox completely
 qs list                                  list sandboxes
 
-Short aliases: b, s, cl, c, g, u, l.
+Short aliases: b, s, cl, c, g, gp, gt, u, l.
 ```
 
 PATH is where the session starts, *inside* the sandbox: relative paths and
@@ -174,6 +176,61 @@ for you; it prints a reminder with the [token settings
 link](https://github.com/settings/tokens?type=beta). The short expiry is the
 real backstop — re-run `qs gh-auth` to refresh.
 
+## Google Cloud access (`gcloud` / `gsutil`)
+
+The Cloud SDK is installed in every sandbox (`48-install-gcloud.sh`), but it
+needs credentials to do anything. `qs gcp-auth` provisions a **per-sandbox
+service account** scoped to one project — your host gcloud identity never
+enters the sandbox, mirroring the deploy-key/PAT split for GitHub:
+
+```bash
+qs gcp-auth work metadata-dev-4d18
+```
+
+The argument is the **target project** to grant read access on. The service
+account's own **owner project** (where it's created) is prompted, defaulting
+to your active gcloud project — press Enter to accept. The flow then:
+
+1. Creates the service account `qs-NAME` in the owner project (display name
+   `Quicksand sandbox: NAME`). The sandbox name is lowercased and `_`→`-` to
+   satisfy GCP's account-id rules; idempotent if it already exists.
+2. Grants `roles/viewer` and `roles/artifactregistry.reader` on the target
+   project (override with `QS_GCP_ROLES="role1,role2"`).
+3. Grants your host's active identity `roles/iam.serviceAccountTokenCreator`
+   on the SA, then mints a short-lived access token by impersonating it and
+   writes the token to the workspace (`chmod 600`).
+4. Pins the target project as the sandbox's default.
+
+On the next session, `61-gcp-auth.sh` points gcloud at the token file
+(`gcloud config set auth/access_token_file`, which `gsutil` and `gcloud
+storage` honor) and sets the default project — so `gsutil ls`, `gcloud
+storage`, and `bq` just work.
+
+**No downloadable keys.** Most GCP orgs enforce
+`constraints/iam.disableServiceAccountKeyCreation`, which blocks SA key files
+outright. quicksand sidesteps that entirely by using **impersonated tokens**
+instead of keys. The trade-off is lifetime: impersonated tokens last about an
+hour (and 1h is a hard cap unless an org admin allows lifetime extension).
+
+quicksand handles the expiry for you in two ways:
+
+- **On launch:** every `qs shell`/`qs claude` mints a fresh token on the host
+  before entering (skipped if the current one is under ~50 min old, and
+  best-effort — a failed mint never blocks entry). So any session under an hour
+  needs nothing manual.
+- **Mid-session:** for a session that outlives its token, refresh from another
+  host terminal — the sandbox re-reads the token file on every gcloud call, so
+  it picks up the new one live, no re-entry:
+  ```bash
+  qs gcp-token work
+  ```
+
+Your host must be logged in (`gcloud auth login`) with permission to create
+service accounts in the owner project, set IAM policy on the target project,
+and set IAM policy on the SA itself (to grant token-creator). `qs uninstall`
+removes the IAM bindings and deletes the service account (which drops the
+token-creator binding with it).
+
 ## Automatic rebuilds
 
 The install marker stores a fingerprint of everything a build bakes into a
@@ -201,6 +258,7 @@ sandbox (first run installs, later runs are no-ops):
 | `50-tab-color.sh` | tint the iTerm2 tab green so a sandbox tab is obvious |
 | `51-tab-name.sh` | name the tab `<sandbox> \| Claude` or `<sandbox> \| Shell` |
 | `60-gh-auth.sh` | sign `gh` in with the repo-scoped token from `qs gh-auth` |
+| `61-gcp-auth.sh` | point `gcloud`/`gsutil` at the impersonated token from `qs gcp-auth` |
 
 Scripts in `logout.d/` are the exit-time counterpart: they run as the sandbox
 user when the session ends (a normal `exit`, Ctrl-D, or quitting Claude Code),
@@ -236,9 +294,10 @@ existing sandboxes automatically on next entry.
 | Cloned repos | `/Users/Shared/qs-NAME/repos/<repo>` (linked at `~/<repo>`) |
 | Deploy keys | `/Users/Shared/qs-NAME/_quicksand/.ssh/` |
 | gh tokens | `/Users/Shared/qs-NAME/_quicksand/gh-token-<repo>` |
+| GCP access token & SA ref | `/Users/Shared/qs-NAME/_quicksand/gcp-token`, `gcp-sa` |
 | Sudoers | `/etc/sudoers.d/50-nopasswd-for-qs-NAME` |
 | Sandbox profile | `/var/quicksand/sandbox-qs-NAME.sb` |
-| Install marker & clone manifest | `~/.config/quicksand/` |
+| Install marker, clone & GCP manifests | `~/.config/quicksand/` |
 
 Sandbox names: up to 16 characters, `[A-Za-z0-9_-]+`.
 

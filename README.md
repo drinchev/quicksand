@@ -202,6 +202,16 @@ sandbox (first run installs, later runs are no-ops):
 | `51-tab-name.sh` | name the tab `<sandbox> \| Claude` or `<sandbox> \| Shell` |
 | `60-gh-auth.sh` | sign `gh` in with the repo-scoped token from `qs gh-auth` |
 
+After the `profile.d/` scripts run, the launcher sources the sandbox's
+`~/.zshrc` before starting the session — for `qs claude`, one-off `-- command`
+runs, and piped input alike, not just the interactive `qs shell` (which already
+loaded it). So environment variables, `PATH` additions, and other settings you
+keep in the sandbox's `~/.zshrc` are present in every session, including the one
+Claude Code runs in. Sourcing is best-effort: a missing or broken `~/.zshrc`
+never blocks the session. Note this is the *sandbox's* `~/.zshrc`, not your
+host's — to seed it, drop a script in your [personal
+overlay](#personal-overlay-configquicksandcustom)'s `profile.d/`.
+
 Scripts in `logout.d/` are the exit-time counterpart: they run as the sandbox
 user when the session ends (a normal `exit`, Ctrl-D, or quitting Claude Code),
 via an `EXIT` trap in the launcher. Use them to undo anything a `profile.d/`

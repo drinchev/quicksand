@@ -983,6 +983,19 @@ cmd_launch() {
     # (e.g. SIGHUP when the terminal closes), which is fine — the tab is gone.
     ZSH_COMMAND="$ZSH_COMMAND; trap 'for s in $SHARED_WORKSPACE/_quicksand/logout.d/*.sh $SHARED_WORKSPACE/_quicksand/custom/logout.d/*.sh; do [[ -f \"\$s\" && -x \"\$s\" ]] && \"\$s\"; done' EXIT"
 
+    # The outer `zsh -c` below is non-interactive, so it does NOT source
+    # ~/.zshrc the way `qs shell`'s inner `zsh -i` does. Source it explicitly
+    # before launching claude / a one-off command / a piped session, so the
+    # environment variables and settings defined in the sandbox's ~/.zshrc are
+    # present in every session, not just the interactive shell. Placed after
+    # the profile.d loop above so a ~/.zshrc that 45-install-oh-my-zsh.sh only
+    # just created on first run is picked up. Guarded and best-effort: a
+    # missing or failing ~/.zshrc must never block the session (this outer
+    # shell runs without `set -e`, so the following `;`-separated command runs
+    # regardless). The interactive `zsh -i` branch is left alone — its inner
+    # shell already sources ~/.zshrc, and double-sourcing would re-run omz.
+    local SOURCE_ZSHRC='[[ -r ~/.zshrc ]] && source ~/.zshrc'
+
     # Session kind, consumed by profile.d/51-tab-name.sh to label the tab as
     # "<sandbox> | Claude" or "<sandbox> | Shell". Only the two interactive
     # (tty) modes get a label; one-off command and piped sessions are left
@@ -996,15 +1009,16 @@ cmd_launch() {
         # 30-claude-json.sh profile script) is the on-disk acknowledgement.
         # Not exec'd (unlike a bare launch) so the EXIT trap's logout.d hooks
         # run when claude quits.
-        ZSH_COMMAND="$ZSH_COMMAND; $(quote_zsh_args claude --dangerously-skip-permissions "${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}")"
+        ZSH_COMMAND="$ZSH_COMMAND; $SOURCE_ZSHRC; $(quote_zsh_args claude --dangerously-skip-permissions "${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}")"
     elif (( ${#COMMAND_ARGS[@]} > 0 )); then
-        ZSH_COMMAND="$ZSH_COMMAND; $(quote_zsh_args "${COMMAND_ARGS[@]}")"
+        ZSH_COMMAND="$ZSH_COMMAND; $SOURCE_ZSHRC; $(quote_zsh_args "${COMMAND_ARGS[@]}")"
     elif [[ -t 0 ]]; then
         QS_SESSION_KIND="Shell"
         ZSH_COMMAND="$ZSH_COMMAND; /bin/zsh -i"
     else
-        # Piped stdin: non-interactive zsh, no prompt or interactive hooks.
-        ZSH_COMMAND="$ZSH_COMMAND; /bin/zsh"
+        # Piped stdin: non-interactive zsh, no prompt or interactive hooks. The
+        # nested shell inherits exported vars from the $SOURCE_ZSHRC above.
+        ZSH_COMMAND="$ZSH_COMMAND; $SOURCE_ZSHRC; /bin/zsh"
     fi
 
     SANDBOX_EXEC=()

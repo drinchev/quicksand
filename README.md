@@ -259,6 +259,7 @@ sandbox (first run installs, later runs are no-ops):
 | `46-install-pnpm.sh` | pnpm + Node.js 24 (pnpm as the version manager) |
 | `47-install-python.sh` | uv + a managed Python 3.12 |
 | `48-install-gcloud.sh` | Google Cloud SDK (`gcloud`, `gsutil`, `bq`) |
+| `49-install-aws.sh` | install the AWS CLI v2 (per-user macOS `.pkg`, no sudo) |
 | `50-tab-color.sh` | tint the iTerm2 tab green so a sandbox tab is obvious |
 | `51-tab-name.sh` | name the tab `<sandbox> \| Claude` or `<sandbox> \| Shell` |
 | `60-gh-auth.sh` | sign `gh` in with the repo-scoped token from `qs gh-auth` |

@@ -92,7 +92,7 @@ Usage:
   qs claude    NAME [PATH] [-- args ...]
   qs clone     NAME URL_OR_PATH
   qs gh-auth   NAME [OWNER/REPO]
-  qs gcp-auth  NAME TARGET_PROJECT
+  qs gcp-auth  NAME PROJECT [PROJECT ...]
   qs gcp-token NAME
   qs uninstall NAME
   qs list
@@ -112,15 +112,16 @@ paste back; git push/pull keeps using the deploy key. 'clone' offers this
 automatically. OWNER/REPO may be omitted when the sandbox has one clone.
 
 'gcp-auth' provisions a per-sandbox Google Cloud service account so
-'gcloud'/'gsutil' work inside the sandbox. TARGET_PROJECT is the project to
-grant read access on; the service account's own (owner) project is prompted,
-defaulting to your active gcloud project. It creates the SA 'qs-NAME', grants
-roles/viewer + roles/artifactregistry.reader on TARGET_PROJECT (override with
-QS_GCP_ROLES), lets your host impersonate the SA, mints a short-lived access
-token into the sandbox, and pins TARGET_PROJECT as the default. 'uninstall'
-unbinds the roles and deletes the SA. Downloadable keys are intentionally not
-used (orgs commonly disable them); the token lasts ~1h, so 'gcp-token' re-mints
-one without redoing the SA/role setup.
+'gcloud'/'gsutil' work inside the sandbox. PROJECT is the project to grant read
+access on; pass several to span e.g. the sandbox's own project and a separate
+shared Artifact Registry project. The service account's own (owner) project is
+prompted, defaulting to your active gcloud project. It creates the SA 'qs-NAME',
+grants roles/viewer + roles/artifactregistry.reader on each PROJECT (override
+with QS_GCP_ROLES), lets your host impersonate the SA, mints a short-lived
+access token into the sandbox, and pins the first PROJECT as the default.
+'uninstall' unbinds the roles and deletes the SA. Downloadable keys are
+intentionally not used (orgs commonly disable them); the token lasts ~1h, so
+'gcp-token' re-mints one without redoing the SA/role setup.
 
 Options:
   -r, --rebuild        Rebuild configuration and file permissions/ACLs.
@@ -167,7 +168,7 @@ COMMAND_ARGS=()
 INITIAL_DIR=""
 CLONE_SOURCE=""
 GH_AUTH_REPO=""
-GCP_TARGET_PROJECT=""
+GCP_TARGET_PROJECTS=()
 
 parse_args() {
     if [[ -n "${QUICKSAND_ARGS:-}" ]]; then
@@ -230,7 +231,7 @@ parse_args() {
                 CLONE_SOURCE="$3"
                 ;;
             gh-auth) GH_AUTH_REPO="${3:-}" ;;
-            gcp-auth) GCP_TARGET_PROJECT="${3:-}" ;;
+            gcp-auth) GCP_TARGET_PROJECTS=("${@:3}") ;;
         esac
     fi
 }
@@ -674,14 +675,16 @@ gcp_auto_refresh() {
 
 # Provision a per-sandbox GCP service account the sandbox uses for
 # gcloud/gsutil. Idempotently creates the SA 'qs-<name>' in OWNER_PROJECT,
-# grants the configured read roles on TARGET_PROJECT, lets the host impersonate
-# the SA (token-creator), mints the first access token into the workspace,
-# pins TARGET_PROJECT as the sandbox default, and records every binding so
-# uninstall can reverse it. Uses the host's own gcloud identity, which must be
-# able to create SAs in OWNER_PROJECT, set IAM policy on TARGET_PROJECT, and
-# set IAM policy on the SA itself.
+# grants the configured read roles on each target project, lets the host
+# impersonate the SA (token-creator), mints the first access token into the
+# workspace, pins the first target project as the sandbox default, and records
+# every binding so uninstall can reverse it. Uses the host's own gcloud
+# identity, which must be able to create SAs in OWNER_PROJECT, set IAM policy on
+# each target project, and set IAM policy on the SA itself.
 gcp_sa_setup() {
-    local owner_project="$1" target_project="$2" sandbox_name="$3"
+    local owner_project="$1" sandbox_name="$2"
+    shift 2
+    local target_projects=("$@")
 
     command -v gcloud >/dev/null 2>&1 \
         || abort "gcloud not found on host — install the Google Cloud SDK and run 'gcloud auth login' first."
@@ -710,22 +713,26 @@ gcp_sa_setup() {
             || abort "Failed to create service account $sa_id in $owner_project"
     fi
 
-    # 2. Grant each role on the target project, recording it for teardown.
+    # 2. Grant each role on every target project, recording it for teardown.
+    #    Multiple projects let one SA read across e.g. the sandbox's own
+    #    project and a separate shared Artifact Registry project.
     mkdir -p "$INSTALL_DIR"
-    local role entry
-    for role in "${roles[@]}"; do
-        [[ -n "$role" ]] || continue
-        info "Granting $role on $target_project to $sa_email..."
-        if gcloud projects add-iam-policy-binding "$target_project" \
-                --member="serviceAccount:$sa_email" \
-                --role="$role" --condition=None >/dev/null 2>&1; then
-            entry="$(printf '%s\t%s\t%s\t%s' \
-                "$owner_project" "$sa_email" "$target_project" "$role")"
-            grep -qxF "$entry" "$QS_GCP_MANIFEST" 2>/dev/null \
-                || echo "$entry" >> "$QS_GCP_MANIFEST"
-        else
-            warn "Failed to grant $role on $target_project — you may lack setIamPolicy there. Continuing; the token is still minted."
-        fi
+    local role entry target_project
+    for target_project in "${target_projects[@]}"; do
+        for role in "${roles[@]}"; do
+            [[ -n "$role" ]] || continue
+            info "Granting $role on $target_project to $sa_email..."
+            if gcloud projects add-iam-policy-binding "$target_project" \
+                    --member="serviceAccount:$sa_email" \
+                    --role="$role" --condition=None >/dev/null 2>&1; then
+                entry="$(printf '%s\t%s\t%s\t%s' \
+                    "$owner_project" "$sa_email" "$target_project" "$role")"
+                grep -qxF "$entry" "$QS_GCP_MANIFEST" 2>/dev/null \
+                    || echo "$entry" >> "$QS_GCP_MANIFEST"
+            else
+                warn "Failed to grant $role on $target_project — you may lack setIamPolicy there. Continuing; the token is still minted."
+            fi
+        done
     done
 
     # 3. Let the host's active identity impersonate the SA (the org blocks
@@ -746,13 +753,15 @@ gcp_sa_setup() {
         --project="$owner_project" >/dev/null \
         || abort "Failed to grant token-creator on $sa_email to $host_account"
 
-    # 4. Record the SA + default project, then mint the first token.
+    # 4. Record the SA + default project (the first target), then mint the
+    #    first token.
+    local default_project="${target_projects[0]}"
     mkdir -p "$QS_PRIVATE_DIR"
-    printf '%s\n' "$sa_email"       > "$QS_PRIVATE_DIR/gcp-sa"
-    printf '%s\n' "$target_project" > "$QS_PRIVATE_DIR/gcp-project"
+    printf '%s\n' "$sa_email"        > "$QS_PRIVATE_DIR/gcp-sa"
+    printf '%s\n' "$default_project" > "$QS_PRIVATE_DIR/gcp-project"
     gcp_mint_token "$sa_email" || abort "Failed to mint the initial access token for $sa_email."
 
-    info "Service account ready — gcloud/gsutil run as $sa_email inside the sandbox (default project $target_project)."
+    info "Service account ready — gcloud/gsutil run as $sa_email inside the sandbox (default project $default_project)."
 }
 
 # Clone a git repo into $QS_REPOS_DIR/<reponame>. For GitHub SSH URLs,
@@ -1155,14 +1164,14 @@ cmd_gh_auth() {
 }
 
 # Provision (or refresh) the GCP service account for a sandbox. The required
-# argument is the *target* project to grant read access on; the *owner*
-# project (where the SA lives) is prompted, defaulting to the host's active
-# gcloud project.
+# argument is one or more *target* projects to grant read access on; the
+# *owner* project (where the SA lives) is prompted, defaulting to the host's
+# active gcloud project.
 cmd_gcp_auth() {
     (( ${#COMMAND_ARGS[@]} == 0 )) \
         || abort "qs gcp-auth doesn't accept '--' args"
-    [[ -n "$GCP_TARGET_PROJECT" ]] \
-        || abort "Specify the project to grant access on: qs gcp-auth $SANDBOX_NAME TARGET_PROJECT"
+    (( ${#GCP_TARGET_PROJECTS[@]} > 0 )) \
+        || abort "Specify at least one project to grant access on: qs gcp-auth $SANDBOX_NAME PROJECT [PROJECT ...]"
     command -v gcloud >/dev/null 2>&1 \
         || abort "gcloud not found on host — install the Google Cloud SDK and run 'gcloud auth login' first."
     [[ -t 0 ]] \
@@ -1179,7 +1188,7 @@ cmd_gcp_auth() {
     fi
     [[ -n "$owner_project" ]] || abort "Owner project required."
 
-    gcp_sa_setup "$owner_project" "$GCP_TARGET_PROJECT" "$SANDBOX_NAME"
+    gcp_sa_setup "$owner_project" "$SANDBOX_NAME" "${GCP_TARGET_PROJECTS[@]}"
 }
 
 # Refresh the sandbox's GCP access token. Impersonated tokens expire in ~1h;

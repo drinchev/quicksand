@@ -502,9 +502,16 @@ qs_run() {
 
 @test "parse_args resolves gcp-auth and its target project arg" {
     qs_run 'parse_args gcp-auth work metadata-dev-4d18
-            echo "$COMMAND $SANDBOX_NAME $GCP_TARGET_PROJECT"'
+            echo "$COMMAND $SANDBOX_NAME ${GCP_TARGET_PROJECTS[*]}"'
     [ "$status" -eq 0 ]
     [[ "$output" == "gcp-auth work metadata-dev-4d18" ]]
+}
+
+@test "parse_args collects multiple gcp-auth target projects" {
+    qs_run 'parse_args gcp-auth work metadata-dev-4d18 shared-packages-fad1
+            echo "${#GCP_TARGET_PROJECTS[@]}: ${GCP_TARGET_PROJECTS[*]}"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == "2: metadata-dev-4d18 shared-packages-fad1" ]]
 }
 
 @test "parse_args resolves the gp alias for gcp-auth" {
@@ -554,7 +561,7 @@ gcloud_provision_stub() {
             INSTALL_DIR="$BATS_TEST_TMPDIR"
             QS_GCP_MANIFEST="$MANIFEST"
             QS_PRIVATE_DIR="$PRIV"
-            gcp_sa_setup ivan-drinchev metadata-dev-4d18 work'
+            gcp_sa_setup ivan-drinchev work metadata-dev-4d18'
     [ "$status" -eq 0 ]
     [ "$(cat "$PRIV/gcp-token")" == "ya29.fake-token" ]
     local sa="qs-work@ivan-drinchev.iam.gserviceaccount.com"
@@ -566,6 +573,25 @@ gcloud_provision_stub() {
     grep -qF "roles/artifactregistry.reader" "$MANIFEST"
 }
 
+@test "gcp_sa_setup grants roles on every target project and pins the first" {
+    gcloud_provision_stub
+    export PRIV="$BATS_TEST_TMPDIR/priv"
+    export MANIFEST="$BATS_TEST_TMPDIR/gcp-manifest"
+    qs_run 'PATH="$STUBS:$PATH"
+            INSTALL_DIR="$BATS_TEST_TMPDIR"
+            QS_GCP_MANIFEST="$MANIFEST"
+            QS_PRIVATE_DIR="$PRIV"
+            gcp_sa_setup ivan-drinchev work metadata-dev-4d18 shared-packages-fad1'
+    [ "$status" -eq 0 ]
+    local sa="qs-work@ivan-drinchev.iam.gserviceaccount.com"
+    # First target becomes the sandbox default project.
+    [ "$(cat "$PRIV/gcp-project")" == "metadata-dev-4d18" ]
+    # The reader role is granted (and recorded) on BOTH projects.
+    grep -q "projects add-iam-policy-binding metadata-dev-4d18 .*--role=roles/artifactregistry.reader" "$STUB_LOG"
+    grep -q "projects add-iam-policy-binding shared-packages-fad1 .*--role=roles/artifactregistry.reader" "$STUB_LOG"
+    grep -qF "$(printf '%s\t%s\t%s\t%s' ivan-drinchev "$sa" shared-packages-fad1 roles/artifactregistry.reader)" "$MANIFEST"
+}
+
 @test "gcp_sa_setup honours a QS_GCP_ROLES override" {
     gcloud_provision_stub
     export PRIV="$BATS_TEST_TMPDIR/priv"
@@ -574,7 +600,7 @@ gcloud_provision_stub() {
             INSTALL_DIR="$BATS_TEST_TMPDIR"
             QS_GCP_MANIFEST="$MANIFEST" QS_PRIVATE_DIR="$PRIV"
             QS_GCP_ROLES="roles/storage.admin"
-            gcp_sa_setup owner target work'
+            gcp_sa_setup owner work target'
     [ "$status" -eq 0 ]
     grep -qF "roles/storage.admin" "$MANIFEST"
     ! grep -qF "roles/viewer" "$MANIFEST"
@@ -594,7 +620,7 @@ gcloud_provision_stub() {
     qs_run 'PATH="$STUBS:$PATH"
             INSTALL_DIR="$BATS_TEST_TMPDIR"
             QS_GCP_MANIFEST="$BATS_TEST_TMPDIR/gcp-manifest" QS_PRIVATE_DIR="$PRIV"
-            gcp_sa_setup owner target work'
+            gcp_sa_setup owner work target'
     [ "$status" -eq 0 ]
     [[ "$output" == *"already exists"* ]]
     ! grep -q "service-accounts create" "$STUB_LOG"
@@ -684,8 +710,8 @@ gcloud_provision_stub() {
 
 @test "cmd_gcp_auth requires a target project" {
     make_stub gcloud 'exit 0'
-    qs_run 'PATH="$STUBS:$PATH"; COMMAND_ARGS=(); GCP_TARGET_PROJECT=""
+    qs_run 'PATH="$STUBS:$PATH"; COMMAND_ARGS=(); GCP_TARGET_PROJECTS=()
             SANDBOX_NAME=work; cmd_gcp_auth'
     [ "$status" -ne 0 ]
-    [[ "$output" == *"Specify the project to grant access on"* ]]
+    [[ "$output" == *"Specify at least one project to grant access on"* ]]
 }

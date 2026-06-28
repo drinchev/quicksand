@@ -29,6 +29,10 @@ readonly QS_REPO_DIR
 readonly QS_PROFILE_SOURCE_DIR="$QS_REPO_DIR/profile.d"
 readonly QS_LOGOUT_SOURCE_DIR="$QS_REPO_DIR/logout.d"
 readonly QS_SANDBOX_PROFILE_TEMPLATE="$QS_REPO_DIR/config/sandbox.sb"
+# Static markdown describing the sandbox to Claude; seeded into the sandbox's
+# ~/.claude/CLAUDE.md by profile.d/30-claude-config.sh. Kept as a plain file
+# (not a heredoc) so it's easy to edit.
+readonly QS_QUICKSAND_MD="$QS_REPO_DIR/config/quicksand.md"
 
 QS_VERBOSE="${QS_VERBOSE:-0}"
 abort() { echo >&2 "ERROR: $*"; exit 1; }
@@ -50,15 +54,16 @@ quote_zsh_args() {
     /bin/zsh -fc 'for arg; do printf "%s " "${(q)arg}"; done' -- "$@"
 }
 
-# Fingerprint of everything a build bakes into a sandbox: qs version,
-# sandbox profile template, canonical profile.d/ and logout.d/, and the
-# host-side custom overlay (contents, relative names, and file modes — the
+# Fingerprint of everything a build bakes into a sandbox: qs version, sandbox
+# profile template, the quicksand.md asset, canonical profile.d/ and logout.d/,
+# and the host-side custom overlay (contents, relative names, and file modes — the
 # exec bit decides whether a script runs). A sandbox whose install marker
 # doesn't match is stale and gets rebuilt automatically.
 config_fingerprint() {
     {
         echo "$VERSION"
         /usr/bin/shasum -a 256 < "$QS_SANDBOX_PROFILE_TEMPLATE" 2>/dev/null || true
+        /usr/bin/shasum -a 256 < "$QS_QUICKSAND_MD" 2>/dev/null || true
         local dir
         for dir in "$QS_PROFILE_SOURCE_DIR" "$QS_LOGOUT_SOURCE_DIR" "$QS_CUSTOM_DIR"; do
             [[ -d "$dir" ]] || continue
@@ -1052,6 +1057,15 @@ EOF
         --checksum --recursive --perms --times \
         "$QS_PROFILE_SOURCE_DIR/" "$QS_PROFILE_DIR/"
 
+    # Static asset consumed by a profile script: 30-claude-config.sh copies this
+    # into the sandbox's ~/.claude/quicksand.md. Lives in config/ as plain
+    # markdown rather than a heredoc, so it's easy to edit. QS_PROFILE_DIR's
+    # mkdir above already created the parent _quicksand/.
+    debug "Syncing $QS_QUICKSAND_MD → $QS_PRIVATE_DIR/quicksand.md"
+    /usr/bin/rsync \
+        --checksum --perms --times \
+        "$QS_QUICKSAND_MD" "$QS_PRIVATE_DIR/quicksand.md"
+
     # Per-session logout scripts (logout.d/) are the exit-time counterpart of
     # profile.d/: synced the same way and run as the sandbox user when the
     # session ends (see the EXIT trap in cmd_launch). Optional — unlike
@@ -1276,7 +1290,7 @@ cmd_launch() {
         # sandbox-exec is already restricting file writes to the sandbox home
         # plus the shared workspace, so claude's per-action permission prompts
         # are redundant. `bypassPermissionsModeAccepted: true` (seeded by the
-        # 30-claude-json.sh profile script) is the on-disk acknowledgement.
+        # 30-claude-config.sh profile script) is the on-disk acknowledgement.
         # Not exec'd (unlike a bare launch) so the EXIT trap's logout.d hooks
         # run when claude quits.
         ZSH_COMMAND="$ZSH_COMMAND; $SOURCE_ZSHRC; $(quote_zsh_args claude --dangerously-skip-permissions "${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}")"

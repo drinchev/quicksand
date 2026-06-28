@@ -253,7 +253,7 @@ sandbox (first run installs, later runs are no-ops):
 | `10-keychain.sh` | create/unlock a login keychain (fresh users have none) |
 | `20-install-claude.sh` | install Claude Code via its native installer |
 | `21-install-gh.sh` | install the GitHub CLI (`gh`) from its release tarball |
-| `30-claude-json.sh` | seed onboarding flags so the first session isn't interactive |
+| `30-claude-config.sh` | seed onboarding flags, plus a `~/.claude/CLAUDE.md` import of `config/quicksand.md` describing the sandbox boundary, `gh` access and credentials |
 | `40-gitconfig.sh` | seed the host's git identity + `safe.directory` |
 | `45-install-oh-my-zsh.sh` | Oh My Zsh + custom themes/plugins; disables auto-title so a manual tab name sticks |
 | `46-install-pnpm.sh` | pnpm + Node.js 24 (pnpm as the version manager) |

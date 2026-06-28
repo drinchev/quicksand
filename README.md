@@ -96,10 +96,11 @@ qs clone     NAME URL_OR_PATH            clone a repo into the sandbox
 qs gh-auth   NAME [OWNER/REPO]           set up a repo-scoped gh token
 qs gcp-auth  NAME TARGET_PROJECT         provision a scoped GCP service account
 qs gcp-token NAME                        refresh the GCP access token (~1h)
+qs op-auth   NAME [--write]              provision a 1Password vault for secrets
 qs uninstall NAME                        remove the sandbox completely
 qs list                                  list sandboxes
 
-Short aliases: b, s, cl, c, g, gp, gt, u, l.
+Short aliases: b, s, cl, c, g, gp, gt, o, u, l.
 ```
 
 PATH is where the session starts, *inside* the sandbox: relative paths and
@@ -235,6 +236,53 @@ and set IAM policy on the SA itself (to grant token-creator). `qs uninstall`
 removes the IAM bindings and deletes the service account (which drops the
 token-creator binding with it).
 
+## App secrets via 1Password (`op`)
+
+Deploy keys, the `gh` token and the GCP token cover *infrastructure* access, but
+not the arbitrary **app secrets** a project needs at runtime — database
+passwords, third-party API keys, and so on. `qs op-auth` provisions those
+through 1Password so they're fetched on demand and **never written to the
+sandbox disk**:
+
+```bash
+qs op-auth work            # read-only vault
+qs op-auth work --write    # also let the sandbox store secrets back
+```
+
+Using your own host 1Password (which must be signed in — `op signin`, or the
+desktop app with CLI integration enabled), it:
+
+1. Creates a vault `qs-NAME` if absent.
+2. Creates a **service account** scoped to *only that vault* — `read_items` by
+   default, `write_items` too with `--write` — with a 90-day expiry.
+3. Stores the service-account token (shown once) back in that vault.
+
+The service account is the sandbox's identity: it carries no biometric and no
+desktop-app dependency, so it works inside the isolated user account where the
+1Password app and host keychain are unreachable. The token is scoped to one
+vault and is independently **revocable and expiring**.
+
+On every launch, the host reads the token from your 1Password into a transient
+`_quicksand/op-token` (`0600`), which `62-op-auth.sh` exports as
+`OP_SERVICE_ACCOUNT_TOKEN`; `15-op-token.sh` removes it again at session exit.
+So the token is sourced fresh from 1Password each session and **never persists
+in the sandbox between sessions**. Inside the sandbox:
+
+```bash
+op read "op://qs-NAME/<item>/<field>"     # one field to stdout
+op run  --env-file=<file> -- <command>    # inject op:// refs into a subprocess
+```
+
+You add and edit the secrets yourself from the host (your own 1Password identity
+has full access to the vault) — the sandbox's read-only token can't, which is
+why adding secrets never needs `--write`. Reading the token at launch may prompt
+1Password to unlock, mirroring how `gcp-auth` relies on host `gcloud`.
+
+1Password has **no CLI to revoke** a service account (only the web UI), so
+`qs uninstall` best-effort deletes the stored token item, prints a revoke
+reminder, and **leaves the vault and its secrets intact** — your data is never
+deleted.
+
 ## Automatic rebuilds
 
 The install marker stores a fingerprint of everything a build bakes into a
@@ -253,6 +301,7 @@ sandbox (first run installs, later runs are no-ops):
 | `10-keychain.sh` | create/unlock a login keychain (fresh users have none) |
 | `20-install-claude.sh` | install Claude Code via its native installer |
 | `21-install-gh.sh` | install the GitHub CLI (`gh`) from its release tarball |
+| `22-install-op.sh` | install the 1Password CLI (`op`) from its release zip |
 | `30-claude-config.sh` | seed onboarding flags, plus a `~/.claude/CLAUDE.md` import of `config/quicksand.md` describing the sandbox boundary, `gh` access and credentials |
 | `40-gitconfig.sh` | seed the host's git identity + `safe.directory` |
 | `45-install-oh-my-zsh.sh` | Oh My Zsh + custom themes/plugins; disables auto-title so a manual tab name sticks |
@@ -264,6 +313,7 @@ sandbox (first run installs, later runs are no-ops):
 | `51-tab-name.sh` | name the tab `<sandbox> \| Claude` or `<sandbox> \| Shell` |
 | `60-gh-auth.sh` | sign `gh` in with the repo-scoped token from `qs gh-auth` |
 | `61-gcp-auth.sh` | point `gcloud`/`gsutil` at the impersonated token from `qs gcp-auth` |
+| `62-op-auth.sh` | export `OP_SERVICE_ACCOUNT_TOKEN` from the token staged by `qs op-auth` |
 
 After the `profile.d/` scripts run, the launcher sources the sandbox's
 `~/.zshrc` before starting the session — for `qs claude`, one-off `-- command`

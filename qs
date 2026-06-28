@@ -570,12 +570,13 @@ gh_token_setup() {
     url+="&description=$(url_encode "$desc")"
     url+="&target_name=$(url_encode "$owner")"
     url+="&expires_in=90"
-    url+="&contents=read&pull_requests=write&actions=read&checks=read&statuses=read"
+    url+="&contents=read&pull_requests=write&actions=write&checks=read&statuses=read"
 
     cat <<EOF
 
 Optional: set up a GitHub token so 'gh' works inside the sandbox for
-$owner_repo (open PRs + PR comments, read commits, branches and CI).
+$owner_repo (open PRs + PR comments, read commits/branches, read and
+re-run CI).
 Git push/pull already works via the deploy key — press Enter to skip.
 
 1. Open this page (name, owner, expiry and permissions are prefilled):

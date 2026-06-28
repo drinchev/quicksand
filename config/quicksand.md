@@ -25,3 +25,12 @@ home directory, files, or credentials.
 - Scoped credentials live as files under /Users/Shared/qs-*/_quicksand/
   (the gh token and, if configured, a short-lived GCP token).
 - Network access is unrestricted.
+
+## App secrets (1Password)
+- If `qs op-auth` has been run, app secrets (API keys, passwords, etc.) live in
+  a per-sandbox 1Password vault and the `op` CLI is authenticated via the
+  OP_SERVICE_ACCOUNT_TOKEN environment variable. Fetch them on demand:
+  `op vault list` to find the vault, then `op read "op://<vault>/<item>/<field>"`
+  or `op run --env-file=<file> -- <command>`.
+- Prefer fetching at the point of use — these secrets are deliberately NOT
+  written to disk. Don't copy them into files or commit them.

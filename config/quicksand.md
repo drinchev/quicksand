@@ -16,8 +16,8 @@ home directory, files, or credentials.
 - `gh` is signed in (when `qs gh-auth` has been run) with a fine-grained token
   scoped to a SINGLE repository. Its permissions are: Pull requests (write),
   Contents (read), Actions (write — so it can re-run workflows), Checks (read),
-  and Commit statuses (read). It cannot push code, change repo settings, or
-  reach any other repository.
+  Commit statuses (read), and Variables (read — so `gh variable list` works).
+  It cannot push code, change repo settings, or reach any other repository.
 - git push/pull use a repo-scoped SSH deploy key, NOT the token. Normal git
   over SSH works; the token alone cannot write repository contents.
 

@@ -29,9 +29,11 @@ home directory, files, or credentials.
 ## App secrets (1Password)
 - If `qs op-auth` has been run, app secrets (API keys, passwords, etc.) live in
   a per-sandbox 1Password vault and the `op` CLI is authenticated via the
-  OP_SERVICE_ACCOUNT_TOKEN environment variable. Fetch them on demand:
-  `op vault list` to find the vault, then `op read "op://<vault>/<item>/<field>"`
-  or `op run --env-file=<file> -- <command>`.
+  OP_SERVICE_ACCOUNT_TOKEN environment variable. The vault is named after this
+  sandbox's user account (`qs-<name>`, i.e. $USER) and is the only vault the
+  service account can see. Fetch secrets on demand:
+  `op read "op://$USER/<item>/<field>"` or
+  `op run --env-file=<file> -- <command>`.
 - Prefer fetching at the point of use — these secrets are deliberately NOT
   written to disk. Don't copy them into files or commit them.
 
@@ -61,7 +63,7 @@ home directory, files, or credentials.
 - Put the description in `notesPlain` (or a labeled `description[text]=…`
   field).
 - The title must be a kebab-case slug (e.g. `anthropic-api-key`, not
-  "Anthropic API Key") so the reference `op://<vault>/<slug>/credential` is
+  "Anthropic API Key") so the reference `op://$USER/<slug>/credential` is
   clean and predictable. If a downstream store has its own name for the
   secret, match the slug to it.
 
@@ -70,7 +72,7 @@ home directory, files, or credentials.
 ```sh
 read -rs KEY
 op item create --category "API Credential" --title "anthropic-api-key" \
-  --vault "<vault>" "credential=$KEY" "notesPlain=<what it's for>"
+  --vault "$USER" "credential=$KEY" "notesPlain=<what it's for>"
 unset KEY
 
 op item edit "<old title>" --title "<slug>"   # rename an existing item

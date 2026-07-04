@@ -166,11 +166,11 @@ API:
    repo and saves it to the workspace.
 3. On the next session, `gh` signs in automatically inside the sandbox.
 
-Permissions requested are least-privilege and **read-only except PR writes**:
-`Pull requests: write` (PRs + PR comments) plus read-only `Contents`
-(commits/branches), `Actions`, `Checks` and `Commit statuses` (CI). The token
-is API-only — `git push`/`pull` stay on the deploy key, so it never needs
-write access to repository contents.
+Permissions requested are least-privilege: `Pull requests: write` (PRs + PR
+comments), `Actions: write` (re-run CI workflows), plus read-only `Contents`
+(commits/branches), `Checks`, `Commit statuses` (CI) and `Variables` (Actions
+variables). The token is API-only — `git push`/`pull` stay on the deploy key,
+so it never needs write access to repository contents.
 
 Fine-grained PATs have **no revoke API**, so `qs uninstall` can't delete one
 for you; it prints a reminder with the [token settings

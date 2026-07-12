@@ -29,9 +29,12 @@ ensure_collection() {
     return 1
 }
 
+# Versioned sentinel: bump SETUP_VERSION when this block changes so existing
+# sandboxes re-run it once (every step below tolerates re-runs).
+SETUP_VERSION=2
 STATE_DIR="$HOME/.local/state/quicksand"
 SENTINEL="$STATE_DIR/qmd-initialized"
-if [[ ! -f "$SENTINEL" ]]; then
+if [[ "$(cat "$SENTINEL" 2>/dev/null)" != "$SETUP_VERSION" ]]; then
     mkdir -p "$STATE_DIR" "$HOME/.claude/projects"
     ensure_collection "${SHARED_WORKSPACE:?}/notes" --name notes
     # Only each project's memory/ dir; if this qmd version rejects the
@@ -40,7 +43,12 @@ if [[ ! -f "$SENTINEL" ]]; then
     ensure_collection "$HOME/.claude/projects" --name claude-memory \
             --mask "**/memory/**/*.md" \
         || ensure_collection "$HOME/.claude/projects" --name claude-memory
-    touch "$SENTINEL"
+    # Collection descriptions feed qmd's reranker and query expansion.
+    "$QMD" context add qmd://notes/ \
+        "Durable notes agents in this sandbox write for each other: decisions, findings, handoffs, state of ongoing work"
+    "$QMD" context add qmd://claude-memory/ \
+        "Claude Code auto-memory: facts about the user, projects, preferences, and feedback recorded across sessions"
+    echo "$SETUP_VERSION" > "$SENTINEL"
 fi
 
 nohup "$QMD" update > /dev/null 2>&1 &

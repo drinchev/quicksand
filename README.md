@@ -19,6 +19,10 @@ built from plain Unix primitives: user accounts, group ACLs, `sudo`, and
   with `--dangerously-skip-permissions` (the sandbox is the permission system)
 - **Per-repo isolation** — `qs clone` gives each sandbox its own repo copy
   and a scoped GitHub deploy key; no host credentials enter the sandbox
+- **Shared agent memory** — a per-sandbox `notes/` knowledge base in the
+  shared workspace, indexed by [qmd](https://github.com/tobi/qmd) alongside
+  Claude Code's auto-memory, so agent sessions keep context across runs
+  (shared host ↔ sandbox, never across sandboxes)
 - **Fast** — no VM overhead; entering a sandbox is a `sudo` away
 - **Passwordless** — switch accounts without a prompt (after setup)
 - **Self-healing** — sandboxes rebuild automatically when the configuration

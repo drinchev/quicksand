@@ -162,6 +162,14 @@ qs_run() {
     [ "$output" != "$before" ]
 }
 
+@test "config_fingerprint changes when quicksand.md changes" {
+    qs_run 'QS_CUSTOM_DIR=/nonexistent; config_fingerprint'
+    local before="$output"
+    echo "tweak" >> "$REPO_COPY/config/quicksand.md"
+    qs_run 'QS_CUSTOM_DIR=/nonexistent; config_fingerprint'
+    [ "$output" != "$before" ]
+}
+
 @test "config_fingerprint changes when the sandbox profile template changes" {
     qs_run 'QS_CUSTOM_DIR=/nonexistent; config_fingerprint'
     local before="$output"

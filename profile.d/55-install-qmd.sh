@@ -36,15 +36,14 @@ export PNPM_HOME="$HOME/Library/pnpm"
 export PATH="$PNPM_HOME/bin:$PNPM_HOME:$PATH"
 
 echo "Installing qmd into sandbox..." >&2
-# pnpm >= 10 skips dependency build scripts unless allowlisted; without these
-# the native modules ship no bindings and qmd dies on "Could not locate the
-# bindings file" at first use (better-sqlite3 fetches a prebuilt binary, no
-# compiler needed).
-"$PNPM" add -g \
-    --allow-build=better-sqlite3 \
-    --allow-build=node-llama-cpp \
-    --allow-build=sqlite-vec \
-    @tobilu/qmd
+# pnpm >= 10 blocks dependency build scripts by default: skipped silently
+# without a TTY (qmd then dies at first use on better-sqlite3's missing
+# bindings), or via an interactive "choose which packages to build" prompt
+# in a terminal, which would hang session startup. Allow all builds instead
+# of allowlisting per package — the dep list changes across qmd releases
+# (better-sqlite3, node-llama-cpp, tree-sitter-*), and running postinstall
+# scripts of a package we install anyway is what the sandbox is for.
+"$PNPM" add -g --dangerously-allow-all-builds @tobilu/qmd
 
 # pnpm's global bin dir is $PNPM_HOME ($PNPM_HOME/bin on some versions).
 QMD_BIN=""

@@ -1022,9 +1022,11 @@ ensure_built() {
 
     release_id_lock
 
-    # Shared workspace
+    # Shared workspace. notes/ is the sandbox's durable knowledge base
+    # (searchable via qmd — see profile.d/55/56); created here so it picks
+    # up the inherited group ACL below.
     debug "Creating $SHARED_WORKSPACE"
-    mkdir -p "$SHARED_WORKSPACE"
+    mkdir -p "$SHARED_WORKSPACE/notes"
     configure_shared_folder_permissions true
 
     # Sudoers

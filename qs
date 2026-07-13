@@ -97,6 +97,7 @@ Usage:
   qs claude    NAME [PATH] [-- args ...]
   qs clone     NAME URL_OR_PATH
   qs gh-auth   NAME [OWNER/REPO]
+  qs memory    NAME OWNER/REPO
   qs gcp-auth  NAME PROJECT [PROJECT ...]
   qs gcp-token NAME
   qs op-auth   NAME [--write]
@@ -116,6 +117,16 @@ the sandbox (open PRs and comments, read commits, branches and CI). It
 opens a prefilled fine-grained PAT creation page and stores the token you
 paste back; git push/pull keeps using the deploy key. 'clone' offers this
 automatically. OWNER/REPO may be omitted when the sandbox has one clone.
+
+'memory' attaches a shared memory repo: a private GitHub repo of markdown
+notes cloned to the shared workspace with its own read-write deploy key,
+indexed by qmd inside the sandbox. Agents share knowledge across sandboxes
+by pushing a qs/NAME branch and opening a PR for you to merge — nothing
+propagates without your review, and commits are authored 'qs-NAME' so
+history shows which sandbox wrote what. Different sandboxes may attach
+different memory repos. For agents to open PRs, the sandbox's gh token
+must also select the memory repo (fine-grained PATs can cover several
+repositories — pick both when creating it, or edit its repository access).
 
 'gcp-auth' provisions a per-sandbox Google Cloud service account so
 'gcloud'/'gsutil' work inside the sandbox. PROJECT is the project to grant read
@@ -185,6 +196,7 @@ COMMAND_ARGS=()
 INITIAL_DIR=""
 CLONE_SOURCE=""
 GH_AUTH_REPO=""
+MEMORY_REPO=""
 GCP_TARGET_PROJECTS=()
 OP_WRITE=false
 
@@ -231,6 +243,7 @@ parse_args() {
         cl|claude)   COMMAND=claude; needs_name=true ;;
         c|clone)     COMMAND=clone;  needs_name=true ;;
         g|gh-auth)   COMMAND=gh-auth; needs_name=true ;;
+        m|memory)    COMMAND=memory; needs_name=true ;;
         gp|gcp-auth) COMMAND=gcp-auth; needs_name=true ;;
         gt|gcp-token) COMMAND=gcp-token; needs_name=true ;;
         o|op-auth)   COMMAND=op-auth; needs_name=true ;;
@@ -251,6 +264,10 @@ parse_args() {
                 CLONE_SOURCE="$3"
                 ;;
             gh-auth) GH_AUTH_REPO="${3:-}" ;;
+            memory)
+                [[ $# -ge 3 ]] || abort "qs memory requires OWNER/REPO (try: qs --help)"
+                MEMORY_REPO="$3"
+                ;;
             gcp-auth) GCP_TARGET_PROJECTS=("${@:3}") ;;
         esac
     fi
@@ -293,6 +310,8 @@ derive_constants() {
     readonly QS_CUSTOM_DIR="$INSTALL_DIR/custom"
     readonly QS_CUSTOM_SANDBOX_DIR="$QS_PRIVATE_DIR/custom"
     readonly QS_REPOS_DIR="$SHARED_WORKSPACE/repos"
+    readonly QS_MEMORY_DIR="$SHARED_WORKSPACE/memory"
+    readonly QS_MEMORY_MANIFEST="$INSTALL_DIR/memory-$SANDBOX_NAME"
     readonly QS_SSH_DIR="$QS_PRIVATE_DIR/.ssh"
     readonly HOST_USER="$USER"
     QS_SESSION_ID="$(/usr/bin/uuidgen)"
@@ -466,6 +485,20 @@ cleanup_clone_artifacts() {
     rm -f "$QS_CLONES_MANIFEST"
 }
 
+# Undo what `qs memory` provisioned: the deploy key on the memory repo.
+cleanup_memory_artifacts() {
+    [[ -f "$QS_MEMORY_MANIFEST" ]] || return 0
+    local line rest owner_repo
+    while IFS= read -r line; do
+        [[ "$line" == *$'\t'*$'\t'* ]] || continue
+        rest="${line#*$'\t'}"
+        owner_repo="${rest%%$'\t'*}"
+        [[ -n "$owner_repo" ]] \
+            && delete_deploy_key "$owner_repo" "qs:$SANDBOX_NAME:memory"
+    done < "$QS_MEMORY_MANIFEST"
+    rm -f "$QS_MEMORY_MANIFEST"
+}
+
 # Reverse what `qs gcp-auth` provisioned: remove each recorded IAM binding on
 # its target project, then delete each service account (which also deletes its
 # keys). Best-effort — warns and continues so uninstall always completes.
@@ -529,14 +562,15 @@ cleanup_op() {
     rm -f "$QS_OP_MANIFEST"
 }
 
-# Append a clone record to the manifest (see QS_CLONES_MANIFEST) so
+# Append a clone record to the manifest (see QS_CLONES_MANIFEST, or
+# CLONE_MANIFEST_OVERRIDE when set — `qs memory` records separately) so
 # uninstall can clean up after it. Idempotent: skips exact duplicates.
 record_clone() {
-    local entry
+    local entry manifest="${CLONE_MANIFEST_OVERRIDE:-$QS_CLONES_MANIFEST}"
     entry="$(printf '%s\t%s\t%s' "$1" "$2" "$3")"
     mkdir -p "$INSTALL_DIR"
-    grep -qxF "$entry" "$QS_CLONES_MANIFEST" 2>/dev/null \
-        || echo "$entry" >> "$QS_CLONES_MANIFEST"
+    grep -qxF "$entry" "$manifest" 2>/dev/null \
+        || echo "$entry" >> "$manifest"
 }
 
 # Percent-encode a string for a URL query value: RFC 3986 unreserved chars
@@ -628,7 +662,9 @@ Git push/pull already works via the deploy key — press Enter to skip.
      $url
 
 2. Under "Repository access" pick "Only select repositories" and choose
-   $owner_repo (GitHub can't preselect it via the link).
+   $owner_repo (GitHub can't preselect it via the link). If this sandbox
+   has (or will get) a shared memory repo ('qs memory'), select that
+   repository too so agents can open memory PRs with the same token.
 3. Check that "Resource owner" shows '$owner', then "Generate token".
    (Org repos may need an owner to approve the token before it works.)
 4. Copy the token (starts with 'github_pat_') and paste it below.
@@ -847,9 +883,12 @@ gcp_sa_setup() {
 # repo pointing at the sandbox copy. Sets CLONE_DEST as a side effect.
 #
 # Optional per-call overrides (unset = classic behavior):
-#   CLONE_DEST_OVERRIDE — clone destination instead of $QS_REPOS_DIR/<reponame>;
-#                         the home symlink is named after its basename
-#   CLONE_KEY_NAME      — deploy-key file/title suffix instead of <reponame>
+#   CLONE_DEST_OVERRIDE     — clone destination instead of
+#                             $QS_REPOS_DIR/<reponame>; the home symlink is
+#                             named after its basename
+#   CLONE_KEY_NAME          — deploy-key file/title suffix instead of <reponame>
+#   CLONE_MANIFEST_OVERRIDE — manifest file instead of $QS_CLONES_MANIFEST
+#   CLONE_SKIP_TOKEN_SETUP  — non-empty: don't offer the gh token flow
 do_clone() {
     local source="$CLONE_SOURCE"
     local local_repo="" url
@@ -930,7 +969,8 @@ do_clone() {
         fi
 
         # Offer a repo-scoped gh token (API only; transport stays on the key).
-        gh_token_setup "$owner" "$gh_repo" "$repo_name"
+        [[ -n "${CLONE_SKIP_TOKEN_SETUP:-}" ]] \
+            || gh_token_setup "$owner" "$gh_repo" "$repo_name"
     else
         debug "Non-GitHub URL; skipping deploy-key generation"
     fi
@@ -1192,6 +1232,7 @@ cmd_uninstall() {
     info "Uninstalling sandbox '$SANDBOX_NAME'..."
 
     cleanup_clone_artifacts
+    cleanup_memory_artifacts
     cleanup_gcp
     cleanup_op
 
@@ -1227,6 +1268,58 @@ cmd_uninstall() {
     rmdir "$SHARED_WORKSPACE" 2>/dev/null || true
     [[ -d "$SHARED_WORKSPACE" ]] && info "Keeping $SHARED_WORKSPACE (not empty)"
     info "Sandbox '$SANDBOX_NAME' removed."
+}
+
+# Attach a shared memory repo: clone OWNER/REPO to $SHARED_WORKSPACE/memory
+# with a read-write deploy key and a per-sandbox commit identity. Knowledge
+# crosses the sandbox boundary only through PRs the host user merges.
+cmd_memory() {
+    (( ${#COMMAND_ARGS[@]} == 0 )) \
+        || abort "qs memory doesn't accept '--' args"
+    parse_github_repo "$MEMORY_REPO" \
+        || abort "Couldn't parse '$MEMORY_REPO' — expected OWNER/REPO or a github.com URL"
+    local owner_repo="$PG_OWNER/$PG_REPO"
+    [[ ! -e "$QS_MEMORY_DIR" ]] \
+        || abort "$QS_MEMORY_DIR already exists — this sandbox already has a memory repo attached."
+
+    # Separate key name and manifest keep clone tooling (gh-auth
+    # auto-detection, uninstall's clone cleanup) unaffected.
+    CLONE_SOURCE="git@github.com:$owner_repo.git"
+    CLONE_DEST_OVERRIDE="$QS_MEMORY_DIR"
+    CLONE_KEY_NAME=memory
+    CLONE_MANIFEST_OVERRIDE="$QS_MEMORY_MANIFEST"
+    CLONE_SKIP_TOKEN_SETUP=true
+    do_clone
+
+    # Repo-local identity: memory commits show their sandbox of origin
+    # while work repos keep the host identity.
+    git -C "$QS_MEMORY_DIR" config user.name "qs-$SANDBOX_NAME"
+    git -C "$QS_MEMORY_DIR" config user.email "qs-$SANDBOX_NAME@$(hostname)"
+
+    # Opening memory PRs needs the sandbox gh token to cover this repo too
+    # (fine-grained PATs can select multiple repositories); git push/pull
+    # works via the deploy key either way.
+    local token_ok=false token_file
+    if command -v gh &>/dev/null; then
+        for token_file in "$QS_PRIVATE_DIR"/gh-token-*; do
+            [[ -f "$token_file" ]] || continue
+            if GH_TOKEN="$(<"$token_file")" gh api "repos/$owner_repo" &>/dev/null; then
+                token_ok=true
+                break
+            fi
+        done
+    fi
+    if [[ "$token_ok" == "true" ]]; then
+        info "Sandbox gh token can access $owner_repo — agents can open memory PRs."
+    else
+        warn "The sandbox's gh token can't see $owner_repo, so agents can't open memory PRs yet. Add $owner_repo to the token's repository access at https://github.com/settings/personal-access-tokens or re-run 'qs gh-auth $SANDBOX_NAME' selecting both repos."
+    fi
+
+    info ""
+    info "Memory repo attached:"
+    info "  Clone:        $QS_MEMORY_DIR"
+    info "  Sandbox path: /Users/$QUICKSAND_USER/memory (symlink)"
+    info "  Commits as:   qs-$SANDBOX_NAME"
 }
 
 cmd_clone() {
@@ -1530,6 +1623,10 @@ main() {
         gh-auth)
             ensure_built
             cmd_gh_auth
+            ;;
+        memory)
+            ensure_built
+            cmd_memory
             ;;
         gcp-auth)
             ensure_built

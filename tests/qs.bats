@@ -411,6 +411,84 @@ qs_run() {
     [[ -f "$BATS_TEST_TMPDIR/ws/.ssh/id_ed25519_memory" ]]
 }
 
+###############################################################################
+# qs memory (git/gh/ssh-keygen/sudo stubbed)
+###############################################################################
+
+@test "parse_args resolves memory and requires OWNER/REPO" {
+    qs_run 'parse_args memory foo owner/mem
+            echo "$COMMAND $SANDBOX_NAME $MEMORY_REPO"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == "memory foo owner/mem" ]]
+
+    qs_run 'parse_args memory foo'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"requires OWNER/REPO"* ]]
+}
+
+@test "cmd_memory clones to the memory dir with its own key, manifest and identity" {
+    make_stub git 'echo "git $*" >> "$STUB_LOG"
+        [[ "$1" == "clone" ]] && mkdir -p "$3"
+        exit 0'
+    make_stub gh 'echo "gh $*" >> "$STUB_LOG"; exit 0'
+    make_stub ssh-keygen 'while [[ $# -gt 0 ]]; do
+            [[ "$1" == "-f" ]] && keyfile="$2"
+            shift
+        done
+        touch "$keyfile" "$keyfile.pub"'
+    make_stub sudo 'echo "sudo $*" >> "$STUB_LOG"; exit 0'
+
+    export MEM_MANIFEST="$BATS_TEST_TMPDIR/memory-manifest"
+    qs_run 'PATH="$STUBS:$PATH"
+            MEMORY_REPO="me/agent-memory"
+            SANDBOX_NAME=demo QUICKSAND_USER=qs-bats-nonexistent
+            QS_MEMORY_DIR="$BATS_TEST_TMPDIR/ws/memory"
+            QS_REPOS_DIR="$BATS_TEST_TMPDIR/ws/repos"
+            QS_SSH_DIR="$BATS_TEST_TMPDIR/ws/.ssh"
+            QS_PRIVATE_DIR="$BATS_TEST_TMPDIR/ws/_quicksand"
+            INSTALL_DIR="$BATS_TEST_TMPDIR"
+            QS_CLONES_MANIFEST="$BATS_TEST_TMPDIR/clones-manifest"
+            QS_MEMORY_MANIFEST="$MEM_MANIFEST"
+            COMMAND_ARGS=()
+            cmd_memory'
+    [ "$status" -eq 0 ]
+    grep -q "git clone git@github.com:me/agent-memory.git $BATS_TEST_TMPDIR/ws/memory" "$STUB_LOG"
+    grep -q "qs:demo:memory" "$STUB_LOG"
+    grep -q "config user.name qs-demo" "$STUB_LOG"
+    grep -q "$(printf 'agent-memory\tme/agent-memory\t')" "$MEM_MANIFEST"
+    [[ ! -f "$BATS_TEST_TMPDIR/clones-manifest" ]]
+    [[ -f "$BATS_TEST_TMPDIR/ws/.ssh/id_ed25519_memory" ]]
+}
+
+@test "cmd_memory refuses when the memory dir already exists" {
+    mkdir -p "$BATS_TEST_TMPDIR/ws/memory"
+    qs_run 'MEMORY_REPO="me/agent-memory"
+            SANDBOX_NAME=demo
+            QS_MEMORY_DIR="$BATS_TEST_TMPDIR/ws/memory"
+            COMMAND_ARGS=()
+            cmd_memory'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"already exists"* ]]
+}
+
+@test "cleanup_memory_artifacts deletes the deploy key and manifest" {
+    make_stub gh 'echo "gh $*" >> "$STUB_LOG"
+        if [[ "$3" == "list" ]]; then
+            printf "77\tqs:demo:memory\n"
+        fi
+        exit 0'
+    export MEM_MANIFEST="$BATS_TEST_TMPDIR/memory-manifest"
+    printf 'agent-memory\tme/agent-memory\t\n' > "$MEM_MANIFEST"
+    qs_run 'PATH="$STUBS:$PATH"
+            SANDBOX_NAME=demo
+            QS_MEMORY_MANIFEST="$MEM_MANIFEST"
+            cleanup_memory_artifacts'
+    [ "$status" -eq 0 ]
+    grep -q "gh repo deploy-key delete 77 -R me/agent-memory" "$STUB_LOG"
+    [[ ! -f "$MEM_MANIFEST" ]]
+}
+
+
 @test "do_clone escapes the deploy key path for shell re-parsing" {
     make_stub git 'echo "git $*" >> "$STUB_LOG"
         [[ "$1" == "clone" ]] && mkdir -p "$3"

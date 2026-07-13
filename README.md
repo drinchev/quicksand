@@ -23,6 +23,10 @@ built from plain Unix primitives: user accounts, group ACLs, `sudo`, and
   shared workspace, indexed by [qmd](https://github.com/tobi/qmd) alongside
   Claude Code's auto-memory, so agent sessions keep context across runs
   (shared host ↔ sandbox, never across sandboxes)
+- **Cross-sandbox memory (opt-in)** — `qs memory` attaches a private GitHub
+  "memory repo" cloned per sandbox with its own deploy key; agents share
+  knowledge by opening PRs you merge, with commits authored per sandbox —
+  nothing propagates between sandboxes without your review
 - **Fast** — no VM overhead; entering a sandbox is a `sudo` away
 - **Passwordless** — switch accounts without a prompt (after setup)
 - **Self-healing** — sandboxes rebuild automatically when the configuration

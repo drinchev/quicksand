@@ -382,6 +382,35 @@ qs_run() {
     grep -q "$(printf 'proj\tme/proj\t')" "$MANIFEST"
 }
 
+@test "do_clone honors CLONE_DEST_OVERRIDE and CLONE_KEY_NAME" {
+    make_stub git 'echo "git $*" >> "$STUB_LOG"
+        [[ "$1" == "clone" ]] && mkdir -p "$3"
+        exit 0'
+    make_stub gh 'echo "gh $*" >> "$STUB_LOG"; exit 0'
+    make_stub ssh-keygen 'while [[ $# -gt 0 ]]; do
+            [[ "$1" == "-f" ]] && keyfile="$2"
+            shift
+        done
+        touch "$keyfile" "$keyfile.pub"'
+    make_stub sudo 'echo "sudo $*" >> "$STUB_LOG"; exit 0'
+
+    qs_run 'PATH="$STUBS:$PATH"
+            CLONE_SOURCE="https://github.com/me/proj"
+            SANDBOX_NAME=demo QUICKSAND_USER=qs-bats-nonexistent
+            QS_REPOS_DIR="$BATS_TEST_TMPDIR/ws/repos"
+            QS_SSH_DIR="$BATS_TEST_TMPDIR/ws/.ssh"
+            INSTALL_DIR="$BATS_TEST_TMPDIR"
+            QS_CLONES_MANIFEST="$BATS_TEST_TMPDIR/manifest"
+            CLONE_DEST_OVERRIDE="$BATS_TEST_TMPDIR/ws/memory"
+            CLONE_KEY_NAME=memory
+            do_clone'
+    [ "$status" -eq 0 ]
+    grep -q "git clone git@github.com:me/proj.git $BATS_TEST_TMPDIR/ws/memory" "$STUB_LOG"
+    grep -q "qs:demo:memory" "$STUB_LOG"
+    grep -q "ln -sfn $BATS_TEST_TMPDIR/ws/memory /Users/qs-bats-nonexistent/memory" "$STUB_LOG"
+    [[ -f "$BATS_TEST_TMPDIR/ws/.ssh/id_ed25519_memory" ]]
+}
+
 @test "do_clone escapes the deploy key path for shell re-parsing" {
     make_stub git 'echo "git $*" >> "$STUB_LOG"
         [[ "$1" == "clone" ]] && mkdir -p "$3"

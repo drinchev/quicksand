@@ -845,6 +845,11 @@ gcp_sa_setup() {
 # prints it for manual upload). For local-path sources, derives the URL
 # from the local repo's origin and adds a `quicksand` remote on the host
 # repo pointing at the sandbox copy. Sets CLONE_DEST as a side effect.
+#
+# Optional per-call overrides (unset = classic behavior):
+#   CLONE_DEST_OVERRIDE — clone destination instead of $QS_REPOS_DIR/<reponame>;
+#                         the home symlink is named after its basename
+#   CLONE_KEY_NAME      — deploy-key file/title suffix instead of <reponame>
 do_clone() {
     local source="$CLONE_SOURCE"
     local local_repo="" url
@@ -872,8 +877,9 @@ do_clone() {
     [[ -n "$repo_name" && "$repo_name" != "/" ]] \
         || abort "Could not determine repo name from $url"
 
-    CLONE_DEST="$QS_REPOS_DIR/$repo_name"
-    CLONE_LINK="/Users/$QUICKSAND_USER/$repo_name"
+    local key_name="${CLONE_KEY_NAME:-$repo_name}"
+    CLONE_DEST="${CLONE_DEST_OVERRIDE:-$QS_REPOS_DIR/$repo_name}"
+    CLONE_LINK="/Users/$QUICKSAND_USER/$(basename "$CLONE_DEST")"
     [[ ! -e "$CLONE_DEST" ]] \
         || abort "Destination $CLONE_DEST already exists. Run 'qs uninstall $SANDBOX_NAME' to start over, or use a different sandbox name."
     [[ ! -e "$CLONE_LINK" && ! -L "$CLONE_LINK" ]] \
@@ -883,7 +889,7 @@ do_clone() {
     if [[ "$url" =~ ^git@github\.com:([^/]+)/([^/]+)\.git$ ]]; then
         local owner="${BASH_REMATCH[1]}" gh_repo="${BASH_REMATCH[2]}"
         owner_repo="$owner/$gh_repo"
-        local key_path="$QS_SSH_DIR/id_ed25519_$repo_name"
+        local key_path="$QS_SSH_DIR/id_ed25519_$key_name"
         local pub_path="$key_path.pub"
 
         mkdir -p "$QS_SSH_DIR"
@@ -892,7 +898,7 @@ do_clone() {
         if [[ ! -f "$key_path" ]]; then
             info "Generating deploy key for $owner_repo..."
             ssh-keygen -t ed25519 -f "$key_path" -N "" -q \
-                -C "qs-deploy-${repo_name}@$(hostname)"
+                -C "qs-deploy-${key_name}@$(hostname)"
         fi
         chmod 0600 "$key_path"
 
@@ -904,7 +910,7 @@ do_clone() {
         if command -v gh &>/dev/null; then
             info "Registering deploy key with $owner_repo (write access)..."
             if gh repo deploy-key add "$pub_path" -R "$owner_repo" \
-                    --title "qs:$SANDBOX_NAME:$repo_name" --allow-write &>/dev/null; then
+                    --title "qs:$SANDBOX_NAME:$key_name" --allow-write &>/dev/null; then
                 uploaded=true
             else
                 warn "gh repo deploy-key add failed — gh may not be authenticated, you may lack admin on the repo, or a key with this title already exists."
@@ -934,7 +940,7 @@ do_clone() {
     record_clone "$repo_name" "$owner_repo" "$local_repo"
 
     info "Cloning $url → $CLONE_DEST"
-    mkdir -p "$QS_REPOS_DIR"
+    mkdir -p "$(dirname "$CLONE_DEST")"
     if [[ -n "$ssh_cmd" ]]; then
         GIT_SSH_COMMAND="$ssh_cmd" git clone "$url" "$CLONE_DEST"
         git -C "$CLONE_DEST" config core.sshCommand "$ssh_cmd"

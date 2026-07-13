@@ -51,4 +51,6 @@ if [[ "$(cat "$SENTINEL" 2>/dev/null)" != "$SETUP_VERSION" ]]; then
     echo "$SETUP_VERSION" > "$SENTINEL"
 fi
 
-nohup "$QMD" update > /dev/null 2>&1 &
+# Detached via subshell double-fork, not nohup: macOS nohup dies with
+# "can't detach from console" in sessions without a TTY (e.g. piped ones).
+( "$QMD" update > /dev/null 2>&1 & )

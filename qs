@@ -121,9 +121,10 @@ automatically. OWNER/REPO may be omitted when the sandbox has one clone.
 'memory' attaches a shared memory repo: a private GitHub repo of markdown
 notes cloned to the shared workspace with its own read-write deploy key,
 indexed by qmd inside the sandbox. Agents share knowledge across sandboxes
-by pushing a qs/NAME branch and opening a PR for you to merge — nothing
-propagates without your review, and commits are authored 'qs-NAME' so
-history shows which sandbox wrote what. Different sandboxes may attach
+by pushing a semantic branch (feat/..., fix/..., chore/..., docs/...) and
+opening a PR for you to merge — nothing propagates without your review,
+and commits are authored 'qs-NAME' so history shows which sandbox wrote
+what. Different sandboxes may attach
 different memory repos. For agents to open PRs, the sandbox's gh token
 must also select the memory repo (fine-grained PATs can cover several
 repositories — pick both when creating it, or edit its repository access).

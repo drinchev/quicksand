@@ -170,6 +170,14 @@ qs_run() {
     [ "$output" != "$before" ]
 }
 
+@test "config_fingerprint changes when a hook script changes" {
+    qs_run 'QS_CUSTOM_DIR=/nonexistent; config_fingerprint'
+    local before="$output"
+    echo "# tweak" >> "$REPO_COPY/config/hooks/stop-memory-nudge.sh"
+    qs_run 'QS_CUSTOM_DIR=/nonexistent; config_fingerprint'
+    [ "$output" != "$before" ]
+}
+
 @test "config_fingerprint changes when the sandbox profile template changes" {
     qs_run 'QS_CUSTOM_DIR=/nonexistent; config_fingerprint'
     local before="$output"
@@ -410,6 +418,80 @@ qs_run() {
     grep -q "ln -sfn $BATS_TEST_TMPDIR/ws/memory /Users/qs-bats-nonexistent/memory" "$STUB_LOG"
     [[ -f "$BATS_TEST_TMPDIR/ws/.ssh/id_ed25519_memory" ]]
 }
+
+###############################################################################
+# stop-memory-nudge hook
+###############################################################################
+
+# Point the hook at throwaway HOME/workspace/transcript for one test.
+nudge_env() {
+    export NUDGE="$REPO_COPY/config/hooks/stop-memory-nudge.sh"
+    export HOME="$BATS_TEST_TMPDIR/home"
+    export SHARED_WORKSPACE="$BATS_TEST_TMPDIR/ws"
+    export TRANSCRIPT="$BATS_TEST_TMPDIR/transcript.jsonl"
+    mkdir -p "$HOME" "$SHARED_WORKSPACE/notes"
+}
+
+# Run the hook with a Stop-event JSON on stdin (arg 1 = stop_hook_active).
+run_nudge() {
+    export STOP_ACTIVE="$1"
+    run bash -c 'printf "%s" "{\"session_id\":\"s1\",\"transcript_path\":\"$TRANSCRIPT\",\"stop_hook_active\":$STOP_ACTIVE}" | "$NUDGE"'
+}
+
+@test "memory nudge blocks once for a substantial session with nothing saved" {
+    nudge_env
+    dd if=/dev/zero of="$TRANSCRIPT" bs=1024 count=250 2>/dev/null
+    run_nudge false
+    [ "$status" -eq 0 ]
+    [[ "$output" == *'"decision": "block"'* ]]
+    [[ -f "$HOME/.local/state/quicksand/memory-nudge-s1" ]]
+
+    run_nudge false   # marker suppresses a second nudge
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "memory nudge stays silent for short sessions and looped stops" {
+    nudge_env
+    echo "tiny" > "$TRANSCRIPT"
+    run_nudge false
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+
+    dd if=/dev/zero of="$TRANSCRIPT" bs=1024 count=250 2>/dev/null
+    run_nudge true    # stop_hook_active: never block again
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+}
+
+@test "30-claude-config merges the Stop hook into an existing settings.json" {
+    export HOME="$BATS_TEST_TMPDIR/home"
+    export SHARED_WORKSPACE="$BATS_TEST_TMPDIR/ws"
+    mkdir -p "$HOME/.claude" "$SHARED_WORKSPACE/_quicksand/hooks"
+    echo "env doc" > "$SHARED_WORKSPACE/_quicksand/quicksand.md"
+    cp "$REPO_COPY/config/hooks/stop-memory-nudge.sh" "$SHARED_WORKSPACE/_quicksand/hooks/"
+    echo '{"theme": "dark"}' > "$HOME/.claude/settings.json"
+
+    run "$REPO_COPY/profile.d/30-claude-config.sh"
+    [ "$status" -eq 0 ]
+    run "$REPO_COPY/profile.d/30-claude-config.sh"   # idempotent
+    [ "$status" -eq 0 ]
+
+    grep -q '"theme": "dark"' "$HOME/.claude/settings.json"
+    [ "$(grep -c stop-memory-nudge "$HOME/.claude/settings.json")" -eq 1 ]
+}
+
+@test "memory nudge stays silent when a note was written this session" {
+    nudge_env
+    dd if=/dev/zero of="$TRANSCRIPT" bs=1024 count=250 2>/dev/null
+    sleep 1
+    echo "note" > "$SHARED_WORKSPACE/notes/fresh.md"
+    run_nudge false
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    [[ -f "$HOME/.local/state/quicksand/memory-nudge-s1" ]]
+}
+
 
 ###############################################################################
 # qs memory (git/gh/ssh-keygen/sudo stubbed)

@@ -28,6 +28,7 @@ QS_REPO_DIR="$(cd -P "$(dirname "$QS_SOURCE")" && pwd -P)"
 readonly QS_REPO_DIR
 readonly QS_PROFILE_SOURCE_DIR="$QS_REPO_DIR/profile.d"
 readonly QS_LOGOUT_SOURCE_DIR="$QS_REPO_DIR/logout.d"
+readonly QS_HOOKS_SOURCE_DIR="$QS_REPO_DIR/config/hooks"
 readonly QS_SANDBOX_PROFILE_TEMPLATE="$QS_REPO_DIR/config/sandbox.sb"
 # Static markdown describing the sandbox to Claude; seeded into the sandbox's
 # ~/.claude/CLAUDE.md by profile.d/30-claude-config.sh. Kept as a plain file
@@ -65,7 +66,8 @@ config_fingerprint() {
         /usr/bin/shasum -a 256 < "$QS_SANDBOX_PROFILE_TEMPLATE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_QUICKSAND_MD" 2>/dev/null || true
         local dir
-        for dir in "$QS_PROFILE_SOURCE_DIR" "$QS_LOGOUT_SOURCE_DIR" "$QS_CUSTOM_DIR"; do
+        for dir in "$QS_PROFILE_SOURCE_DIR" "$QS_LOGOUT_SOURCE_DIR" \
+                   "$QS_HOOKS_SOURCE_DIR" "$QS_CUSTOM_DIR"; do
             [[ -d "$dir" ]] || continue
             (cd "$dir" \
                 && find . -type f -print0 | sort -z \
@@ -287,6 +289,7 @@ derive_constants() {
     readonly QS_PRIVATE_DIR="$SHARED_WORKSPACE/_quicksand"
     readonly QS_PROFILE_DIR="$QS_PRIVATE_DIR/profile.d"
     readonly QS_LOGOUT_DIR="$QS_PRIVATE_DIR/logout.d"
+    readonly QS_HOOKS_DIR="$QS_PRIVATE_DIR/hooks"
     readonly SUDOERS_FILE="/etc/sudoers.d/50-nopasswd-for-$QUICKSAND_USER"
     readonly SANDBOX_PROFILE="/var/quicksand/sandbox-$QUICKSAND_USER.sb"
     readonly INSTALL_DIR="$HOME/.config/quicksand"
@@ -1195,6 +1198,14 @@ EOF
         /usr/bin/rsync \
             --checksum --recursive --perms --times \
             "$QS_LOGOUT_SOURCE_DIR/" "$QS_LOGOUT_DIR/"
+    fi
+
+    if [[ -d "$QS_HOOKS_SOURCE_DIR" ]]; then
+        debug "Syncing $QS_HOOKS_SOURCE_DIR/ → $QS_HOOKS_DIR/"
+        mkdir -p "$QS_HOOKS_DIR"
+        /usr/bin/rsync \
+            --checksum --recursive --perms --times \
+            "$QS_HOOKS_SOURCE_DIR/" "$QS_HOOKS_DIR/"
     fi
 
     if [[ -d "$QS_CUSTOM_DIR" ]]; then

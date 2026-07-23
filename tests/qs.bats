@@ -1004,3 +1004,184 @@ op_provision_stub() {
     [[ "$output" != *"readonly variable"* ]]
     [ "$(cat "$BATS_TEST_TMPDIR/priv/op-token")" == "tok-ro" ]
 }
+
+
+###############################################################################
+# docker broker — config/qs-docker-broker run directly against a stub docker
+###############################################################################
+
+# Run the broker as `launchd` would (request on stdin, reply on stdout) with
+# the workspace at $WS and a stub docker that prints its argv. Tests that
+# need custom docker behavior overwrite the stub before calling this.
+broker() {
+    command -v jq >/dev/null 2>&1 || skip "jq not available"
+    [[ -x "$STUBS/docker" ]] \
+        || make_stub docker 'printf "DOCKER:"; printf " %s" "$@"; printf "\n"'
+    # Resolved path: $BATS_TEST_TMPDIR sits under the /var → /private/var
+    # symlink, and the broker canonicalizes its workspace argument.
+    mkdir -p "$BATS_TEST_TMPDIR/ws"
+    WS="$(cd "$BATS_TEST_TMPDIR/ws" && pwd -P)"
+    run bash -c "HOME=\"$BATS_TEST_TMPDIR\" \
+        bash \"$REPO_COPY/config/qs-docker-broker\" work \"$WS\" \
+        \"$STUBS/docker\" \"\$(command -v jq)\" <<< '$1'"
+}
+
+@test "docker broker run composes the hardened template" {
+    broker '{"v":1,"verb":"run","image":"node:20","cmd":["node","-e","x"],"env":{"FOO":"bar baz"}}'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"DOCKER: run --rm -i --label quicksand.sandbox=work --cap-drop ALL"* ]]
+    [[ "$output" == *"-v $WS:$WS -w $WS"* ]]         # default workdir = workspace
+    [[ "$output" == *"-e FOO=bar baz node:20 node -e x"* ]]
+    [[ "$output" == *"@@qs-docker-exit:0@@"* ]]
+}
+
+@test "docker broker rejects a workdir outside the workspace" {
+    mkdir -p "$BATS_TEST_TMPDIR/elsewhere"
+    broker "{\"v\":1,\"verb\":\"run\",\"image\":\"node:20\",\"workdir\":\"$BATS_TEST_TMPDIR/elsewhere\"}"
+    [[ "$output" == *"workdir must be under"* ]]
+    [[ "$output" != *"DOCKER:"* ]]
+    [[ "$output" == *"@@qs-docker-exit:125@@"* ]]
+}
+
+@test "docker broker resolves ../ traversal before the workspace check" {
+    mkdir -p "$BATS_TEST_TMPDIR/evil"
+    broker "{\"v\":1,\"verb\":\"run\",\"image\":\"node:20\",\"workdir\":\"$BATS_TEST_TMPDIR/ws/../evil\"}"
+    [[ "$output" == *"workdir must be under"* ]]
+    [[ "$output" != *"DOCKER:"* ]]
+}
+
+@test "docker broker rejects flag injection via the image field" {
+    broker '{"v":1,"verb":"run","image":"--privileged"}'
+    [[ "$output" == *"bad image ref"* ]]
+    [[ "$output" != *"DOCKER:"* ]]
+}
+
+@test "docker broker rejects malformed env names" {
+    broker '{"v":1,"verb":"run","image":"node:20","env":{"BAD NAME":"x"}}'
+    [[ "$output" == *"bad env name"* ]]
+    [[ "$output" != *"DOCKER:"* ]]
+}
+
+@test "docker broker forces build tags into the sandbox namespace" {
+    broker '{"v":1,"verb":"build","tag":"innocent/app","context":"/tmp"}'
+    [[ "$output" == *"tag must live under qs-work/"* ]]
+    [[ "$output" != *"DOCKER:"* ]]
+}
+
+@test "docker broker builds with an in-workspace context" {
+    mkdir -p "$BATS_TEST_TMPDIR/ws/proj"
+    broker "{\"v\":1,\"verb\":\"build\",\"tag\":\"qs-work/app\",\"context\":\"$BATS_TEST_TMPDIR/ws/proj\"}"
+    [[ "$output" == *"DOCKER: build --label quicksand.sandbox=work -t qs-work/app $WS/proj"* ]]
+    [[ "$output" == *"@@qs-docker-exit:0@@"* ]]
+}
+
+@test "docker broker rejects a build context outside the workspace" {
+    broker '{"v":1,"verb":"build","tag":"qs-work/app","context":"/etc"}'
+    [[ "$output" == *"context must be under"* ]]
+    [[ "$output" != *"DOCKER:"* ]]
+}
+
+@test "docker broker refuses verbs outside the allowlist" {
+    broker '{"v":1,"verb":"exec","id":"whatever"}'
+    [[ "$output" == *"unknown verb 'exec'"* ]]
+    [[ "$output" != *"DOCKER:"* ]]
+}
+
+@test "docker broker rejects command injection in container ids" {
+    broker '{"v":1,"verb":"logs","id":"$(rm -rf /)"}'
+    [[ "$output" == *"bad container id"* ]]
+    [[ "$output" != *"DOCKER:"* ]]
+}
+
+@test "docker broker refuses containers owned by another sandbox" {
+    make_stub docker '[[ "$1" == "inspect" ]] && { echo "other"; exit 0; }
+        printf "DOCKER:"; printf " %s" "$@"; printf "\n"'
+    broker '{"v":1,"verb":"stop","id":"abc123"}'
+    [[ "$output" == *"no such container"* ]]
+    [[ "$output" != *"DOCKER: stop"* ]]
+}
+
+@test "docker broker rejects a non-JSON request" {
+    broker 'not json at all'
+    [[ "$output" == *"unparseable request"* ]]
+    [[ "$output" != *"DOCKER:"* ]]
+}
+
+
+###############################################################################
+# qs docker — CLI plumbing and host-side helpers
+###############################################################################
+
+@test "qs docker requires a sandbox name" {
+    run "$QS" docker
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"sandbox name required"* ]]
+}
+
+@test "qs docker rejects actions other than off" {
+    run "$QS" docker work offf
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"accepts 'off' or nothing"* ]]
+}
+
+@test "qs --help documents qs docker" {
+    run "$QS" --help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"qs docker    NAME [off]"* ]]
+}
+
+@test "cmd_docker aborts when docker is missing on the host" {
+    qs_run 'PATH="/usr/bin:/bin"; COMMAND_ARGS=(); DOCKER_ACTION=on
+            SANDBOX_NAME=work; cmd_docker'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"docker CLI not found on host"* ]]
+}
+
+@test "docker_broker_install stages, renders, and loads the agent" {
+    command -v jq >/dev/null 2>&1 || skip "jq not available"
+    make_stub launchctl 'echo "launchctl $*" >> "$STUB_LOG"'
+    export WORK="$BATS_TEST_TMPDIR/work"
+    mkdir -p "$WORK"
+    qs_run 'PATH="$STUBS:$PATH"; SANDBOX_NAME=work
+            SHARED_WORKSPACE="$WORK/ws"; QS_PRIVATE_DIR="$WORK/ws/_quicksand"
+            INSTALL_DIR="$WORK/install"
+            QS_DOCKER_LABEL=com.quicksand.docker-broker.work
+            QS_DOCKER_PLIST="$WORK/agent.plist"
+            QS_DOCKER_BROKER_STAGED="$WORK/install/docker-broker-work.sh"
+            HOME="$WORK"
+            docker_broker_install /host/bin/docker /host/bin/jq'
+    [ "$status" -eq 0 ]
+    [ -x "$WORK/install/docker-broker-work.sh" ]
+    [ -x "$WORK/ws/_quicksand/bin/qs-docker" ]
+    grep -q "<string>/host/bin/docker</string>" "$WORK/agent.plist"
+    grep -q "<string>$WORK/install/docker-broker-work.sh</string>" "$WORK/agent.plist"
+    grep -q "$WORK/ws/_quicksand/docker-broker.sock" "$WORK/agent.plist"
+    grep -q "launchctl bootstrap" "$STUB_LOG"
+}
+
+@test "cleanup_docker reaps labeled containers and images" {
+    make_stub launchctl 'echo "launchctl $*" >> "$STUB_LOG"'
+    make_stub docker 'echo "docker $*" >> "$STUB_LOG"
+        case "$1" in
+            ps)     echo "c1"; echo "c2" ;;
+            images) echo "i1" ;;
+        esac'
+    export WORK="$BATS_TEST_TMPDIR/work"
+    mkdir -p "$WORK/install" "$WORK/ws/_quicksand/bin"
+    touch "$WORK/agent.plist" "$WORK/install/docker-broker-work.sh" \
+          "$WORK/ws/_quicksand/bin/qs-docker"
+    qs_run 'PATH="$STUBS:/usr/bin:/bin"; SANDBOX_NAME=work
+            QS_PRIVATE_DIR="$WORK/ws/_quicksand"
+            INSTALL_DIR="$WORK/install"
+            QS_DOCKER_LABEL=com.quicksand.docker-broker.work
+            QS_DOCKER_PLIST="$WORK/agent.plist"
+            QS_DOCKER_BROKER_STAGED="$WORK/install/docker-broker-work.sh"
+            cleanup_docker'
+    [ "$status" -eq 0 ]
+    [ ! -f "$WORK/agent.plist" ]
+    [ ! -f "$WORK/install/docker-broker-work.sh" ]
+    [ ! -f "$WORK/ws/_quicksand/bin/qs-docker" ]
+    grep -q "docker ps -aq --filter label=quicksand.sandbox=work" "$STUB_LOG"
+    grep -q "docker rm -f c1 c2" "$STUB_LOG"
+    grep -q "docker rmi -f i1" "$STUB_LOG"
+}

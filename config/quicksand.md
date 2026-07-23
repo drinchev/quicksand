@@ -84,6 +84,27 @@ sandboxes, indexed as the qmd collection `shared-memory`.
   main); other sandboxes only after the user merges the PR.
 - NEVER write secrets here — this repo leaves the machine.
 
+## Docker (host broker)
+
+- There is no Docker engine inside the sandbox. If `qs docker` has been
+  enabled for this sandbox (check: `command -v qs-docker`), containers run
+  on the HOST's Docker engine through a policy broker — you talk to it with
+  the `qs-docker` command, never a Docker socket:
+  - `qs-docker run [-w DIR] [-e KEY=VAL]... IMAGE [CMD ARGS...]`
+  - `qs-docker build -t qs-$QS_SANDBOX_NAME/TAG [-f DOCKERFILE] CONTEXT_DIR`
+  - `qs-docker pull IMAGE`, `qs-docker ps`, `qs-docker logs ID`,
+    `qs-docker stop ID`
+- The broker enforces the policy host-side; these are facts, not knobs:
+  containers mount ONLY $SHARED_WORKSPACE (paths outside it don't exist in
+  the container), capabilities are dropped, resources are capped
+  (4g RAM / 4 CPUs / 512 pids), build tags must live under
+  `qs-<sandbox>/`, and you can only see or stop containers this sandbox
+  created. Piped stdin reaches the container; there is no TTY, no `exec`,
+  no volume flags.
+- If `qs-docker` is absent or reports the broker socket missing, the
+  feature is off — hand the user the command `qs docker <name>` to run on
+  the host instead of trying to reach Docker another way.
+
 ## App secrets (1Password)
 - If `qs op-auth` has been run, app secrets (API keys, passwords, etc.) live in
   a per-sandbox 1Password vault and the `op` CLI is authenticated via the

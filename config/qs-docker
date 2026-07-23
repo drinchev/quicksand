@@ -1,0 +1,112 @@
+#!/bin/bash
+# qs-docker — sandbox-side client for the host docker broker (see
+# config/qs-docker-broker for the security model). Staged into
+# _quicksand/bin/ by `qs docker NAME` and installed onto the sandbox PATH
+# by profile.d/63-docker-shim.sh.
+#
+# Deliberately NOT a docker CLI clone: it speaks exactly the verbs the
+# broker allows, with a tiny flag surface, and anything else fails loudly.
+# The broker owns every real docker flag — mounts, caps, limits, labels.
+#
+#   qs-docker run [-w DIR] [-e KEY=VAL]... IMAGE [CMD ARGS...]
+#   qs-docker build -t qs-NAME/TAG [-f DOCKERFILE] CONTEXT_DIR
+#   qs-docker pull IMAGE
+#   qs-docker ps
+#   qs-docker logs CONTAINER
+#   qs-docker stop CONTAINER
+set -euo pipefail
+
+SOCK="${QS_DOCKER_SOCK:-${SHARED_WORKSPACE:?SHARED_WORKSPACE not set}/_quicksand/docker-broker.sock}"
+[[ -S "$SOCK" ]] || {
+    echo "qs-docker: broker socket not found at $SOCK — enable with 'qs docker <name>' on the host" >&2
+    exit 125
+}
+command -v jq >/dev/null 2>&1 || {
+    echo "qs-docker: jq not found (ships with macOS 15+; install it into ~/.local/bin otherwise)" >&2
+    exit 125
+}
+
+usage() {
+    sed -n 's/^#   \(qs-docker.*\)/  \1/p' "$0" >&2
+    exit 2
+}
+
+[[ $# -ge 1 ]] || usage
+VERB="$1"; shift
+
+REQ=""
+STREAM_STDIN=false
+case "$VERB" in
+run)
+    workdir="" envs=()
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -w) workdir="${2:?-w needs a directory}"; shift 2 ;;
+            -e) envs+=("${2:?-e needs KEY=VAL}"); shift 2 ;;
+            -*) echo "qs-docker: unsupported flag '$1' (the broker owns all other flags)" >&2; exit 2 ;;
+            *)  break ;;
+        esac
+    done
+    [[ $# -ge 1 ]] || usage
+    image="$1"; shift
+    REQ="$(jq -cn --arg image "$image" --arg workdir "$workdir" \
+        '{v:1, verb:"run", image:$image, cmd:$ARGS.positional}
+         + (if $workdir != "" then {workdir:$workdir} else {} end)' \
+        --args -- "$@")"
+    if (( ${#envs[@]} > 0 )); then
+        REQ="$(jq -cn --argjson base "$REQ" \
+            '$base + {env: ($ARGS.positional
+                | map(split("=") | {(.[0]): (.[1:] | join("="))}) | add)}' \
+            --args -- "${envs[@]}")"
+    fi
+    # Forward stdin only when something is piped in; attaching the terminal
+    # would hold the connection open waiting for EOF.
+    [[ -t 0 ]] || STREAM_STDIN=true
+    ;;
+build)
+    tag="" dockerfile=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -t) tag="${2:?-t needs a tag}"; shift 2 ;;
+            -f) dockerfile="${2:?-f needs a path}"; shift 2 ;;
+            -*) echo "qs-docker: unsupported flag '$1'" >&2; exit 2 ;;
+            *)  break ;;
+        esac
+    done
+    [[ -n "$tag" && $# -eq 1 ]] || usage
+    context="$(cd "$1" 2>/dev/null && pwd -P)" \
+        || { echo "qs-docker: context directory '$1' not found" >&2; exit 2; }
+    REQ="$(jq -cn --arg tag "$tag" --arg context "$context" --arg dockerfile "$dockerfile" \
+        '{v:1, verb:"build", tag:$tag, context:$context}
+         + (if $dockerfile != "" then {dockerfile:$dockerfile} else {} end)')"
+    ;;
+pull)
+    [[ $# -eq 1 ]] || usage
+    REQ="$(jq -cn --arg image "$1" '{v:1, verb:"pull", image:$image}')"
+    ;;
+ps)
+    [[ $# -eq 0 ]] || usage
+    REQ='{"v":1,"verb":"ps"}'
+    ;;
+logs|stop)
+    [[ $# -eq 1 ]] || usage
+    REQ="$(jq -cn --arg verb "$VERB" --arg id "$1" '{v:1, verb:$verb, id:$id}')"
+    ;;
+*)
+    usage
+    ;;
+esac
+
+# Send the request (plus stdin, for run), stream the reply as it arrives,
+# and turn the trailing @@qs-docker-exit:N@@ sentinel into our exit code.
+STATUS=125
+while IFS= read -r line; do
+    if [[ "$line" =~ ^@@qs-docker-exit:([0-9]+)@@$ ]]; then
+        STATUS="${BASH_REMATCH[1]}"
+    else
+        printf '%s\n' "$line"
+    fi
+done < <(
+    { printf '%s\n' "$REQ"; if $STREAM_STDIN; then cat; fi; } | nc -U "$SOCK"
+)
+exit "$STATUS"

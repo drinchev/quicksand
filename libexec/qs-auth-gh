@@ -30,9 +30,10 @@
 # Environment contract (exported by qs for every qs-auth-* provider):
 #   QS_SANDBOX_NAME  sandbox name (the qs-NAME user)
 #   QS_PRIVATE_DIR   $SHARED_WORKSPACE/_quicksand — token files live here
-#   QS_INSTALL_DIR   ~/.config/quicksand — unused here (no host manifest:
-#                    the token files are the only state)
 #   QS_VERBOSE       verbosity (0-3)
+# (qs also exports QS_INSTALL_DIR for providers with host-side manifests;
+# this one has none — the token files are its only state — so it neither
+# requires nor reads it.)
 #
 # Runs straight from the repo checkout like qs itself; nothing here is
 # baked into sandboxes, so edits don't trigger rebuilds.
@@ -47,7 +48,6 @@ debug() { (( QS_VERBOSE >= 2 )) && echo "$*" || true; }
 
 SANDBOX_NAME="${QS_SANDBOX_NAME:?qs-auth-gh is invoked by qs, which sets QS_SANDBOX_NAME}"
 QS_PRIVATE_DIR="${QS_PRIVATE_DIR:?}"
-QS_INSTALL_DIR="${QS_INSTALL_DIR:?}"
 
 # Percent-encode a string for a URL query value: RFC 3986 unreserved chars
 # pass through, everything else becomes %XX. ASCII inputs only — all we build.

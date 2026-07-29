@@ -530,8 +530,7 @@ qs_run() {
 # contract (its main is guarded against sourcing, mirroring qs itself).
 gh_run() {
     run bash -c "export QS_SANDBOX_NAME=demo \
-            QS_PRIVATE_DIR=\"\$BATS_TEST_TMPDIR/priv\" \
-            QS_INSTALL_DIR=\"\$BATS_TEST_TMPDIR\"
+            QS_PRIVATE_DIR=\"\$BATS_TEST_TMPDIR/priv\"
         source \"\$GH\"; $1"
 }
 
@@ -543,7 +542,6 @@ gh_exec() {
     run env PATH="$STUBS:$PATH" \
         QS_SANDBOX_NAME=demo \
         QS_PRIVATE_DIR="${GH_PRIV:-$BATS_TEST_TMPDIR/priv}" \
-        QS_INSTALL_DIR="$BATS_TEST_TMPDIR" \
         "$GH" "$@"
 }
 

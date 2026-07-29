@@ -298,9 +298,6 @@ derive_constants() {
     # One tab-separated line per clone: REPO_NAME\tOWNER/REPO\tLOCAL_REPO_PATH
     # (fields 2 and 3 may be empty).
     readonly QS_CLONES_MANIFEST="$INSTALL_DIR/clones-$SANDBOX_NAME"
-    # Host-side record of `qs op-auth` provisioning, consumed by uninstall.
-    # One tab-separated line: VAULT_NAME\tTOKEN_ITEM_TITLE\tSERVICE_ACCOUNT_NAME
-    readonly QS_OP_MANIFEST="$INSTALL_DIR/op-$SANDBOX_NAME"
     # Host-side personal additions. The whole tree is rsync'd verbatim into
     # the sandbox's _quicksand/custom/. Recognised subdirs:
     #   custom/profile.d/   .sh scripts run after canonical (50-99 prefixes)
@@ -522,27 +519,6 @@ run_all_auth_providers() {
     done
 }
 
-# Reverse what `qs op-auth` provisioned. 1Password has no CLI to delete/revoke
-# a service account (only the web UI), so we best-effort delete the stored token
-# item, then print a revoke reminder. The vault and its secrets are left intact.
-cleanup_op() {
-    [[ -f "$QS_OP_MANIFEST" ]] || return 0
-    local vault item sa
-    IFS=$'\t' read -r vault item sa < "$QS_OP_MANIFEST"
-
-    if command -v op >/dev/null 2>&1 && [[ -n "$item" && -n "$vault" ]]; then
-        op item delete "$item" --vault "$vault" >/dev/null 2>&1 \
-            && info "Removed the stored token item from vault '$vault'." || true
-    fi
-    if [[ -n "$sa" ]]; then
-        warn "Revoke the service account '$sa' in 1Password (no CLI to do it):"
-        warn "  https://my.1password.com → Developer → Service Accounts → $sa → Revoke Token"
-    fi
-    [[ -n "$vault" ]] && info "Left 1Password vault '$vault' and its secrets intact."
-
-    rm -f "$QS_OP_MANIFEST"
-}
-
 # Append a clone record to the manifest (see QS_CLONES_MANIFEST, or
 # CLONE_MANIFEST_OVERRIDE when set — `qs memory` records separately) so
 # uninstall can clean up after it. Idempotent: skips exact duplicates.
@@ -587,37 +563,6 @@ detect_single_github_clone() {
     parse_github_repo "$one_repo" || return 1
     PG_NAME="$one_name"   # prefer the recorded clone name for the token file
     return 0
-}
-
-# Stage the sandbox's 1Password service-account token for this session by
-# reading it from your *host* 1Password (where it was stored by `qs op-auth`)
-# into a 0600 workspace file that profile.d/62-op-auth.sh exports as
-# OP_SERVICE_ACCOUNT_TOKEN. Reading via the host's own op identity (not the
-# service account) keeps the token out of the sandbox between sessions and lets
-# rotating it in 1Password propagate. Best-effort: a missing op or locked vault
-# warns but never blocks entry (the session simply has no OP token).
-op_auto_inject() {
-    [[ -f "$QS_OP_MANIFEST" ]] || return 0
-    command -v op >/dev/null 2>&1 || {
-        warn "op (1Password CLI) not on host — can't load the token for '$SANDBOX_NAME'. Continuing without it."
-        return 0
-    }
-
-    local vault item sa
-    IFS=$'\t' read -r vault item sa < "$QS_OP_MANIFEST"
-    [[ -n "$vault" && -n "$item" ]] || return 0
-
-    local token
-    token="$(op read "op://$vault/$item/password" 2>/dev/null || true)"
-    if [[ -z "$token" ]]; then
-        warn "Could not read the 1Password token for '$SANDBOX_NAME' — unlock 1Password or re-run 'qs op-auth $SANDBOX_NAME'. Continuing without it."
-        return 0
-    fi
-
-    mkdir -p "$QS_PRIVATE_DIR"
-    local token_file="$QS_PRIVATE_DIR/op-token"
-    ( umask 077; printf '%s\n' "$token" > "$token_file" )
-    chmod 0600 "$token_file"
 }
 
 # Clone a git repo into $QS_REPOS_DIR/<reponame>. For GitHub SSH URLs,
@@ -978,7 +923,6 @@ cmd_uninstall() {
     cleanup_clone_artifacts
     cleanup_memory_artifacts
     run_all_auth_providers cleanup
-    cleanup_op
 
     # Best-effort: tear down any running session for this sandbox user.
     # `|| true` swallows pipefail-induced ERR when the user is already
@@ -1115,61 +1059,15 @@ cmd_gcp_token() {
     run_auth_provider gcp mint || exit $?
 }
 
-# Provision per-sandbox app-secret access via 1Password: a vault 'qs-NAME', a
-# service account scoped to just that vault (read-only by default; --write adds
-# write_items), with its token stored back in the vault so the launcher can
-# re-read it each session. Uses the host's own (signed-in) op identity. The
-# token is shown only once by 1Password, so re-running mints a fresh service
-# account — the old one can't be deleted via CLI and should be revoked in the UI.
+# Provision per-sandbox app-secret access via 1Password — a thin dispatcher
+# into the op auth provider (libexec/qs-auth-op), which owns the whole flow:
+# vault, scoped service account, token storage, launch-time staging.
 cmd_op_auth() {
     (( ${#COMMAND_ARGS[@]} == 0 )) \
         || abort "qs op-auth doesn't accept '--' args"
-    command -v op >/dev/null 2>&1 \
-        || abort "op (1Password CLI) not found on host — install it first: https://1password.com/downloads/command-line/"
-    op whoami >/dev/null 2>&1 \
-        || abort "Not signed in to 1Password on the host — run 'op signin' (or unlock the desktop app with CLI integration on) first."
-
-    local vault="qs-$SANDBOX_NAME"
-    local sa="qs-$SANDBOX_NAME"
-    local item="quicksand-service-account"
-    local perms="read_items"
-    [[ "$OP_WRITE" == "true" ]] && perms="read_items,write_items"
-
-    # 1. Vault (idempotent).
-    if op vault get "$vault" >/dev/null 2>&1; then
-        info "1Password vault '$vault' already exists."
-    else
-        info "Creating 1Password vault '$vault'..."
-        op vault create "$vault" >/dev/null \
-            || abort "Failed to create vault '$vault'."
-    fi
-
-    # 2. Service account scoped to that vault. Token is returned once (--raw).
-    info "Creating service account '$sa' scoped to '$vault' ($perms, expires 90d)..."
-    local token
-    token="$(op service-account create "$sa" \
-                --expires-in 90d \
-                --vault "$vault:$perms" \
-                --raw 2>/dev/null)" \
-        || abort "Failed to create the service account (one named '$sa' may already exist — revoke it in 1Password, then retry)."
-    [[ -n "$token" ]] || abort "1Password returned an empty service-account token."
-
-    # 3. Store the token back in the vault so launches can re-read it via your
-    #    host identity. Replace any prior item so re-running refreshes cleanly.
-    op item delete "$item" --vault "$vault" >/dev/null 2>&1 || true
-    op item create --category Password --title "$item" --vault "$vault" \
-            "password=$token" >/dev/null \
-        || abort "Created the service account but failed to store its token in '$vault'."
-
-    # 4. Record for uninstall.
-    mkdir -p "$INSTALL_DIR"
-    printf '%s\t%s\t%s\n' "$vault" "$item" "$sa" > "$QS_OP_MANIFEST"
-
-    info ""
-    info "Done. Add secrets to vault '$vault' in 1Password; the sandbox reads them with:"
-    info "  op read \"op://$vault/<item>/<field>\""
-    info "  op run  --env-file=<file> -- <command>"
-    [[ "$OP_WRITE" == "true" ]] || info "(read-only; pass --write to let the sandbox store secrets back)"
+    local args=()
+    [[ "$OP_WRITE" == "true" ]] && args+=(--write)
+    run_auth_provider op provision "${args[@]+"${args[@]}"}" || exit $?
 }
 
 # Enter the sandbox: sanity-check the build artifacts, assemble the
@@ -1195,8 +1093,6 @@ cmd_launch() {
     # Hand the session fresh credentials from every provisioned auth provider
     # (best-effort; each provider self-gates on its own state files).
     run_all_auth_providers refresh
-    # Stage the 1Password service-account token if this sandbox uses one.
-    op_auto_inject
 
     local INITIAL_DIR_Q ZSH_COMMAND
     INITIAL_DIR_Q="$(quote_zsh_args "${INITIAL_DIR:-/Users/$QUICKSAND_USER}")"

@@ -1,0 +1,187 @@
+#!/bin/bash
+# qs-auth-op — 1Password credential provider for quicksand sandboxes.
+#
+# Owns the host side of `qs op-auth`: a per-sandbox 1Password vault, a
+# service account scoped to just that vault, and the transient token file
+# staged into the workspace each launch. The in-sandbox consumer is
+# profile.d/62-op-auth.sh, which exports the staged file as
+# OP_SERVICE_ACCOUNT_TOKEN; logout.d/15-op-token.sh removes it when the
+# session ends, so the token never persists in the sandbox between
+# sessions — `refresh` re-stages it from your host 1Password on the next
+# launch, which also means rotating it in 1Password propagates.
+#
+# Invoked by qs (see run_auth_provider there), not run by hand:
+#
+#   qs-auth-op provision [--write]
+#       Setup behind `qs op-auth`, using the host's own (signed-in) op
+#       identity: create the vault 'qs-NAME' (idempotent), create a
+#       service account scoped to it (read-only; --write adds
+#       write_items), store the SA token back in the vault, and record a
+#       manifest for cleanup. The token is shown only once by 1Password,
+#       so re-running mints a fresh service account — the old one can't
+#       be deleted via CLI and should be revoked in the UI.
+#   qs-auth-op refresh
+#       Launch-time staging: read the SA token from the vault via the
+#       host identity into a 0600 workspace file. Silent no-op unless
+#       provisioned; a missing op or locked vault warns but never fails —
+#       the session simply has no OP token.
+#   qs-auth-op cleanup
+#       Uninstall-time: delete the stored token item, print a revoke
+#       reminder (1Password has no CLI revoke), drop the manifest. The
+#       vault and its secrets are left intact. Best-effort; never fails.
+#
+# Environment contract (exported by qs for every qs-auth-* provider):
+#   QS_SANDBOX_NAME  sandbox name (the qs-NAME user)
+#   QS_PRIVATE_DIR   $SHARED_WORKSPACE/_quicksand — the token is staged here
+#   QS_INSTALL_DIR   ~/.config/quicksand — the manifest lives here
+#   QS_VERBOSE       verbosity (0-3)
+#
+# Runs straight from the repo checkout like qs itself; nothing here is
+# baked into sandboxes, so edits don't trigger rebuilds.
+set -Eeuo pipefail
+trap 'echo >&2 "${BASH_SOURCE[0]}: line $LINENO: $BASH_COMMAND: exitcode $?"' ERR
+
+QS_VERBOSE="${QS_VERBOSE:-0}"
+abort() { echo >&2 "ERROR: $*"; exit 1; }
+warn()  { echo >&2 "WARNING: $*"; }
+info()  { echo "$*"; }
+debug() { (( QS_VERBOSE >= 2 )) && echo "$*" || true; }
+
+SANDBOX_NAME="${QS_SANDBOX_NAME:?qs-auth-op is invoked by qs, which sets QS_SANDBOX_NAME}"
+QS_PRIVATE_DIR="${QS_PRIVATE_DIR:?}"
+QS_INSTALL_DIR="${QS_INSTALL_DIR:?}"
+
+# Host-side record of what provision created, consumed by `refresh` (which
+# vault/item to read) and `cleanup`. One tab-separated line:
+# VAULT_NAME\tTOKEN_ITEM_TITLE\tSERVICE_ACCOUNT_NAME
+QS_OP_MANIFEST="$QS_INSTALL_DIR/op-$SANDBOX_NAME"
+
+# Provision per-sandbox app-secret access via 1Password: a vault 'qs-NAME', a
+# service account scoped to just that vault (read-only by default; --write adds
+# write_items), with its token stored back in the vault so `refresh` can
+# re-read it each launch via the host identity.
+do_provision() {
+    local perms="read_items"
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --write) perms="read_items,write_items"; shift ;;
+            *) abort "provision: unknown argument '$1' (accepts --write)" ;;
+        esac
+    done
+
+    command -v op >/dev/null 2>&1 \
+        || abort "op (1Password CLI) not found on host — install it first: https://1password.com/downloads/command-line/"
+    op whoami >/dev/null 2>&1 \
+        || abort "Not signed in to 1Password on the host — run 'op signin' (or unlock the desktop app with CLI integration on) first."
+
+    local vault="qs-$SANDBOX_NAME"
+    local sa="qs-$SANDBOX_NAME"
+    local item="quicksand-service-account"
+
+    # 1. Vault (idempotent).
+    if op vault get "$vault" >/dev/null 2>&1; then
+        info "1Password vault '$vault' already exists."
+    else
+        info "Creating 1Password vault '$vault'..."
+        op vault create "$vault" >/dev/null \
+            || abort "Failed to create vault '$vault'."
+    fi
+
+    # 2. Service account scoped to that vault. Token is returned once (--raw).
+    info "Creating service account '$sa' scoped to '$vault' ($perms, expires 90d)..."
+    local token
+    token="$(op service-account create "$sa" \
+                --expires-in 90d \
+                --vault "$vault:$perms" \
+                --raw 2>/dev/null)" \
+        || abort "Failed to create the service account (one named '$sa' may already exist — revoke it in 1Password, then retry)."
+    [[ -n "$token" ]] || abort "1Password returned an empty service-account token."
+
+    # 3. Store the token back in the vault so launches can re-read it via your
+    #    host identity. Replace any prior item so re-running refreshes cleanly.
+    op item delete "$item" --vault "$vault" >/dev/null 2>&1 || true
+    op item create --category Password --title "$item" --vault "$vault" \
+            "password=$token" >/dev/null \
+        || abort "Created the service account but failed to store its token in '$vault'."
+
+    # 4. Record for refresh and cleanup.
+    mkdir -p "$(dirname "$QS_OP_MANIFEST")"
+    printf '%s\t%s\t%s\n' "$vault" "$item" "$sa" > "$QS_OP_MANIFEST"
+
+    info ""
+    info "Done. Add secrets to vault '$vault' in 1Password; the sandbox reads them with:"
+    info "  op read \"op://$vault/<item>/<field>\""
+    info "  op run  --env-file=<file> -- <command>"
+    [[ "$perms" != "read_items" ]] \
+        || info "(read-only; pass --write to let the sandbox store secrets back)"
+}
+
+# Stage the sandbox's 1Password service-account token for this session by
+# reading it from your *host* 1Password (where provision stored it) into a
+# 0600 workspace file that profile.d/62-op-auth.sh exports as
+# OP_SERVICE_ACCOUNT_TOKEN. Reading via the host's own op identity (not the
+# service account) keeps the token out of the sandbox between sessions and
+# lets rotating it in 1Password propagate. Best-effort: a missing op or
+# locked vault warns but never blocks entry (the session simply has no OP
+# token).
+op_auto_inject() {
+    [[ -f "$QS_OP_MANIFEST" ]] || return 0
+    command -v op >/dev/null 2>&1 || {
+        warn "op (1Password CLI) not on host — can't load the token for '$SANDBOX_NAME'. Continuing without it."
+        return 0
+    }
+
+    local vault item sa
+    IFS=$'\t' read -r vault item sa < "$QS_OP_MANIFEST"
+    [[ -n "$vault" && -n "$item" ]] || return 0
+
+    local token
+    token="$(op read "op://$vault/$item/password" 2>/dev/null || true)"
+    if [[ -z "$token" ]]; then
+        warn "Could not read the 1Password token for '$SANDBOX_NAME' — unlock 1Password or re-run 'qs op-auth $SANDBOX_NAME'. Continuing without it."
+        return 0
+    fi
+
+    mkdir -p "$QS_PRIVATE_DIR"
+    local token_file="$QS_PRIVATE_DIR/op-token"
+    ( umask 077; printf '%s\n' "$token" > "$token_file" )
+    chmod 0600 "$token_file"
+}
+
+# Reverse what provision set up. 1Password has no CLI to delete/revoke a
+# service account (only the web UI), so we best-effort delete the stored token
+# item, then print a revoke reminder. The vault and its secrets are left intact.
+cleanup_op() {
+    [[ -f "$QS_OP_MANIFEST" ]] || return 0
+    local vault item sa
+    IFS=$'\t' read -r vault item sa < "$QS_OP_MANIFEST"
+
+    if command -v op >/dev/null 2>&1 && [[ -n "$item" && -n "$vault" ]]; then
+        op item delete "$item" --vault "$vault" >/dev/null 2>&1 \
+            && info "Removed the stored token item from vault '$vault'." || true
+    fi
+    if [[ -n "$sa" ]]; then
+        warn "Revoke the service account '$sa' in 1Password (no CLI to do it):"
+        warn "  https://my.1password.com → Developer → Service Accounts → $sa → Revoke Token"
+    fi
+    [[ -n "$vault" ]] && info "Left 1Password vault '$vault' and its secrets intact."
+
+    rm -f "$QS_OP_MANIFEST"
+}
+
+main() {
+    local verb="${1:-}"
+    [[ $# -gt 0 ]] && shift
+    case "$verb" in
+        provision) do_provision "$@" ;;
+        refresh)   op_auto_inject ;;
+        cleanup)   cleanup_op ;;
+        *) abort "usage: qs-auth-op {provision [--write] | refresh | cleanup} (invoked by qs)" ;;
+    esac
+}
+
+# Run only when executed, not when sourced (the test suite sources this
+# provider to call functions directly, the same way it tests qs).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

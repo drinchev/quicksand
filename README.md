@@ -396,7 +396,7 @@ same applies here.
 ## Development
 
 ```bash
-shellcheck qs profile.d/*.sh logout.d/*.sh    # lint
+shellcheck qs libexec/* profile.d/*.sh logout.d/*.sh    # lint
 bats tests                      # unit tests (no sudo required)
 ```
 

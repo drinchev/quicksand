@@ -17,7 +17,7 @@ jobs:
         run: brew install shellcheck bats-core
 
       - name: Lint
-        run: shellcheck qs profile.d/*.sh
+        run: shellcheck qs libexec/* profile.d/*.sh
 
       - name: Test
         run: bats tests

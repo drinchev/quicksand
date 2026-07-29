@@ -1,0 +1,168 @@
+#!/bin/bash
+# qs-auth-gh — GitHub credential provider for quicksand sandboxes.
+#
+# Owns the guided fine-grained PAT flow behind `qs gh-auth` (also offered
+# by `qs clone` after registering a deploy key) and the token files it
+# stages at $QS_PRIVATE_DIR/gh-token-<name>. Those files are the contract
+# with the rest of the system: profile.d/60-gh-auth.sh signs `gh` in from
+# them inside the sandbox, and `qs memory` checks them to see whether the
+# token can open PRs on the memory repo. The token is for the GitHub *API*
+# only — git transport stays on the per-repo deploy key, which `qs` owns
+# (clone manifest, deploy-key registration and cleanup all stay there).
+#
+# Invoked by qs (see run_auth_provider there), not run by hand:
+#
+#   qs-auth-gh provision OWNER REPO [TOKEN_NAME]
+#       Guided, interactive, skippable: open a prefilled PAT creation page,
+#       read the pasted token, validate it against OWNER/REPO, save it as
+#       gh-token-TOKEN_NAME (default: REPO). Silent no-op without a tty —
+#       a piped `qs clone` must not hang on the offer. qs resolves
+#       OWNER/REPO from the CLI arg or the clone manifest before
+#       dispatching; this provider never parses repo references.
+#   qs-auth-gh refresh
+#       No-op: fine-grained PATs are durable (~90d) and staged once —
+#       nothing to re-mint at launch time.
+#   qs-auth-gh cleanup
+#       Uninstall-time: fine-grained PATs cannot be revoked via API, so
+#       point at the tokens page for every token file still staged. The
+#       files themselves die with _quicksand/ right after.
+#
+# Environment contract (exported by qs for every qs-auth-* provider):
+#   QS_SANDBOX_NAME  sandbox name (the qs-NAME user)
+#   QS_PRIVATE_DIR   $SHARED_WORKSPACE/_quicksand — token files live here
+#   QS_INSTALL_DIR   ~/.config/quicksand — unused here (no host manifest:
+#                    the token files are the only state)
+#   QS_VERBOSE       verbosity (0-3)
+#
+# Runs straight from the repo checkout like qs itself; nothing here is
+# baked into sandboxes, so edits don't trigger rebuilds.
+set -Eeuo pipefail
+trap 'echo >&2 "${BASH_SOURCE[0]}: line $LINENO: $BASH_COMMAND: exitcode $?"' ERR
+
+QS_VERBOSE="${QS_VERBOSE:-0}"
+abort() { echo >&2 "ERROR: $*"; exit 1; }
+warn()  { echo >&2 "WARNING: $*"; }
+info()  { echo "$*"; }
+debug() { (( QS_VERBOSE >= 2 )) && echo "$*" || true; }
+
+SANDBOX_NAME="${QS_SANDBOX_NAME:?qs-auth-gh is invoked by qs, which sets QS_SANDBOX_NAME}"
+QS_PRIVATE_DIR="${QS_PRIVATE_DIR:?}"
+QS_INSTALL_DIR="${QS_INSTALL_DIR:?}"
+
+# Percent-encode a string for a URL query value: RFC 3986 unreserved chars
+# pass through, everything else becomes %XX. ASCII inputs only — all we build.
+url_encode() {
+    local s="$1" out="" i c
+    for (( i = 0; i < ${#s}; i++ )); do
+        c="${s:i:1}"
+        case "$c" in
+            [a-zA-Z0-9.~_-]) out+="$c" ;;
+            *) out+="$(printf '%%%02X' "'$c")" ;;
+        esac
+    done
+    printf '%s' "$out"
+}
+
+# Guide the user through creating a repository-scoped fine-grained PAT and
+# store it for the sandbox. Fine-grained PATs can't be minted or revoked via
+# API, so this is a guided manual flow: open a prefilled creation page, read
+# the pasted token, validate it against the repo, and save it where
+# profile.d/60-gh-auth.sh signs gh in on entry.
+gh_token_setup() {
+    local owner="$1" gh_repo="$2" repo_name="$3"
+    local owner_repo="$owner/$gh_repo"
+
+    if [[ ! -t 0 ]]; then
+        debug "Non-interactive; skipping gh token setup for $owner_repo"
+        return 0
+    fi
+
+    # Prefilled fine-grained PAT page. We can preset name, owner, expiry and
+    # permissions; GitHub can't preselect the specific repo (user picks it).
+    local name desc url
+    name="qs:$SANDBOX_NAME:$repo_name"
+    desc="quicksand sandbox token for $owner_repo"
+    url="https://github.com/settings/personal-access-tokens/new"
+    url+="?name=$(url_encode "$name")"
+    url+="&description=$(url_encode "$desc")"
+    url+="&target_name=$(url_encode "$owner")"
+    url+="&expires_in=90"
+    url+="&contents=read&pull_requests=write&actions=write&checks=read&statuses=read&actions_variables=read"
+
+    cat <<EOF
+
+Optional: set up a GitHub token so 'gh' works inside the sandbox for
+$owner_repo (open PRs + PR comments, read commits/branches, read and
+re-run CI, read Actions variables).
+Git push/pull already works via the deploy key — press Enter to skip.
+
+1. Open this page (name, owner, expiry and permissions are prefilled):
+
+     $url
+
+2. Under "Repository access" pick "Only select repositories" and choose
+   $owner_repo (GitHub can't preselect it via the link). If this sandbox
+   has (or will get) a shared memory repo ('qs memory'), select that
+   repository too so agents can open memory PRs with the same token.
+3. Check that "Resource owner" shows '$owner', then "Generate token".
+   (Org repos may need an owner to approve the token before it works.)
+4. Copy the token (starts with 'github_pat_') and paste it below.
+
+EOF
+
+    local token=""
+    read -rs -p "Paste token (hidden), or Enter to skip: " token
+    echo
+    [[ -n "$token" ]] || { info "Skipped gh setup for $owner_repo."; return 0; }
+
+    if command -v gh &>/dev/null; then
+        info "Validating token against $owner_repo..."
+        if ! GH_TOKEN="$token" gh api "repos/$owner_repo" >/dev/null 2>&1; then
+            warn "Token didn't validate for $owner_repo — it may be wrong, lack access, or await org approval. Not saved. Retry with: qs gh-auth $SANDBOX_NAME $owner_repo"
+            return 0
+        fi
+    else
+        warn "gh not on host — saving token without validation."
+    fi
+
+    mkdir -p "$QS_PRIVATE_DIR"
+    local token_file="$QS_PRIVATE_DIR/gh-token-$repo_name"
+    ( umask 077; printf '%s\n' "$token" > "$token_file" )
+    chmod 0600 "$token_file"
+    info "Token saved for $owner_repo — 'gh' signs in automatically inside the sandbox."
+}
+
+do_provision() {
+    (( $# >= 2 )) || abort "provision needs OWNER REPO [TOKEN_NAME]"
+    local owner="$1" gh_repo="$2" token_name="${3:-$2}"
+    gh_token_setup "$owner" "$gh_repo" "$token_name"
+}
+
+# Fine-grained PATs have no revoke API, so all cleanup can do is remind the
+# user about every token still staged. Best-effort; never fails.
+do_cleanup() {
+    local token_file name
+    for token_file in "$QS_PRIVATE_DIR"/gh-token-*; do
+        [[ -f "$token_file" ]] || continue
+        name="${token_file##*/gh-token-}"
+        warn "A fine-grained PAT was saved for '$name'; it can't be revoked via API. If you no longer need it, delete it at https://github.com/settings/tokens?type=beta"
+    done
+    return 0
+}
+
+main() {
+    local verb="${1:-}"
+    [[ $# -gt 0 ]] && shift
+    case "$verb" in
+        provision) do_provision "$@" ;;
+        refresh)   debug "gh tokens are durable; nothing to refresh" ;;
+        cleanup)   do_cleanup ;;
+        *) abort "usage: qs-auth-gh {provision OWNER REPO [TOKEN_NAME] | refresh | cleanup} (invoked by qs)" ;;
+    esac
+}
+
+# Run only when executed, not when sourced (the test suite sources this
+# provider to call functions directly, the same way it tests qs).
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi

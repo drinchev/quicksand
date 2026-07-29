@@ -465,10 +465,6 @@ cleanup_clone_artifacts() {
         [[ -n "$repo_name" ]] || continue
         [[ -z "$owner_repo" ]] \
             || delete_deploy_key "$owner_repo" "qs:$SANDBOX_NAME:$repo_name"
-        # Fine-grained PATs have no revoke API — point the user at the page.
-        if [[ -n "$owner_repo" && -f "${QS_PRIVATE_DIR:-}/gh-token-$repo_name" ]]; then
-            warn "A fine-grained PAT was used for $owner_repo; it can't be revoked via API. If you no longer need it, delete it at https://github.com/settings/tokens?type=beta"
-        fi
         if [[ -n "$local_repo" && -d "$local_repo" ]]; then
             # Only touch the remote if it still points into this sandbox.
             remote_url="$(git -C "$local_repo" remote get-url quicksand 2>/dev/null || true)"
@@ -558,20 +554,6 @@ record_clone() {
         || echo "$entry" >> "$manifest"
 }
 
-# Percent-encode a string for a URL query value: RFC 3986 unreserved chars
-# pass through, everything else becomes %XX. ASCII inputs only — all we build.
-url_encode() {
-    local s="$1" out="" i c
-    for (( i = 0; i < ${#s}; i++ )); do
-        c="${s:i:1}"
-        case "$c" in
-            [a-zA-Z0-9.~_-]) out+="$c" ;;
-            *) out+="$(printf '%%%02X' "'$c")" ;;
-        esac
-    done
-    printf '%s' "$out"
-}
-
 # Parse a GitHub repo reference — OWNER/REPO, an https:// URL, or a git@ SSH
 # URL — into PG_OWNER / PG_REPO / PG_NAME. Returns nonzero if unparseable.
 PG_OWNER="" PG_REPO="" PG_NAME=""
@@ -605,77 +587,6 @@ detect_single_github_clone() {
     parse_github_repo "$one_repo" || return 1
     PG_NAME="$one_name"   # prefer the recorded clone name for the token file
     return 0
-}
-
-# Guide the user through creating a repository-scoped fine-grained PAT and
-# store it for the sandbox. The token is for the GitHub *API* only (gh pr,
-# gh run, comments, branch/CI reads) — git transport stays on the deploy key,
-# so the token never needs write access to contents. Fine-grained PATs can't
-# be minted or revoked via API, so this is a guided manual flow: open a
-# prefilled creation page, read the pasted token, validate it against the
-# repo, and save it where profile.d/60-gh-auth.sh signs gh in on entry.
-gh_token_setup() {
-    local owner="$1" gh_repo="$2" repo_name="$3"
-    local owner_repo="$owner/$gh_repo"
-
-    if [[ ! -t 0 ]]; then
-        debug "Non-interactive; skipping gh token setup for $owner_repo"
-        return 0
-    fi
-
-    # Prefilled fine-grained PAT page. We can preset name, owner, expiry and
-    # permissions; GitHub can't preselect the specific repo (user picks it).
-    local name desc url
-    name="qs:$SANDBOX_NAME:$repo_name"
-    desc="quicksand sandbox token for $owner_repo"
-    url="https://github.com/settings/personal-access-tokens/new"
-    url+="?name=$(url_encode "$name")"
-    url+="&description=$(url_encode "$desc")"
-    url+="&target_name=$(url_encode "$owner")"
-    url+="&expires_in=90"
-    url+="&contents=read&pull_requests=write&actions=write&checks=read&statuses=read&actions_variables=read"
-
-    cat <<EOF
-
-Optional: set up a GitHub token so 'gh' works inside the sandbox for
-$owner_repo (open PRs + PR comments, read commits/branches, read and
-re-run CI, read Actions variables).
-Git push/pull already works via the deploy key — press Enter to skip.
-
-1. Open this page (name, owner, expiry and permissions are prefilled):
-
-     $url
-
-2. Under "Repository access" pick "Only select repositories" and choose
-   $owner_repo (GitHub can't preselect it via the link). If this sandbox
-   has (or will get) a shared memory repo ('qs memory'), select that
-   repository too so agents can open memory PRs with the same token.
-3. Check that "Resource owner" shows '$owner', then "Generate token".
-   (Org repos may need an owner to approve the token before it works.)
-4. Copy the token (starts with 'github_pat_') and paste it below.
-
-EOF
-
-    local token=""
-    read -rs -p "Paste token (hidden), or Enter to skip: " token
-    echo
-    [[ -n "$token" ]] || { info "Skipped gh setup for $owner_repo."; return 0; }
-
-    if command -v gh &>/dev/null; then
-        info "Validating token against $owner_repo..."
-        if ! GH_TOKEN="$token" gh api "repos/$owner_repo" >/dev/null 2>&1; then
-            warn "Token didn't validate for $owner_repo — it may be wrong, lack access, or await org approval. Not saved. Retry with: qs gh-auth $SANDBOX_NAME $owner_repo"
-            return 0
-        fi
-    else
-        warn "gh not on host — saving token without validation."
-    fi
-
-    mkdir -p "$QS_PRIVATE_DIR"
-    local token_file="$QS_PRIVATE_DIR/gh-token-$repo_name"
-    ( umask 077; printf '%s\n' "$token" > "$token_file" )
-    chmod 0600 "$token_file"
-    info "Token saved for $owner_repo — 'gh' signs in automatically inside the sandbox."
 }
 
 # Stage the sandbox's 1Password service-account token for this session by
@@ -803,7 +714,7 @@ do_clone() {
 
         # Offer a repo-scoped gh token (API only; transport stays on the key).
         [[ -n "${CLONE_SKIP_TOKEN_SETUP:-}" ]] \
-            || gh_token_setup "$owner" "$gh_repo" "$repo_name"
+            || run_auth_provider gh provision "$owner" "$gh_repo" "$repo_name"
     else
         debug "Non-GitHub URL; skipping deploy-key generation"
     fi
@@ -1168,9 +1079,11 @@ cmd_clone() {
     info "  qs claude $SANDBOX_NAME $CLONE_LINK"
 }
 
-# Set up (or refresh) the gh token for a repo in an existing sandbox. The
-# repo can be given as OWNER/REPO or a GitHub URL, or omitted when the
-# sandbox has exactly one recorded GitHub clone.
+# Set up (or refresh) the gh token for a repo in an existing sandbox — a
+# thin dispatcher into the gh auth provider (libexec/qs-auth-gh). The repo
+# can be given as OWNER/REPO or a GitHub URL, or omitted when the sandbox
+# has exactly one recorded GitHub clone; resolving that stays here (CLI
+# parsing and the clone manifest are qs's domain, the PAT flow is not).
 cmd_gh_auth() {
     (( ${#COMMAND_ARGS[@]} == 0 )) \
         || abort "qs gh-auth doesn't accept '--' args"
@@ -1180,7 +1093,7 @@ cmd_gh_auth() {
     elif ! detect_single_github_clone; then
         abort "Specify which repo: qs gh-auth $SANDBOX_NAME OWNER/REPO"
     fi
-    gh_token_setup "$PG_OWNER" "$PG_REPO" "$PG_NAME"
+    run_auth_provider gh provision "$PG_OWNER" "$PG_REPO" "$PG_NAME" || exit $?
 }
 
 # Provision (or refresh) the GCP service account for a sandbox — a thin

@@ -990,3 +990,17 @@ op_provision_stub() {
     grep -q -- "--vault qs-work:read_items,write_items" "$STUB_LOG"
     [ -f "$BATS_TEST_TMPDIR/op-work" ]
 }
+
+# Regression: in real runs derive_constants declares the qs globals
+# readonly, and bash rejects `VAR=x cmd` env-prefix assignments for
+# readonly names — the dispatch must build the child env via `env`.
+@test "run_auth_provider works when qs constants are readonly" {
+    make_stub op '[[ "$1" == "read" ]] && echo "tok-ro"; exit 0'
+    printf 'qs-work\tquicksand-service-account\tqs-work\n' > "$BATS_TEST_TMPDIR/op-work"
+    qs_run 'PATH="$STUBS:$PATH"; SANDBOX_NAME=work
+            readonly QS_PRIVATE_DIR="$BATS_TEST_TMPDIR/priv" INSTALL_DIR="$BATS_TEST_TMPDIR"
+            run_all_auth_providers refresh'
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"readonly variable"* ]]
+    [ "$(cat "$BATS_TEST_TMPDIR/priv/op-token")" == "tok-ro" ]
+}

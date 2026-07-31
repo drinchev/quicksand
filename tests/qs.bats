@@ -11,11 +11,14 @@ setup() {
     cp -R "$BATS_TEST_DIRNAME/../profile.d" "$REPO_COPY/profile.d"
     cp -R "$BATS_TEST_DIRNAME/../logout.d" "$REPO_COPY/logout.d"
     cp -R "$BATS_TEST_DIRNAME/../config" "$REPO_COPY/config"
+    cp -R "$BATS_TEST_DIRNAME/../libexec" "$REPO_COPY/libexec"
     QS="$REPO_COPY/qs"
     STUBS="$BATS_TEST_TMPDIR/stubs"
     STUB_LOG="$BATS_TEST_TMPDIR/stub.log"
     mkdir -p "$STUBS"
-    export QS STUBS STUB_LOG
+    # REPO_COPY is exported so provider-test helpers can exec/source
+    # "$REPO_COPY/libexec/qs-auth-*" from `run bash -c` subshells.
+    export QS REPO_COPY STUBS STUB_LOG
 }
 
 # make_stub NAME SCRIPT-BODY — create an executable stub on $STUBS.
@@ -293,6 +296,11 @@ qs_run() {
 @test "parse_args sets option flags" {
     qs_run 'parse_args -r -n -x shell foo; echo "$REBUILD $NO_BUILD $USE_SANDBOX"'
     [ "$output" == "true true false" ]
+}
+
+@test "parse_args sets OP_WRITE for --write" {
+    qs_run 'parse_args --write op-auth foo; echo "$OP_WRITE"'
+    [ "$output" == "true" ]
 }
 
 @test "parse_args prepends QUICKSAND_ARGS" {
@@ -829,4 +837,120 @@ gcloud_provision_stub() {
             SANDBOX_NAME=work; cmd_gcp_auth'
     [ "$status" -ne 0 ]
     [[ "$output" == *"Specify at least one project to grant access on"* ]]
+}
+
+
+###############################################################################
+# 1Password auth provider (libexec/qs-auth-op; op stubbed)
+###############################################################################
+
+# Execute the provider the way qs's run_auth_provider does: verb as argv,
+# context via QS_* env, stubs first on PATH. The sandbox name is fixed to
+# 'work' (never inherited — the suite may itself run inside a sandbox that
+# exports QS_SANDBOX_NAME); override the private dir per-test via OP_PRIV.
+op_exec() {
+    run env PATH="$STUBS:$PATH" \
+        QS_SANDBOX_NAME=work \
+        QS_PRIVATE_DIR="${OP_PRIV:-$BATS_TEST_TMPDIR/priv}" \
+        QS_INSTALL_DIR="$BATS_TEST_TMPDIR" \
+        "$REPO_COPY/libexec/qs-auth-op" "$@"
+}
+
+# An op stub covering the whole provisioning flow: signed in, vault absent
+# (so the create path runs), service account minted, item stored.
+op_provision_stub() {
+    make_stub op 'echo "op $*" >> "$STUB_LOG"
+        case "$1 $2" in
+            "vault get") exit 1 ;;                      # not yet present
+            "service-account create") echo "ops_fake-token" ;;
+        esac
+        exit 0'
+}
+
+@test "qs-auth-op rejects unknown verbs" {
+    op_exec frobnicate
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"usage: qs-auth-op"* ]]
+}
+
+@test "qs-auth-op provision creates vault + scoped SA and records the manifest" {
+    op_provision_stub
+    op_exec provision
+    [ "$status" -eq 0 ]
+    grep -q "vault create qs-work" "$STUB_LOG"
+    grep -q "service-account create qs-work --expires-in 90d --vault qs-work:read_items" "$STUB_LOG"
+    grep -q "item create --category Password --title quicksand-service-account --vault qs-work" "$STUB_LOG"
+    [ "$(cat "$BATS_TEST_TMPDIR/op-work")" == "$(printf 'qs-work\tquicksand-service-account\tqs-work')" ]
+    [[ "$output" == *"read-only; pass --write"* ]]
+}
+
+@test "qs-auth-op provision --write grants write_items and drops the hint" {
+    op_provision_stub
+    op_exec provision --write
+    [ "$status" -eq 0 ]
+    grep -q -- "--vault qs-work:read_items,write_items" "$STUB_LOG"
+    [[ "$output" != *"read-only; pass --write"* ]]
+}
+
+@test "qs-auth-op provision reuses an existing vault" {
+    make_stub op 'echo "op $*" >> "$STUB_LOG"
+        case "$1 $2" in
+            "service-account create") echo "ops_fake-token" ;;
+        esac
+        exit 0'                                          # vault get succeeds
+    op_exec provision
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"already exists"* ]]
+    ! grep -q "vault create" "$STUB_LOG"
+}
+
+@test "qs-auth-op refresh stages the token 0600 from the vault" {
+    make_stub op 'echo "op $*" >> "$STUB_LOG"
+        [[ "$1" == "read" ]] && echo "ops_staged-token"
+        exit 0'
+    printf 'qs-work\tquicksand-service-account\tqs-work\n' > "$BATS_TEST_TMPDIR/op-work"
+    op_exec refresh
+    [ "$status" -eq 0 ]
+    grep -q "read op://qs-work/quicksand-service-account/password" "$STUB_LOG"
+    [ "$(cat "$BATS_TEST_TMPDIR/priv/op-token")" == "ops_staged-token" ]
+    [ "$(/usr/bin/stat -f %Lp "$BATS_TEST_TMPDIR/priv/op-token")" == "600" ]
+}
+
+@test "qs-auth-op refresh is a no-op for a sandbox without op" {
+    make_stub op 'echo "op $*" >> "$STUB_LOG"; exit 0'
+    op_exec refresh
+    [ "$status" -eq 0 ]
+    [ ! -f "$STUB_LOG" ]
+    [ ! -e "$BATS_TEST_TMPDIR/priv/op-token" ]
+}
+
+@test "qs-auth-op refresh warns but succeeds when the vault is unreadable" {
+    make_stub op 'exit 1'                               # locked / no access
+    printf 'qs-work\tquicksand-service-account\tqs-work\n' > "$BATS_TEST_TMPDIR/op-work"
+    op_exec refresh
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Could not read the 1Password token"* ]]
+    [ ! -e "$BATS_TEST_TMPDIR/priv/op-token" ]
+}
+
+@test "qs-auth-op cleanup deletes the token item and reminds about the SA" {
+    make_stub op 'echo "op $*" >> "$STUB_LOG"; exit 0'
+    printf 'qs-work\tquicksand-service-account\tqs-work\n' > "$BATS_TEST_TMPDIR/op-work"
+    op_exec cleanup
+    [ "$status" -eq 0 ]
+    grep -q "item delete quicksand-service-account --vault qs-work" "$STUB_LOG"
+    [[ "$output" == *"Revoke the service account 'qs-work'"* ]]
+    [[ "$output" == *"vault 'qs-work' and its secrets intact"* ]]
+    [ ! -f "$BATS_TEST_TMPDIR/op-work" ]
+}
+
+@test "cmd_op_auth dispatches --write through the provider" {
+    op_provision_stub
+    qs_run 'PATH="$STUBS:$PATH"; COMMAND_ARGS=(); OP_WRITE=true
+            SANDBOX_NAME=work
+            QS_PRIVATE_DIR="$BATS_TEST_TMPDIR/priv" INSTALL_DIR="$BATS_TEST_TMPDIR"
+            cmd_op_auth'
+    [ "$status" -eq 0 ]
+    grep -q -- "--vault qs-work:read_items,write_items" "$STUB_LOG"
+    [ -f "$BATS_TEST_TMPDIR/op-work" ]
 }

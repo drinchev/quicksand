@@ -383,6 +383,7 @@ qs_run() {
             QS_REPOS_DIR="$BATS_TEST_TMPDIR/ws/repos"
             QS_SSH_DIR="$BATS_TEST_TMPDIR/ws/.ssh"
             INSTALL_DIR="$BATS_TEST_TMPDIR" QS_CLONES_MANIFEST="$MANIFEST"
+            QS_PRIVATE_DIR="$BATS_TEST_TMPDIR/ws/_quicksand"
             do_clone'
     [ "$status" -eq 0 ]
     grep -q "git clone git@github.com:me/proj.git" "$STUB_LOG"
@@ -409,6 +410,7 @@ qs_run() {
             QS_SSH_DIR="$BATS_TEST_TMPDIR/ws/.ssh"
             INSTALL_DIR="$BATS_TEST_TMPDIR"
             QS_CLONES_MANIFEST="$BATS_TEST_TMPDIR/manifest"
+            QS_PRIVATE_DIR="$BATS_TEST_TMPDIR/ws/_quicksand"
             CLONE_DEST_OVERRIDE="$BATS_TEST_TMPDIR/ws/memory"
             CLONE_KEY_NAME=memory
             do_clone'
@@ -516,6 +518,7 @@ qs_run() {
             QS_SSH_DIR="$BATS_TEST_TMPDIR/ws dir/.ssh"
             INSTALL_DIR="$BATS_TEST_TMPDIR"
             QS_CLONES_MANIFEST="$BATS_TEST_TMPDIR/manifest"
+            QS_PRIVATE_DIR="$BATS_TEST_TMPDIR/ws dir/_quicksand"
             do_clone'
     [ "$status" -eq 0 ]
     local esc
@@ -525,7 +528,7 @@ qs_run() {
 
 
 ###############################################################################
-# gh token integration
+# gh auth provider (libexec/qs-auth-gh) and repo-ref parsing
 ###############################################################################
 
 @test "parse_args resolves gh-auth and its optional repo arg" {
@@ -560,9 +563,34 @@ qs_run() {
     [ "$status" -ne 0 ]
 }
 
+# Run a bash snippet with the gh provider sourced under the standard env
+# contract (its main is guarded against sourcing, mirroring qs itself).
+gh_run() {
+    run bash -c "export QS_SANDBOX_NAME=demo \
+            QS_PRIVATE_DIR=\"\$BATS_TEST_TMPDIR/priv\"
+        source \"\$REPO_COPY/libexec/qs-auth-gh\"; $1"
+}
+
+# Execute the provider the way qs's run_auth_provider does: verb as argv,
+# context via QS_* env, stubs first on PATH. The sandbox name is fixed to
+# 'demo' (never inherited — the suite may itself run inside a sandbox that
+# exports QS_SANDBOX_NAME); override the private dir per-test via GH_PRIV.
+gh_exec() {
+    run env PATH="$STUBS:$PATH" \
+        QS_SANDBOX_NAME=demo \
+        QS_PRIVATE_DIR="${GH_PRIV:-$BATS_TEST_TMPDIR/priv}" \
+        "$REPO_COPY/libexec/qs-auth-gh" "$@"
+}
+
 @test "url_encode percent-encodes reserved characters" {
-    qs_run 'url_encode "qs:demo:my repo"'
+    gh_run 'url_encode "qs:demo:my repo"'
     [[ "$output" == "qs%3Ademo%3Amy%20repo" ]]
+}
+
+@test "qs-auth-gh rejects unknown verbs" {
+    gh_exec frobnicate
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"usage: qs-auth-gh"* ]]
 }
 
 @test "detect_single_github_clone picks the lone GitHub clone" {
@@ -588,12 +616,16 @@ qs_run() {
     [ "$status" -ne 0 ]
 }
 
-@test "gh_token_setup is a no-op on non-interactive stdin" {
-    qs_run 'QS_PRIVATE_DIR="$BATS_TEST_TMPDIR/priv" SANDBOX_NAME=demo
-            gh_token_setup owner repo repo < /dev/null
-            ls "$BATS_TEST_TMPDIR/priv" 2>/dev/null || echo no-file'
+@test "qs-auth-gh provision is a no-op on non-interactive stdin" {
+    gh_exec provision owner repo
     [ "$status" -eq 0 ]
-    [[ "$output" == *"no-file"* ]]
+    [ ! -e "$BATS_TEST_TMPDIR/priv/gh-token-repo" ]
+}
+
+@test "qs-auth-gh provision requires OWNER and REPO" {
+    gh_exec provision owner
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"provision needs OWNER REPO"* ]]
 }
 
 @test "cmd_gh_auth requires a repo when none can be detected" {
@@ -604,16 +636,20 @@ qs_run() {
     [[ "$output" == *"Specify which repo"* ]]
 }
 
-@test "cleanup reminds about a saved gh token that can't be API-revoked" {
-    make_stub gh 'exit 0'
+@test "cmd_gh_auth dispatches the detected repo to the gh provider" {
     export MANIFEST="$BATS_TEST_TMPDIR/manifest"
-    export PRIV="$BATS_TEST_TMPDIR/priv"
-    mkdir -p "$PRIV"; touch "$PRIV/gh-token-repo"
-    printf 'repo\towner/repo\t\n' > "$MANIFEST"
-    qs_run 'PATH="$STUBS:$PATH"; SANDBOX_NAME=demo
-            QS_CLONES_MANIFEST="$MANIFEST" QS_PRIVATE_DIR="$PRIV"
-            QS_REPOS_DIR=/nonexistent/repos
-            cleanup_clone_artifacts'
+    printf 'proj\tme/proj\t\n' > "$MANIFEST"
+    qs_run 'COMMAND_ARGS=(); GH_AUTH_REPO=""; SANDBOX_NAME=demo
+            QS_CLONES_MANIFEST="$MANIFEST"
+            QS_PRIVATE_DIR="$BATS_TEST_TMPDIR/priv" INSTALL_DIR="$BATS_TEST_TMPDIR"
+            cmd_gh_auth'
+    [ "$status" -eq 0 ]
+}
+
+@test "qs-auth-gh cleanup reminds about saved tokens that can't be API-revoked" {
+    mkdir -p "$BATS_TEST_TMPDIR/priv"
+    touch "$BATS_TEST_TMPDIR/priv/gh-token-repo"
+    gh_exec cleanup
     [ "$status" -eq 0 ]
     [[ "$output" == *"can't be revoked via API"* ]]
 }

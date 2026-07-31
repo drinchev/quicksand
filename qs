@@ -508,10 +508,14 @@ run_auth_provider() {
     local provider="$1"; shift
     local script="$QS_LIBEXEC_DIR/qs-auth-$provider"
     [[ -x "$script" ]] || abort "auth provider missing or not executable: $script"
-    QS_SANDBOX_NAME="$SANDBOX_NAME" \
-    QS_PRIVATE_DIR="$QS_PRIVATE_DIR" \
-    QS_INSTALL_DIR="$INSTALL_DIR" \
-    QS_VERBOSE="$QS_VERBOSE" \
+    # Via `env`, not shell env-prefix assignments: QS_PRIVATE_DIR is a
+    # readonly global (derive_constants), and bash rejects `VAR=x cmd`
+    # for readonly names even though it only targets the child's
+    # environment.
+    env QS_SANDBOX_NAME="$SANDBOX_NAME" \
+        QS_PRIVATE_DIR="$QS_PRIVATE_DIR" \
+        QS_INSTALL_DIR="$INSTALL_DIR" \
+        QS_VERBOSE="$QS_VERBOSE" \
         "$script" "$@"
 }
 

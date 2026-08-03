@@ -154,6 +154,8 @@ delete the deploy key from GitHub and remove the `quicksand` remote again.
 
 ## GitHub API access (`gh`)
 
+<!-- The authoritative permission list is the PAT URL in
+     libexec/qs-auth-gh — keep this section in sync with it. -->
 The deploy key handles git transport, but not the GitHub *API* — opening PRs,
 writing PR comments, reading commits, branches and CI runs. For that the
 sandbox needs a token, and `qs gh-auth` sets one up scoped to a single repo
@@ -360,9 +362,62 @@ matching quicksand's "files, not egress" model.
 
 The install marker stores a fingerprint of everything a build bakes into a
 sandbox: the qs version, the `sandbox-exec` profile template, `profile.d/`,
-`logout.d/`, and your personal overlay — contents, names, and file modes. When any of it
+`logout.d/`, `config/quicksand.md`, the docker broker assets, and your
+personal overlay — contents, names, and file modes. When any of it
 changes (a `git pull` of this repo, an edit to your overlay), the next
 `qs shell`/`qs claude` rebuilds the sandbox automatically and tells you why.
+
+## Architecture: the `qs` core and `libexec/` providers
+
+```
+qs                  # the CLI: parsing, derived constants, build, launch,
+                    # uninstall, dispatch — the security-critical core
+libexec/
+  qs-auth-gcp       # GCP:       provision | mint | refresh | cleanup
+  qs-auth-gh        # GitHub:    provision | refresh | cleanup
+  qs-auth-op        # 1Password: provision [--write] | refresh | cleanup
+profile.d/          # in-sandbox session hooks; 00-lib.sh holds shared
+                    # helpers (sourced by hooks, deliberately not executable)
+logout.d/           # in-sandbox exit hooks
+config/             # sandbox.sb template, quicksand.md, docker broker+client
+tests/qs.bats       # the whole suite; CI = shellcheck + bats
+```
+
+Credential integrations live behind a uniform **auth provider contract**:
+each `libexec/qs-auth-NAME` is a standalone script owning one credential
+domain end-to-end — interactive provisioning, launch-time refresh,
+uninstall cleanup, and its own token/manifest file layout.
+
+| verb | called by | contract |
+|---|---|---|
+| `provision …` | its thin `cmd_*` wrapper in `qs` | interactive setup; may fail loudly |
+| `refresh` | every launch, via `run_all_auth_providers` | self-gate on own state (unprovisioned → silent no-op); never fail |
+| `cleanup` | `qs uninstall`, via the same loop | reverse what provision did; best-effort, never fail |
+
+Context arrives via a small env contract — `QS_SANDBOX_NAME`,
+`QS_PRIVATE_DIR` (the workspace's `_quicksand/`, where tokens are staged),
+`QS_INSTALL_DIR` (`~/.config/quicksand`, where manifests live) and
+`QS_VERBOSE` — passed with `env`, not shell env-prefix assignments (the
+qs globals are readonly, and bash rejects `VAR=x cmd` for readonly names).
+Providers run straight from the repo checkout like `qs` itself; nothing in
+`libexec/` is staged into sandboxes, so provider edits don't trigger
+rebuilds.
+
+Each host-side provider pairs with an in-sandbox consumer in `profile.d/`
+(e.g. `qs-auth-gcp` stages `_quicksand/gcp-token`; `61-gcp-auth.sh` points
+`gcloud` at it) — one file per side of the sandbox boundary.
+
+### Adding a provider
+
+1. `libexec/qs-auth-NAME` implementing the verbs above (copy an existing
+   provider's skeleton; keep `refresh`/`cleanup` self-gating and
+   best-effort).
+2. A `profile.d/` consumer for whatever it stages into `_quicksand/`.
+3. A `cmd_*` wrapper and `parse_args` case in `qs` only if it needs a
+   user-facing command — launch and uninstall pick new providers up
+   automatically via the loops, with no core edits.
+4. Tests: source the provider for unit tests, exec it for CLI-level
+   tests (see the `gcp_run`/`gcp_exec` helpers in `tests/qs.bats`).
 
 ## What gets provisioned
 
@@ -462,12 +517,26 @@ same applies here.
 ## Development
 
 ```bash
-shellcheck qs profile.d/*.sh logout.d/*.sh    # lint
-bats tests                      # unit tests (no sudo required)
+shellcheck qs libexec/* profile.d/*.sh logout.d/*.sh \
+    config/qs-docker-broker config/qs-docker           # lint
+bats tests                                             # unit tests (no sudo)
 ```
 
 CI runs both on every push (macOS runner — the tests stub the privileged
-parts but need BSD userland).
+parts but need BSD userland). Things that bite:
+
+- **Match CI's shellcheck version.** CI installs the latest brew
+  shellcheck; older local versions report findings newer ones dropped
+  (0.10 flags `A && B || true` as SC2015, 0.11 doesn't). Verify with
+  CI's version before trusting a local verdict.
+- **Running the suite inside a quicksand sandbox** needs the session's
+  own variables stripped —
+  `env -u QS_SESSION_ID -u QS_SANDBOX_NAME -u QS_SESSION_KIND bats tests`
+  — because sourcing `qs` refuses inside a sandbox and test helpers must
+  never inherit `QS_*` defaults from the session.
+- **Mirror `readonly` in tests.** `derive_constants` declares the qs
+  globals readonly; tests that set them as plain variables miss a whole
+  failure class (see the `run_auth_provider … readonly` regression test).
 
 ## License
 

@@ -6,6 +6,8 @@
 # system Python is too old (3.9), so we use the Python 3.12 installed
 # by 47-install-python.sh and pin CLOUDSDK_PYTHON in ~/.zshrc.
 set -Eeuo pipefail
+# shellcheck source=/dev/null
+. "${SHARED_WORKSPACE:?}/_quicksand/profile.d/00-lib.sh"
 
 UV="$HOME/.local/bin/uv"
 [[ -x "$UV" ]] || UV="$(command -v uv 2>/dev/null || true)"
@@ -29,11 +31,7 @@ if [[ -x "$HOME/google-cloud-sdk/bin/gcloud" ]]; then
     rm -rf "$HOME/google-cloud-sdk"
 fi
 
-case "$(uname -m)" in
-    arm64)  PKG="google-cloud-cli-darwin-arm.tar.gz" ;;
-    x86_64) PKG="google-cloud-cli-darwin-x86_64.tar.gz" ;;
-    *)      echo "Unsupported arch for gcloud install: $(uname -m)" >&2; exit 1 ;;
-esac
+PKG="google-cloud-cli-darwin-$(qs_arch arm x86_64).tar.gz"
 
 echo "Installing Google Cloud SDK into sandbox (Python: $PYTHON312)..." >&2
 cd "$HOME"

@@ -13,21 +13,11 @@
 # the first run downloads large GGUF models, and BM25 `qmd search` works
 # without them; agents can run `qmd embed` themselves for semantic `qmd query`.
 set -Eeuo pipefail
+# shellcheck source=/dev/null
+. "${SHARED_WORKSPACE:?}/_quicksand/profile.d/00-lib.sh"
 
 QMD="$HOME/.local/bin/qmd"
 [[ -x "$QMD" ]] || exit 0
-
-# Tolerate re-runs after a partial failure: a collection that already exists
-# is success, anything else is a real error (reported, retried next session).
-ensure_collection() {
-    local out
-    if out="$("$QMD" collection add "$@" 2>&1)"; then
-        return 0
-    fi
-    grep -qi "exist" <<< "$out" && return 0
-    echo "$out" >&2
-    return 1
-}
 
 # Versioned sentinel: bump SETUP_VERSION when this block changes so existing
 # sandboxes re-run it once (every step below tolerates re-runs).

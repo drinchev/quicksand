@@ -8,6 +8,8 @@
 #
 # Idempotent: no-op if op is already present.
 set -Eeuo pipefail
+# shellcheck source=/dev/null
+. "${SHARED_WORKSPACE:?}/_quicksand/profile.d/00-lib.sh"
 
 command -v op >/dev/null 2>&1 && exit 0
 [[ -x "$HOME/.local/bin/op" ]] && exit 0
@@ -16,11 +18,7 @@ command -v op >/dev/null 2>&1 && exit 0
 # "latest" redirect like GitHub, so the version is pinned here — bump to upgrade.
 VER="2.33.1"
 
-case "$(uname -m)" in
-    arm64)  ARCH=arm64 ;;
-    x86_64) ARCH=amd64 ;;
-    *) echo "Unsupported arch for op install: $(uname -m)" >&2; exit 1 ;;
-esac
+ARCH="$(qs_arch arm64 amd64)"
 
 echo "Installing 1Password CLI $VER into sandbox..." >&2
 tmp="$(mktemp -d)"

@@ -11,20 +11,10 @@
 #
 # Idempotent: no-op once the wrapper is in place.
 set -Eeuo pipefail
+# shellcheck source=/dev/null
+. "${SHARED_WORKSPACE:?}/_quicksand/profile.d/00-lib.sh"
 
 [[ -x "$HOME/.local/bin/qmd" ]] && exit 0
-
-# Same locator as 46-install-pnpm.sh: pnpm >= 10 installs the CLI at
-# $PNPM_HOME/bin/pnpm; older standalone installers used $PNPM_HOME/pnpm.
-find_pnpm() {
-    command -v pnpm 2>/dev/null && return 0
-    local p
-    for p in "$HOME/Library/pnpm/bin/pnpm" "$HOME/Library/pnpm/pnpm" \
-             "$HOME/.local/share/pnpm/pnpm" "$HOME/.pnpm/pnpm"; do
-        [[ -x "$p" ]] && { echo "$p"; return 0; }
-    done
-    return 1
-}
 
 PNPM="$(find_pnpm || true)"
 if [[ -z "$PNPM" ]]; then

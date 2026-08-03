@@ -1337,3 +1337,61 @@ broker() {
     grep -q "docker rm -f c1 c2" "$STUB_LOG"
     grep -q "docker rmi -f i1" "$STUB_LOG"
 }
+
+
+###############################################################################
+# profile.d/00-lib.sh (shared hook helpers, sourced not executed)
+###############################################################################
+
+# Run a bash snippet with the hook lib sourced.
+lib_run() {
+    run bash -c ". \"\$REPO_COPY/profile.d/00-lib.sh\"; $1"
+}
+
+@test "00-lib.sh is not executable so the session hook loop skips it" {
+    [ -f "$REPO_COPY/profile.d/00-lib.sh" ]
+    [ ! -x "$REPO_COPY/profile.d/00-lib.sh" ]
+}
+
+@test "qs_arch maps arm64 and x86_64 to the caller's names" {
+    make_stub uname 'echo arm64'
+    lib_run 'PATH="$STUBS:$PATH"; qs_arch graviton intel'
+    [ "$status" -eq 0 ]
+    [ "$output" == "graviton" ]
+    make_stub uname 'echo x86_64'
+    lib_run 'PATH="$STUBS:$PATH"; qs_arch graviton intel'
+    [ "$output" == "intel" ]
+}
+
+@test "qs_arch fails on an unknown machine" {
+    make_stub uname 'echo mips'
+    lib_run 'PATH="$STUBS:$PATH"; qs_arch a b'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Unsupported arch"* ]]
+}
+
+@test "find_pnpm prefers PATH, falls back to install dirs, else fails" {
+    lib_run 'PATH=/usr/bin:/bin HOME="$BATS_TEST_TMPDIR"; find_pnpm'
+    [ "$status" -ne 0 ]
+    mkdir -p "$BATS_TEST_TMPDIR/Library/pnpm/bin"
+    printf '#!/bin/bash\n' > "$BATS_TEST_TMPDIR/Library/pnpm/bin/pnpm"
+    chmod +x "$BATS_TEST_TMPDIR/Library/pnpm/bin/pnpm"
+    lib_run 'PATH=/usr/bin:/bin HOME="$BATS_TEST_TMPDIR"; find_pnpm'
+    [ "$status" -eq 0 ]
+    [ "$output" == "$BATS_TEST_TMPDIR/Library/pnpm/bin/pnpm" ]
+}
+
+@test "ensure_collection tolerates already-exists and propagates real errors" {
+    make_stub qmd 'case "$*" in
+        *dup*)  echo "collection already exists"; exit 1 ;;
+        *bad*)  echo "boom"; exit 1 ;;
+        *)      exit 0 ;;
+    esac'
+    lib_run 'QMD="$STUBS/qmd"; ensure_collection /x --name fresh'
+    [ "$status" -eq 0 ]
+    lib_run 'QMD="$STUBS/qmd"; ensure_collection /x --name dup'
+    [ "$status" -eq 0 ]
+    lib_run 'QMD="$STUBS/qmd"; ensure_collection /x --name bad'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"boom"* ]]
+}

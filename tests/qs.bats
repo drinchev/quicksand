@@ -656,8 +656,29 @@ gh_exec() {
 
 
 ###############################################################################
-# GCP service-account integration (gcloud stubbed)
+# GCP auth provider (libexec/qs-auth-gcp; gcloud stubbed)
 ###############################################################################
+
+# Run a bash snippet with the gcp provider sourced under the standard env
+# contract (its main is guarded against sourcing, mirroring qs itself).
+gcp_run() {
+    run bash -c "export QS_SANDBOX_NAME=work \
+            QS_PRIVATE_DIR=\"\$BATS_TEST_TMPDIR/priv\" \
+            QS_INSTALL_DIR=\"\$BATS_TEST_TMPDIR\"
+        source \"\$REPO_COPY/libexec/qs-auth-gcp\"; $1"
+}
+
+# Execute the provider the way qs's run_auth_provider does: verb as argv,
+# context via QS_* env, stubs first on PATH. The sandbox name is fixed to
+# 'work' (never inherited — the suite may itself run inside a sandbox that
+# exports QS_SANDBOX_NAME); override the private dir per-test via GCP_PRIV.
+gcp_exec() {
+    run env PATH="$STUBS:$PATH" \
+        QS_SANDBOX_NAME=work \
+        QS_PRIVATE_DIR="${GCP_PRIV:-$BATS_TEST_TMPDIR/priv}" \
+        QS_INSTALL_DIR="$BATS_TEST_TMPDIR" \
+        "$REPO_COPY/libexec/qs-auth-gcp" "$@"
+}
 
 @test "parse_args resolves gcp-auth and its target project arg" {
     qs_run 'parse_args gcp-auth work metadata-dev-4d18
@@ -686,14 +707,20 @@ gh_exec() {
     [[ "$output" == "gcp-token" ]]
 }
 
+@test "qs-auth-gcp rejects unknown verbs" {
+    gcp_exec frobnicate
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"usage: qs-auth-gcp"* ]]
+}
+
 @test "gcp_sa_id_from_name lowercases and maps underscores" {
-    qs_run 'gcp_sa_id_from_name "My_Work"; echo "$GCP_SA_ID"'
+    gcp_run 'gcp_sa_id_from_name "My_Work"; echo "$GCP_SA_ID"'
     [ "$status" -eq 0 ]
     [ "$output" == "qs-my-work" ]
 }
 
 @test "gcp_sa_id_from_name rejects names too short to be valid" {
-    qs_run 'gcp_sa_id_from_name "ab"'
+    gcp_run 'gcp_sa_id_from_name "ab"'
     [ "$status" -ne 0 ]
     [[ "$output" == *"valid GCP service-account id"* ]]
 }
@@ -716,8 +743,7 @@ gcloud_provision_stub() {
     gcloud_provision_stub
     export PRIV="$BATS_TEST_TMPDIR/priv"
     export MANIFEST="$BATS_TEST_TMPDIR/gcp-manifest"
-    qs_run 'PATH="$STUBS:$PATH"
-            INSTALL_DIR="$BATS_TEST_TMPDIR"
+    gcp_run 'PATH="$STUBS:$PATH"
             QS_GCP_MANIFEST="$MANIFEST"
             QS_PRIVATE_DIR="$PRIV"
             gcp_sa_setup ivan-drinchev work metadata-dev-4d18'
@@ -736,8 +762,7 @@ gcloud_provision_stub() {
     gcloud_provision_stub
     export PRIV="$BATS_TEST_TMPDIR/priv"
     export MANIFEST="$BATS_TEST_TMPDIR/gcp-manifest"
-    qs_run 'PATH="$STUBS:$PATH"
-            INSTALL_DIR="$BATS_TEST_TMPDIR"
+    gcp_run 'PATH="$STUBS:$PATH"
             QS_GCP_MANIFEST="$MANIFEST"
             QS_PRIVATE_DIR="$PRIV"
             gcp_sa_setup ivan-drinchev work metadata-dev-4d18 shared-packages-fad1'
@@ -755,8 +780,7 @@ gcloud_provision_stub() {
     gcloud_provision_stub
     export PRIV="$BATS_TEST_TMPDIR/priv"
     export MANIFEST="$BATS_TEST_TMPDIR/gcp-manifest"
-    qs_run 'PATH="$STUBS:$PATH"
-            INSTALL_DIR="$BATS_TEST_TMPDIR"
+    gcp_run 'PATH="$STUBS:$PATH"
             QS_GCP_MANIFEST="$MANIFEST" QS_PRIVATE_DIR="$PRIV"
             QS_GCP_ROLES="roles/storage.admin"
             gcp_sa_setup owner work target'
@@ -776,8 +800,7 @@ gcloud_provision_stub() {
         esac
         exit 0'
     export PRIV="$BATS_TEST_TMPDIR/priv"
-    qs_run 'PATH="$STUBS:$PATH"
-            INSTALL_DIR="$BATS_TEST_TMPDIR"
+    gcp_run 'PATH="$STUBS:$PATH"
             QS_GCP_MANIFEST="$BATS_TEST_TMPDIR/gcp-manifest" QS_PRIVATE_DIR="$PRIV"
             gcp_sa_setup owner work target'
     [ "$status" -eq 0 ]
@@ -790,56 +813,63 @@ gcloud_provision_stub() {
         [[ "$1 $2" == "auth print-access-token" ]] && echo "ya29.minted"
         exit 0'
     export PRIV="$BATS_TEST_TMPDIR/priv"
-    qs_run 'PATH="$STUBS:$PATH"; SANDBOX_NAME=work; QS_PRIVATE_DIR="$PRIV"
+    gcp_run 'PATH="$STUBS:$PATH"; QS_PRIVATE_DIR="$PRIV"
             gcp_mint_token qs-work@owner.iam.gserviceaccount.com'
     [ "$status" -eq 0 ]
     [ "$(cat "$PRIV/gcp-token")" == "ya29.minted" ]
     grep -q "print-access-token --impersonate-service-account=qs-work@owner.iam.gserviceaccount.com" "$STUB_LOG"
 }
 
-@test "cmd_gcp_token requires a provisioned service account" {
+@test "qs-auth-gcp mint requires a provisioned service account" {
     make_stub gcloud 'exit 0'
-    qs_run 'PATH="$STUBS:$PATH"; COMMAND_ARGS=(); SANDBOX_NAME=work
-            QS_PRIVATE_DIR="$BATS_TEST_TMPDIR/empty"; cmd_gcp_token'
+    GCP_PRIV="$BATS_TEST_TMPDIR/empty" gcp_exec mint
     [ "$status" -ne 0 ]
     [[ "$output" == *"No GCP service account recorded"* ]]
 }
 
-@test "gcp_auto_refresh is a no-op for a sandbox without GCP" {
+@test "cmd_gcp_token dispatches through the provider with the env contract" {
+    make_stub gcloud '[[ "$1 $2" == "auth print-access-token" ]] && echo "ya29.dispatched"; exit 0'
+    export PRIV="$BATS_TEST_TMPDIR/priv"; mkdir -p "$PRIV"
+    printf 'qs-work@owner.iam.gserviceaccount.com\n' > "$PRIV/gcp-sa"
+    qs_run 'PATH="$STUBS:$PATH"; COMMAND_ARGS=(); SANDBOX_NAME=work
+            QS_PRIVATE_DIR="$PRIV" INSTALL_DIR="$BATS_TEST_TMPDIR"
+            cmd_gcp_token'
+    [ "$status" -eq 0 ]
+    [ "$(cat "$PRIV/gcp-token")" == "ya29.dispatched" ]
+}
+
+@test "qs-auth-gcp refresh is a no-op for a sandbox without GCP" {
     make_stub gcloud 'echo "gcloud $*" >> "$STUB_LOG"; exit 0'
-    qs_run 'PATH="$STUBS:$PATH"; QS_PRIVATE_DIR="$BATS_TEST_TMPDIR/empty"
-            gcp_auto_refresh'
+    GCP_PRIV="$BATS_TEST_TMPDIR/empty" gcp_exec refresh
     [ "$status" -eq 0 ]
     [ ! -f "$STUB_LOG" ] || ! grep -q "print-access-token" "$STUB_LOG"
 }
 
-@test "gcp_auto_refresh mints when the token is missing" {
+@test "qs-auth-gcp refresh mints when the token is missing" {
     make_stub gcloud 'echo "gcloud $*" >> "$STUB_LOG"
         [[ "$1 $2" == "auth print-access-token" ]] && echo "ya29.fresh"
         exit 0'
     export PRIV="$BATS_TEST_TMPDIR/priv"; mkdir -p "$PRIV"
     printf 'qs-work@owner.iam.gserviceaccount.com\n' > "$PRIV/gcp-sa"
-    qs_run 'PATH="$STUBS:$PATH"; SANDBOX_NAME=work; QS_PRIVATE_DIR="$PRIV"
-            gcp_auto_refresh'
+    gcp_exec refresh
     [ "$status" -eq 0 ]
     [ "$(cat "$PRIV/gcp-token")" == "ya29.fresh" ]
 }
 
-@test "gcp_auto_refresh skips when the token is still fresh" {
+@test "qs-auth-gcp refresh skips when the token is still fresh" {
     make_stub gcloud 'echo "gcloud $*" >> "$STUB_LOG"
         [[ "$1 $2" == "auth print-access-token" ]] && echo "ya29.new"
         exit 0'
     export PRIV="$BATS_TEST_TMPDIR/priv"; mkdir -p "$PRIV"
     printf 'qs-work@owner.iam.gserviceaccount.com\n' > "$PRIV/gcp-sa"
     printf 'ya29.existing\n' > "$PRIV/gcp-token"   # just written → young
-    qs_run 'PATH="$STUBS:$PATH"; SANDBOX_NAME=work; QS_PRIVATE_DIR="$PRIV"
-            gcp_auto_refresh'
+    gcp_exec refresh
     [ "$status" -eq 0 ]
     [ "$(cat "$PRIV/gcp-token")" == "ya29.existing" ]
     [ ! -f "$STUB_LOG" ] || ! grep -q "print-access-token" "$STUB_LOG"
 }
 
-@test "gcp_auto_refresh re-mints when the token is stale" {
+@test "qs-auth-gcp refresh re-mints when the token is stale" {
     make_stub gcloud 'echo "gcloud $*" >> "$STUB_LOG"
         [[ "$1 $2" == "auth print-access-token" ]] && echo "ya29.new"
         exit 0'
@@ -847,29 +877,45 @@ gcloud_provision_stub() {
     printf 'qs-work@owner.iam.gserviceaccount.com\n' > "$PRIV/gcp-sa"
     printf 'ya29.old\n' > "$PRIV/gcp-token"
     touch -t 202001010000 "$PRIV/gcp-token"   # ancient → stale
-    qs_run 'PATH="$STUBS:$PATH"; SANDBOX_NAME=work; QS_PRIVATE_DIR="$PRIV"
-            gcp_auto_refresh'
+    gcp_exec refresh
     [ "$status" -eq 0 ]
     [ "$(cat "$PRIV/gcp-token")" == "ya29.new" ]
 }
 
-@test "cleanup_gcp removes each binding and deletes the SA once" {
+@test "qs-auth-gcp cleanup removes each binding and deletes the SA once" {
     make_stub gcloud 'echo "gcloud $*" >> "$STUB_LOG"; exit 0'
-    export MANIFEST="$BATS_TEST_TMPDIR/gcp-manifest"
     local sa="qs-work@owner.iam.gserviceaccount.com"
-    printf 'owner\t%s\ttarget\troles/viewer\n' "$sa" > "$MANIFEST"
-    printf 'owner\t%s\ttarget\troles/artifactregistry.reader\n' "$sa" >> "$MANIFEST"
-    qs_run 'PATH="$STUBS:$PATH"; QS_GCP_MANIFEST="$MANIFEST"; cleanup_gcp'
+    printf 'owner\t%s\ttarget\troles/viewer\n' "$sa" > "$BATS_TEST_TMPDIR/gcp-work"
+    printf 'owner\t%s\ttarget\troles/artifactregistry.reader\n' "$sa" >> "$BATS_TEST_TMPDIR/gcp-work"
+    gcp_exec cleanup
     [ "$status" -eq 0 ]
     grep -q "remove-iam-policy-binding target .*--role=roles/viewer" "$STUB_LOG"
     grep -q "remove-iam-policy-binding target .*--role=roles/artifactregistry.reader" "$STUB_LOG"
     [ "$(grep -c "service-accounts delete $sa" "$STUB_LOG")" -eq 1 ]
-    [ ! -f "$MANIFEST" ]
+    [ ! -f "$BATS_TEST_TMPDIR/gcp-work" ]
+}
+
+@test "uninstall's provider loop runs the gcp cleanup" {
+    make_stub gcloud 'echo "gcloud $*" >> "$STUB_LOG"; exit 0'
+    printf 'owner\tqs-work@owner.iam.gserviceaccount.com\ttarget\troles/viewer\n' \
+        > "$BATS_TEST_TMPDIR/gcp-work"
+    qs_run 'PATH="$STUBS:$PATH"; SANDBOX_NAME=work
+            QS_PRIVATE_DIR="$BATS_TEST_TMPDIR/priv" INSTALL_DIR="$BATS_TEST_TMPDIR"
+            run_all_auth_providers cleanup'
+    [ "$status" -eq 0 ]
+    grep -q "remove-iam-policy-binding target" "$STUB_LOG"
+    [ ! -f "$BATS_TEST_TMPDIR/gcp-work" ]
+}
+
+@test "qs-auth-gcp provision needs a terminal to confirm the owner project" {
+    make_stub gcloud 'exit 0'
+    gcp_exec provision someproj
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"interactive terminal"* ]]
 }
 
 @test "cmd_gcp_auth requires a target project" {
-    make_stub gcloud 'exit 0'
-    qs_run 'PATH="$STUBS:$PATH"; COMMAND_ARGS=(); GCP_TARGET_PROJECTS=()
+    qs_run 'COMMAND_ARGS=(); GCP_TARGET_PROJECTS=()
             SANDBOX_NAME=work; cmd_gcp_auth'
     [ "$status" -ne 0 ]
     [[ "$output" == *"Specify at least one project to grant access on"* ]]

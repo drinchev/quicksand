@@ -9,6 +9,16 @@
 # invocation from a fixed hardened template. The client picks the verb and
 # a few validated values; the broker owns every flag.
 #
+# What the policy can and cannot contain: a malicious Dockerfile or image
+# stays inside Docker's own boundaries (COPY/ADD are confined to the
+# validated build context; RUN steps and containers only ever see the
+# workspace mount below, with _quicksand/ masked out — never other host
+# paths, because the client controls no flags). What it cannot defend
+# against is a container-escape vulnerability in the engine itself:
+# enabling the broker adds the container engine — and its VM's macOS file
+# sharing — to the sandbox's trusted computing base. Keep the engine
+# updated.
+#
 # Spawned by launchd per connection (inetd "nowait" style — see
 # config/com.quicksand.docker-broker.plist.tmpl): stdin/stdout ARE the
 # client socket. Runs as the HOST user. The client is the sandboxed agent
@@ -103,6 +113,11 @@ run)
         --network bridge
         -v "$SHARED_WORKSPACE:$SHARED_WORKSPACE"
         -w "$WORKDIR")
+    # Shadow _quicksand with an empty anonymous volume (reaped by --rm):
+    # it holds live credentials (gh/gcp/op tokens) and this broker's own
+    # socket. Containers — often third-party images — get the workspace,
+    # never the sandbox's secrets or a path back to the broker.
+    ARGS+=(-v "$SHARED_WORKSPACE/_quicksand")
 
     while IFS= read -r -d '' kv; do
         [[ "${kv%%=*}" =~ $ENVKEY_RE ]] || fail "run: bad env name"
@@ -124,6 +139,12 @@ build)
     CONTEXT="$(json '.context')" || fail "build: missing context"
     CONTEXT="$(under_workspace "$CONTEXT")" \
         || fail "build: context must be under $SHARED_WORKSPACE"
+    # COPY/ADD can reach anything in the context, so the workspace root
+    # and _quicksand (live credentials) must never BE the context.
+    [[ "$CONTEXT" != "$SHARED_WORKSPACE" ]] \
+        || fail "build: context must be a subdirectory of the workspace, not its root (it would include _quicksand credentials)"
+    [[ "$CONTEXT" != "$SHARED_WORKSPACE/_quicksand" && "$CONTEXT" != "$SHARED_WORKSPACE/_quicksand/"* ]] \
+        || fail "build: context must not be under _quicksand"
     DFILE="$(json '.dockerfile // empty')"
     ARGS=(build --label "$LABEL" -t "$TAG")
     if [[ -n "$DFILE" ]]; then

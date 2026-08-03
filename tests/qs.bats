@@ -1077,6 +1077,8 @@ broker() {
     [ "$status" -eq 0 ]
     [[ "$output" == *"DOCKER: run --rm -i --label quicksand.sandbox=work --cap-drop ALL"* ]]
     [[ "$output" == *"-v $WS:$WS -w $WS"* ]]         # default workdir = workspace
+    # _quicksand masked by an empty anonymous volume (no tokens, no socket)
+    [[ "$output" == *"-w $WS -v $WS/_quicksand"* ]]
     [[ "$output" == *"-e FOO=bar baz node:20 node -e x"* ]]
     [[ "$output" == *"@@qs-docker-exit:0@@"* ]]
 }
@@ -1124,6 +1126,19 @@ broker() {
 @test "docker broker rejects a build context outside the workspace" {
     broker '{"v":1,"verb":"build","tag":"qs-work/app","context":"/etc"}'
     [[ "$output" == *"context must be under"* ]]
+    [[ "$output" != *"DOCKER:"* ]]
+}
+
+@test "docker broker rejects the workspace root as build context" {
+    broker "{\"v\":1,\"verb\":\"build\",\"tag\":\"qs-work/app\",\"context\":\"$BATS_TEST_TMPDIR/ws\"}"
+    [[ "$output" == *"not its root"* ]]
+    [[ "$output" != *"DOCKER:"* ]]
+}
+
+@test "docker broker rejects a build context under _quicksand" {
+    mkdir -p "$BATS_TEST_TMPDIR/ws/_quicksand"
+    broker "{\"v\":1,\"verb\":\"build\",\"tag\":\"qs-work/app\",\"context\":\"$BATS_TEST_TMPDIR/ws/_quicksand\"}"
+    [[ "$output" == *"must not be under _quicksand"* ]]
     [[ "$output" != *"DOCKER:"* ]]
 }
 

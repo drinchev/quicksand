@@ -330,6 +330,9 @@ The policy, enforced entirely host-side:
 
 - **Mounts**: the shared workspace, nothing else — hard-coded, with
   workdir/build paths `realpath`-checked against symlink and `..` escapes.
+  `_quicksand/` (live credentials, the broker's own socket) is masked out
+  of the container by an empty anonymous volume, and may not be (part of)
+  a build context — so third-party images never see the sandbox's tokens.
 - **Hardening**: `--cap-drop ALL`, `--security-opt no-new-privileges`,
   4 GB / 4 CPUs / 512 pids.
 - **Ownership**: everything is labeled `quicksand.sandbox=NAME`; `ps`,
@@ -337,6 +340,12 @@ The policy, enforced entirely host-side:
   `qs-NAME/` so a sandbox can't clobber host images, and `qs uninstall`
   reaps the labeled containers and images.
 - **Surface**: six verbs, no `exec`, no `cp`, no volumes, no TTY.
+- **Trust boundary**: what the broker cannot policy away is the engine
+  itself. A container-escape vulnerability lands in the engine's Linux VM,
+  with whatever macOS file sharing that VM has — enabling `qs docker` adds
+  the container engine to the sandbox's trusted computing base, so keep it
+  updated. Build-time resource use (CPU, disk) is also uncapped; a hostile
+  build can waste resources, not read files.
 
 The broker script is staged under `~/.config/quicksand/` and loaded as a
 socket-activated LaunchAgent (`com.quicksand.docker-broker.NAME`): launchd

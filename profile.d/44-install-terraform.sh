@@ -5,15 +5,13 @@
 #
 # Idempotent: no-op if terraform is already present.
 set -Eeuo pipefail
+# shellcheck source=/dev/null
+. "${SHARED_WORKSPACE:?}/_quicksand/profile.d/00-lib.sh"
 
 command -v terraform >/dev/null 2>&1 && exit 0
 [[ -x "$HOME/.local/bin/terraform" ]] && exit 0
 
-case "$(uname -m)" in
-    arm64)  ARCH=arm64 ;;
-    x86_64) ARCH=amd64 ;;
-    *) echo "Unsupported arch for terraform install: $(uname -m)" >&2; exit 1 ;;
-esac
+ARCH="$(qs_arch arm64 amd64)"
 
 # Resolve the latest release from HashiCorp's checkpoint API, so we don't pin
 # a version that goes stale.

@@ -6,22 +6,13 @@
 # the sandbox boundary only through PRs; the conventions live in
 # ~/.claude/quicksand.md. No-op for sandboxes without a memory repo.
 set -Eeuo pipefail
+# shellcheck source=/dev/null
+. "${SHARED_WORKSPACE:?}/_quicksand/profile.d/00-lib.sh"
 
 MEMORY_DIR="${SHARED_WORKSPACE:?}/memory"
 [[ -d "$MEMORY_DIR/.git" ]] || exit 0
 
 QMD="$HOME/.local/bin/qmd"
-
-# Same helper as 56-setup-qmd.sh (profile.d scripts are standalone).
-ensure_collection() {
-    local out
-    if out="$("$QMD" collection add "$@" 2>&1)"; then
-        return 0
-    fi
-    grep -qi "exist" <<< "$out" && return 0
-    echo "$out" >&2
-    return 1
-}
 
 # One-time collection registration; versioned sentinel like 56-setup-qmd.sh.
 SETUP_VERSION=1

@@ -1214,6 +1214,80 @@ cmd_docker() {
     info "           image builds tagged under qs-$SANDBOX_NAME/; disable with: qs docker $SANDBOX_NAME off"
 }
 
+# Assemble the in-sandbox zsh command line: per-session TMPDIR, cd to the
+# initial dir, the profile.d hook loop, the logout.d EXIT trap, then the
+# session payload (claude, a one-off command, an interactive or piped
+# shell). Pure string assembly with no side effects, so the three quoting
+# layers (this bash string → the sandbox `zsh -c` parse → the trap body's
+# deferred re-parse) are unit-testable without exec'ing anything. Sets
+# ZSH_COMMAND and QS_SESSION_KIND; whether stdin is a tty is passed in
+# ("true"/"false") rather than probed here so tests can exercise both
+# the interactive and piped shapes.
+ZSH_COMMAND=""
+QS_SESSION_KIND=""
+build_session_command() {
+    local stdin_tty="$1"
+
+    local INITIAL_DIR_Q
+    INITIAL_DIR_Q="$(quote_zsh_args "${INITIAL_DIR:-/Users/$QUICKSAND_USER}")"
+    # TMPDIR is per-session so tools that name temp dirs after themselves
+    # (e.g. /tmp/claude) don't collide across sandbox users, and lives in
+    # the sandbox user's private /var/folders tree rather than world-listable
+    # /tmp (falling back to /tmp if confstr resolution ever fails).
+    ZSH_COMMAND="export TMPDIR=\$(mktemp -d \"\$(getconf DARWIN_USER_TEMP_DIR)/qs.XXXXXX\" 2>/dev/null || mktemp -d); cd $INITIAL_DIR_Q 2>/dev/null || cd ~"
+
+    # Run per-session profile scripts as the sandbox user.
+    ZSH_COMMAND="$ZSH_COMMAND; setopt null_glob; for s in $SHARED_WORKSPACE/_quicksand/profile.d/*.sh $SHARED_WORKSPACE/_quicksand/custom/profile.d/*.sh; do [[ -f \"\$s\" && -x \"\$s\" ]] && \"\$s\"; done"
+
+    # Register logout.d scripts as an EXIT trap, the exit-time counterpart of
+    # the profile.d loop above. The trap body is single-quoted so $s expands
+    # when the trap fires, not now. Because the session command below is NOT
+    # exec'd, control returns to this shell when the session ends and the trap
+    # runs. zsh keeps waiting while a foreground child handles its own SIGINT
+    # (interactive zsh, claude), so an ordinary Ctrl-C won't fire it early;
+    # the trap does not run if this shell is killed by an uncaught signal
+    # (e.g. SIGHUP when the terminal closes), which is fine — the tab is gone.
+    ZSH_COMMAND="$ZSH_COMMAND; trap 'for s in $SHARED_WORKSPACE/_quicksand/logout.d/*.sh $SHARED_WORKSPACE/_quicksand/custom/logout.d/*.sh; do [[ -f \"\$s\" && -x \"\$s\" ]] && \"\$s\"; done' EXIT"
+
+    # The sandbox `zsh -c` is non-interactive, so it does NOT source
+    # ~/.zshrc the way `qs shell`'s inner `zsh -i` does. Source it explicitly
+    # before launching claude / a one-off command / a piped session, so the
+    # environment variables and settings defined in the sandbox's ~/.zshrc are
+    # present in every session, not just the interactive shell. Placed after
+    # the profile.d loop above so a ~/.zshrc that 45-install-oh-my-zsh.sh only
+    # just created on first run is picked up. Guarded and best-effort: a
+    # missing or failing ~/.zshrc must never block the session (this outer
+    # shell runs without `set -e`, so the following `;`-separated command runs
+    # regardless). The interactive `zsh -i` branch is left alone — its inner
+    # shell already sources ~/.zshrc, and double-sourcing would re-run omz.
+    local SOURCE_ZSHRC='[[ -r ~/.zshrc ]] && source ~/.zshrc'
+
+    # Session kind, consumed by profile.d/51-tab-name.sh to label the tab as
+    # "<sandbox> | Claude" or "<sandbox> | Shell". Only the two interactive
+    # (tty) modes get a label; one-off command and piped sessions are left
+    # blank so the script no-ops.
+    QS_SESSION_KIND=""
+    if [[ "$COMMAND" == "claude" ]]; then
+        QS_SESSION_KIND="Claude"
+        # sandbox-exec is already restricting file writes to the sandbox home
+        # plus the shared workspace, so claude's per-action permission prompts
+        # are redundant. `bypassPermissionsModeAccepted: true` (seeded by the
+        # 30-claude-config.sh profile script) is the on-disk acknowledgement.
+        # Not exec'd (unlike a bare launch) so the EXIT trap's logout.d hooks
+        # run when claude quits.
+        ZSH_COMMAND="$ZSH_COMMAND; $SOURCE_ZSHRC; $(quote_zsh_args claude --dangerously-skip-permissions "${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}")"
+    elif (( ${#COMMAND_ARGS[@]} > 0 )); then
+        ZSH_COMMAND="$ZSH_COMMAND; $SOURCE_ZSHRC; $(quote_zsh_args "${COMMAND_ARGS[@]}")"
+    elif [[ "$stdin_tty" == "true" ]]; then
+        QS_SESSION_KIND="Shell"
+        ZSH_COMMAND="$ZSH_COMMAND; /bin/zsh -i"
+    else
+        # Piped stdin: non-interactive zsh, no prompt or interactive hooks. The
+        # nested shell inherits exported vars from the $SOURCE_ZSHRC above.
+        ZSH_COMMAND="$ZSH_COMMAND; $SOURCE_ZSHRC; /bin/zsh"
+    fi
+}
+
 # Enter the sandbox: sanity-check the build artifacts, assemble the
 # in-sandbox zsh command line, and exec into it (never returns).
 cmd_launch() {
@@ -1238,64 +1312,10 @@ cmd_launch() {
     # in libexec/ (best-effort; each provider self-gates on its own state).
     run_all_auth_providers refresh
 
-    local INITIAL_DIR_Q ZSH_COMMAND
-    INITIAL_DIR_Q="$(quote_zsh_args "${INITIAL_DIR:-/Users/$QUICKSAND_USER}")"
-    # TMPDIR is per-session so tools that name temp dirs after themselves
-    # (e.g. /tmp/claude) don't collide across sandbox users, and lives in
-    # the sandbox user's private /var/folders tree rather than world-listable
-    # /tmp (falling back to /tmp if confstr resolution ever fails).
-    ZSH_COMMAND="export TMPDIR=\$(mktemp -d \"\$(getconf DARWIN_USER_TEMP_DIR)/qs.XXXXXX\" 2>/dev/null || mktemp -d); cd $INITIAL_DIR_Q 2>/dev/null || cd ~"
-
-    # Run per-session profile scripts as the sandbox user.
-    ZSH_COMMAND="$ZSH_COMMAND; setopt null_glob; for s in $SHARED_WORKSPACE/_quicksand/profile.d/*.sh $SHARED_WORKSPACE/_quicksand/custom/profile.d/*.sh; do [[ -f \"\$s\" && -x \"\$s\" ]] && \"\$s\"; done"
-
-    # Register logout.d scripts as an EXIT trap, the exit-time counterpart of
-    # the profile.d loop above. The trap body is single-quoted so $s expands
-    # when the trap fires, not now. Because the session command below is NOT
-    # exec'd, control returns to this shell when the session ends and the trap
-    # runs. zsh keeps waiting while a foreground child handles its own SIGINT
-    # (interactive zsh, claude), so an ordinary Ctrl-C won't fire it early;
-    # the trap does not run if this shell is killed by an uncaught signal
-    # (e.g. SIGHUP when the terminal closes), which is fine — the tab is gone.
-    ZSH_COMMAND="$ZSH_COMMAND; trap 'for s in $SHARED_WORKSPACE/_quicksand/logout.d/*.sh $SHARED_WORKSPACE/_quicksand/custom/logout.d/*.sh; do [[ -f \"\$s\" && -x \"\$s\" ]] && \"\$s\"; done' EXIT"
-
-    # The outer `zsh -c` below is non-interactive, so it does NOT source
-    # ~/.zshrc the way `qs shell`'s inner `zsh -i` does. Source it explicitly
-    # before launching claude / a one-off command / a piped session, so the
-    # environment variables and settings defined in the sandbox's ~/.zshrc are
-    # present in every session, not just the interactive shell. Placed after
-    # the profile.d loop above so a ~/.zshrc that 45-install-oh-my-zsh.sh only
-    # just created on first run is picked up. Guarded and best-effort: a
-    # missing or failing ~/.zshrc must never block the session (this outer
-    # shell runs without `set -e`, so the following `;`-separated command runs
-    # regardless). The interactive `zsh -i` branch is left alone — its inner
-    # shell already sources ~/.zshrc, and double-sourcing would re-run omz.
-    local SOURCE_ZSHRC='[[ -r ~/.zshrc ]] && source ~/.zshrc'
-
-    # Session kind, consumed by profile.d/51-tab-name.sh to label the tab as
-    # "<sandbox> | Claude" or "<sandbox> | Shell". Only the two interactive
-    # (tty) modes get a label; one-off command and piped sessions are left
-    # blank so the script no-ops.
-    local QS_SESSION_KIND=""
-    if [[ "$COMMAND" == "claude" ]]; then
-        QS_SESSION_KIND="Claude"
-        # sandbox-exec is already restricting file writes to the sandbox home
-        # plus the shared workspace, so claude's per-action permission prompts
-        # are redundant. `bypassPermissionsModeAccepted: true` (seeded by the
-        # 30-claude-config.sh profile script) is the on-disk acknowledgement.
-        # Not exec'd (unlike a bare launch) so the EXIT trap's logout.d hooks
-        # run when claude quits.
-        ZSH_COMMAND="$ZSH_COMMAND; $SOURCE_ZSHRC; $(quote_zsh_args claude --dangerously-skip-permissions "${COMMAND_ARGS[@]+"${COMMAND_ARGS[@]}"}")"
-    elif (( ${#COMMAND_ARGS[@]} > 0 )); then
-        ZSH_COMMAND="$ZSH_COMMAND; $SOURCE_ZSHRC; $(quote_zsh_args "${COMMAND_ARGS[@]}")"
-    elif [[ -t 0 ]]; then
-        QS_SESSION_KIND="Shell"
-        ZSH_COMMAND="$ZSH_COMMAND; /bin/zsh -i"
-    else
-        # Piped stdin: non-interactive zsh, no prompt or interactive hooks. The
-        # nested shell inherits exported vars from the $SOURCE_ZSHRC above.
-        ZSH_COMMAND="$ZSH_COMMAND; $SOURCE_ZSHRC; /bin/zsh"
-    fi
+    # Probed here (not in build_session_command) so the assembly stays pure.
+    local stdin_tty=false
+    [[ -t 0 ]] && stdin_tty=true
+    build_session_command "$stdin_tty"
 
     SANDBOX_EXEC=()
     if [[ "$USE_SANDBOX" == "true" ]]; then

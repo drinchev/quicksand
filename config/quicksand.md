@@ -96,7 +96,8 @@ sandboxes, indexed as the qmd collection `shared-memory`.
     `qs-docker stop ID`
 - The broker enforces the policy host-side; these are facts, not knobs:
   containers mount ONLY $SHARED_WORKSPACE (paths outside it don't exist in
-  the container), capabilities are dropped, resources are capped
+  the container, and _quicksand/ is masked out — no credentials and no
+  broker socket inside containers), capabilities are dropped, resources are capped
   (4g RAM / 4 CPUs / 512 pids), build tags must live under
   `qs-<sandbox>/`, and you can only see or stop containers this sandbox
   created. Piped stdin reaches the container; there is no TTY, no `exec`,

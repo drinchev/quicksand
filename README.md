@@ -105,10 +105,11 @@ qs gh-auth   NAME [OWNER/REPO]           set up a repo-scoped gh token
 qs gcp-auth  NAME TARGET_PROJECT         provision a scoped GCP service account
 qs gcp-token NAME                        refresh the GCP access token (~1h)
 qs op-auth   NAME [--write]              provision a 1Password vault for secrets
+qs docker    NAME [off]                  let the sandbox run containers via a broker
 qs uninstall NAME                        remove the sandbox completely
 qs list                                  list sandboxes
 
-Short aliases: b, s, cl, c, g, gp, gt, o, u, l.
+Short aliases: b, s, cl, c, g, gp, gt, o, d, u, l.
 ```
 
 PATH is where the session starts, *inside* the sandbox: relative paths and
@@ -291,6 +292,61 @@ why adding secrets never needs `--write`. Reading the token at launch may prompt
 reminder, and **leaves the vault and its secrets intact** — your data is never
 deleted.
 
+## Docker via a host-side broker (`qs docker`)
+
+There is no Docker engine inside a sandbox, and handing one the host's Docker
+socket would undo the whole isolation model: whoever controls the socket can
+`docker run -v /Users/you:/host ...` and read or write everything your engine's
+file sharing reaches — the socket is host-user-equivalent. OrbStack and Docker
+Desktop (outside the Business tier) have no daemon-side policy mechanism to
+prevent that.
+
+`qs docker NAME` takes a different route: a **command-level broker**. The
+sandbox never sees a Docker API; instead a `qs-docker` client sends a small
+JSON request (verb plus a few values) over a Unix socket in `_quicksand/`,
+and a host-side broker composes every `docker` invocation itself from a fixed
+hardened template — the client cannot supply a single flag. That keeps the
+security-critical surface ~150 auditable lines instead of a Docker-API
+payload filter, where one missed field (`Binds` vs `Mounts`, `docker cp`,
+volume remounts, image `load`) is a host compromise.
+
+```bash
+qs docker work        # enable — needs docker + jq on the host
+qs docker work off    # disable again
+```
+
+Inside the sandbox:
+
+```bash
+qs-docker run -w ~/project node:20 node -e 'console.log("hi")'
+qs-docker build -t qs-work/app ~/project
+qs-docker pull postgres:16
+qs-docker ps                # only this sandbox's containers
+qs-docker logs <id>
+qs-docker stop <id>
+```
+
+The policy, enforced entirely host-side:
+
+- **Mounts**: the shared workspace, nothing else — hard-coded, with
+  workdir/build paths `realpath`-checked against symlink and `..` escapes.
+- **Hardening**: `--cap-drop ALL`, `--security-opt no-new-privileges`,
+  4 GB / 4 CPUs / 512 pids.
+- **Ownership**: everything is labeled `quicksand.sandbox=NAME`; `ps`,
+  `logs` and `stop` are scoped to that label, build tags are forced under
+  `qs-NAME/` so a sandbox can't clobber host images, and `qs uninstall`
+  reaps the labeled containers and images.
+- **Surface**: six verbs, no `exec`, no `cp`, no volumes, no TTY.
+
+The broker script is staged under `~/.config/quicksand/` and loaded as a
+socket-activated LaunchAgent (`com.quicksand.docker-broker.NAME`): launchd
+owns the socket and spawns one short-lived broker per connection, so nothing
+runs while idle — and the code executing as your user lives host-side where
+the sandbox can't edit it. The `docker`/`jq` binary paths are pinned into the
+LaunchAgent at install time. Containers themselves are confined by your
+engine's VM, not by `sandbox-exec`; container network egress is unrestricted,
+matching quicksand's "files, not egress" model.
+
 ## Automatic rebuilds
 
 The install marker stores a fingerprint of everything a build bakes into a
@@ -322,6 +378,7 @@ sandbox (first run installs, later runs are no-ops):
 | `60-gh-auth.sh` | sign `gh` in with the repo-scoped token from `qs gh-auth` |
 | `61-gcp-auth.sh` | point `gcloud`/`gsutil` at the impersonated token from `qs gcp-auth` |
 | `62-op-auth.sh` | export `OP_SERVICE_ACCOUNT_TOKEN` from the token staged by `qs op-auth` |
+| `63-docker-shim.sh` | install the `qs-docker` client staged by `qs docker` (or remove it when disabled) |
 
 After the `profile.d/` scripts run, the launcher sources the sandbox's
 `~/.zshrc` before starting the session — for `qs claude`, one-off `-- command`

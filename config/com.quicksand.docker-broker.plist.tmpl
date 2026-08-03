@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- LaunchAgent for the qs docker broker. Rendered per sandbox by
+     `qs docker NAME` (@SANDBOX_NAME@ etc. substituted at install time)
+     into ~/Library/LaunchAgents/. launchd owns the socket and spawns one
+     broker process per connection (inetd nowait): no long-running daemon,
+     starts on demand, and the broker script plus the docker/jq paths are
+     pinned host-side where the sandbox can't rewrite them. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.quicksand.docker-broker.@SANDBOX_NAME@</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>@BROKER_SCRIPT@</string>
+        <string>@SANDBOX_NAME@</string>
+        <string>@SHARED_WORKSPACE@</string>
+        <string>@DOCKER_BIN@</string>
+        <string>@JQ_BIN@</string>
+    </array>
+    <key>inetdCompatibility</key>
+    <dict>
+        <key>Wait</key>
+        <false/>
+    </dict>
+    <key>Sockets</key>
+    <dict>
+        <key>Listener</key>
+        <dict>
+            <key>SockFamily</key>
+            <string>Unix</string>
+            <key>SockPathName</key>
+            <string>@SHARED_WORKSPACE@/_quicksand/docker-broker.sock</string>
+            <!-- 0666 (438): connecting needs write on the socket file, and
+                 reaching it at all needs traversal through the 0770
+                 workspace — only the host user and this sandbox's user
+                 get that far. -->
+            <key>SockPathMode</key>
+            <integer>438</integer>
+        </dict>
+    </dict>
+</dict>
+</plist>

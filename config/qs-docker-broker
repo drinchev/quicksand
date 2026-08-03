@@ -1,0 +1,159 @@
+#!/bin/bash
+# qs-docker-broker — host-side Docker broker for one quicksand sandbox.
+#
+# Lets the sandbox run containers on the host Docker engine (OrbStack,
+# Docker Desktop, ...) without ever seeing the Docker socket: raw socket
+# access is host-user-equivalent (a container with `-v /Users/you:/host`
+# reads your home), so the sandbox instead talks a tiny JSON protocol over
+# a Unix socket in _quicksand/, and this broker composes every docker
+# invocation from a fixed hardened template. The client picks the verb and
+# a few validated values; the broker owns every flag.
+#
+# Spawned by launchd per connection (inetd "nowait" style — see
+# config/com.quicksand.docker-broker.plist.tmpl): stdin/stdout ARE the
+# client socket. Runs as the HOST user. The client is the sandboxed agent
+# and is UNTRUSTED: nothing it sends is ever parsed by a shell or passed
+# as a flag. `qs docker NAME` stages this script host-side (the sandbox
+# must not be able to edit it) and renders the launchd plist that pins the
+# argument paths below.
+#
+# Protocol: the client sends ONE line of JSON, e.g.
+#   {"v":1,"verb":"run","image":"node:20","cmd":["node","x.js"],
+#    "env":{"FOO":"bar"},"workdir":"/Users/Shared/qs-NAME/repos/proj"}
+# Everything after that first line is streamed to the container's stdin
+# (verb=run only). The broker streams combined output back and ends with
+# a final line "@@qs-docker-exit:<code>@@" carrying the exit code.
+set -uo pipefail
+
+SANDBOX_NAME="${1:?usage: qs-docker-broker NAME WORKSPACE DOCKER_BIN JQ_BIN}"
+SHARED_WORKSPACE="${2:?missing WORKSPACE}"
+DOCKER="${3:?missing DOCKER_BIN}"
+JQ="${4:?missing JQ_BIN}"
+
+# Canonicalize the workspace so the prefix checks below compare resolved
+# paths on both sides (client paths go through realpath too).
+SHARED_WORKSPACE="$(realpath -q "$SHARED_WORKSPACE" 2>/dev/null || printf '%s' "$SHARED_WORKSPACE")"
+
+LABEL_KEY="quicksand.sandbox"
+LABEL="$LABEL_KEY=$SANDBOX_NAME"
+TAG_NS="qs-$SANDBOX_NAME/"
+LOG_FILE="$HOME/.config/quicksand/docker-broker-$SANDBOX_NAME.log"
+
+# stderr goes to a host-side log, never to the client.
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+exec 2>>"$LOG_FILE"
+echo "$(date '+%F %T') connection" >&2
+
+finish() { printf '\n@@qs-docker-exit:%d@@\n' "$1"; exit 0; }
+fail()   { printf 'qs-docker: %s\n' "$1"; finish 125; }
+
+[[ -x "$DOCKER" ]] || fail "docker CLI not executable at $DOCKER — re-run 'qs docker $SANDBOX_NAME' on the host"
+[[ -x "$JQ" ]] || fail "jq not executable at $JQ — re-run 'qs docker $SANDBOX_NAME' on the host"
+
+IFS= read -r REQUEST || exit 0
+(( ${#REQUEST} <= 65536 )) || fail "request too large"
+
+json()  { "$JQ" -er "$1" <<<"$REQUEST" 2>/dev/null; }
+# -j (raw, no newline): used with an explicit \u0000 joiner so array and
+# object values survive embedded newlines when read back with `read -d ''`.
+json0() { "$JQ" -j "$1" <<<"$REQUEST" 2>/dev/null; }
+
+VERB="$(json '.verb')" || fail "unparseable request"
+
+# Every client value becomes exactly one argv element after a literal
+# docker subcommand, so injection would need a leading '-'; the regexes
+# forbid that and are belt and braces on top.
+IMAGE_RE='^[A-Za-z0-9][A-Za-z0-9._/:@-]{0,255}$'
+ID_RE='^[A-Za-z0-9][A-Za-z0-9._-]{0,255}$'
+ENVKEY_RE='^[A-Za-z_][A-Za-z0-9_]*$'
+
+# Resolve symlinks and ../ before the prefix check, and echo the resolved
+# path so the caller uses that (not the raw claim). The run mount itself is
+# always the fixed $SHARED_WORKSPACE — this only gates -w and build paths.
+under_workspace() {
+    local p
+    p="$(realpath -q "$1" 2>/dev/null)" || return 1
+    [[ "$p" == "$SHARED_WORKSPACE" || "$p" == "$SHARED_WORKSPACE"/* ]] \
+        && printf '%s' "$p"
+}
+
+run_docker() {
+    "$DOCKER" "$@" 2>&1
+    finish $?
+}
+
+case "$VERB" in
+run)
+    IMAGE="$(json '.image')" || fail "run: missing image"
+    [[ "$IMAGE" =~ $IMAGE_RE ]] || fail "run: bad image ref"
+
+    WORKDIR="$(json '.workdir // empty')"
+    if [[ -n "$WORKDIR" ]]; then
+        WORKDIR="$(under_workspace "$WORKDIR")" \
+            || fail "run: workdir must be under $SHARED_WORKSPACE"
+    else
+        WORKDIR="$SHARED_WORKSPACE"
+    fi
+
+    ARGS=(run --rm -i
+        --label "$LABEL"
+        --cap-drop ALL
+        --security-opt no-new-privileges
+        --pids-limit 512 --memory 4g --cpus 4
+        --network bridge
+        -v "$SHARED_WORKSPACE:$SHARED_WORKSPACE"
+        -w "$WORKDIR")
+
+    while IFS= read -r -d '' kv; do
+        [[ "${kv%%=*}" =~ $ENVKEY_RE ]] || fail "run: bad env name"
+        ARGS+=(-e "$kv")
+    done < <(json0 '(.env // {}) | to_entries[] | .key + "=" + .value + "\u0000"')
+
+    ARGS+=("$IMAGE")
+    while IFS= read -r -d '' c; do
+        ARGS+=("$c")
+    done < <(json0 '(.cmd // [])[] | . + "\u0000"')
+
+    # Remaining socket input becomes the container's stdin.
+    run_docker "${ARGS[@]}"
+    ;;
+build)
+    TAG="$(json '.tag')" || fail "build: missing tag"
+    [[ "$TAG" == "$TAG_NS"* && "$TAG" =~ $IMAGE_RE ]] \
+        || fail "build: tag must live under $TAG_NS (can't clobber host images)"
+    CONTEXT="$(json '.context')" || fail "build: missing context"
+    CONTEXT="$(under_workspace "$CONTEXT")" \
+        || fail "build: context must be under $SHARED_WORKSPACE"
+    DFILE="$(json '.dockerfile // empty')"
+    ARGS=(build --label "$LABEL" -t "$TAG")
+    if [[ -n "$DFILE" ]]; then
+        DFILE="$(under_workspace "$DFILE")" \
+            || fail "build: dockerfile must be under $SHARED_WORKSPACE"
+        ARGS+=(-f "$DFILE")
+    fi
+    exec 0</dev/null
+    run_docker "${ARGS[@]}" "$CONTEXT"
+    ;;
+pull)
+    IMAGE="$(json '.image')" || fail "pull: missing image"
+    [[ "$IMAGE" =~ $IMAGE_RE ]] || fail "pull: bad image ref"
+    exec 0</dev/null
+    run_docker pull "$IMAGE"
+    ;;
+ps)
+    exec 0</dev/null
+    run_docker ps -a --filter "label=$LABEL"
+    ;;
+logs|stop)
+    ID="$(json '.id')" || fail "$VERB: missing id"
+    [[ "$ID" =~ $ID_RE ]] || fail "$VERB: bad container id"
+    exec 0</dev/null
+    # Never touch a container this sandbox didn't create.
+    OWNER="$("$DOCKER" inspect -f "{{ index .Config.Labels \"$LABEL_KEY\" }}" "$ID" 2>/dev/null)"
+    [[ "$OWNER" == "$SANDBOX_NAME" ]] || fail "$VERB: no such container"
+    run_docker "$VERB" "$ID"
+    ;;
+*)
+    fail "unknown verb '$VERB' (allowed: run build pull ps logs stop)"
+    ;;
+esac

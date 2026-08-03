@@ -39,6 +39,11 @@ readonly QS_QUICKSAND_MD="$QS_REPO_DIR/config/quicksand.md"
 # They run straight from the repo like qs itself — nothing is staged into
 # the sandbox, so provider edits don't trigger rebuilds.
 readonly QS_LIBEXEC_DIR="$QS_REPO_DIR/libexec"
+# Docker broker assets (see `qs docker`): the host-side broker script, the
+# sandbox-side client, and the LaunchAgent template that ties them together.
+readonly QS_DOCKER_BROKER_SOURCE="$QS_REPO_DIR/config/qs-docker-broker"
+readonly QS_DOCKER_SHIM_SOURCE="$QS_REPO_DIR/config/qs-docker"
+readonly QS_DOCKER_PLIST_TEMPLATE="$QS_REPO_DIR/config/com.quicksand.docker-broker.plist.tmpl"
 
 QS_VERBOSE="${QS_VERBOSE:-0}"
 abort() { echo >&2 "ERROR: $*"; exit 1; }
@@ -70,6 +75,9 @@ config_fingerprint() {
         echo "$VERSION"
         /usr/bin/shasum -a 256 < "$QS_SANDBOX_PROFILE_TEMPLATE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_QUICKSAND_MD" 2>/dev/null || true
+        /usr/bin/shasum -a 256 < "$QS_DOCKER_BROKER_SOURCE" 2>/dev/null || true
+        /usr/bin/shasum -a 256 < "$QS_DOCKER_SHIM_SOURCE" 2>/dev/null || true
+        /usr/bin/shasum -a 256 < "$QS_DOCKER_PLIST_TEMPLATE" 2>/dev/null || true
         local dir
         for dir in "$QS_PROFILE_SOURCE_DIR" "$QS_LOGOUT_SOURCE_DIR" "$QS_CUSTOM_DIR"; do
             [[ -d "$dir" ]] || continue
@@ -107,6 +115,7 @@ Usage:
   qs gcp-auth  NAME PROJECT [PROJECT ...]
   qs gcp-token NAME
   qs op-auth   NAME [--write]
+  qs docker    NAME [off]
   qs uninstall NAME
   qs list
 
@@ -146,6 +155,17 @@ access token into the sandbox, and pins the first PROJECT as the default.
 'uninstall' unbinds the roles and deletes the SA. Downloadable keys are
 intentionally not used (orgs commonly disable them); the token lasts ~1h, so
 'gcp-token' re-mints one without redoing the SA/role setup.
+
+'docker' lets the sandbox run containers on the host Docker engine (OrbStack,
+Docker Desktop) WITHOUT seeing the Docker socket — raw socket access would be
+host-user-equivalent (bind-mount any host path). Instead a host-side broker,
+loaded as a socket-activated LaunchAgent and staged where the sandbox can't
+edit it, accepts a constrained JSON request over a workspace socket and
+composes every docker invocation from a fixed hardened template: mounts are
+limited to the shared workspace, capabilities dropped, resources capped, and
+everything is labeled per sandbox so 'uninstall' can reap it. Inside the
+sandbox the 'qs-docker' client offers run/build/pull/ps/logs/stop; built
+image tags are forced under 'qs-NAME/'. 'qs docker NAME off' disables it.
 
 'op-auth' sets up per-sandbox app-secret access via 1Password. Using your own
 host 1Password (so it must be signed in), it creates a vault 'qs-NAME', a
@@ -206,6 +226,7 @@ GH_AUTH_REPO=""
 MEMORY_REPO=""
 GCP_TARGET_PROJECTS=()
 OP_WRITE=false
+DOCKER_ACTION="on"
 
 parse_args() {
     if [[ -n "${QUICKSAND_ARGS:-}" ]]; then
@@ -254,6 +275,7 @@ parse_args() {
         gp|gcp-auth) COMMAND=gcp-auth; needs_name=true ;;
         gt|gcp-token) COMMAND=gcp-token; needs_name=true ;;
         o|op-auth)   COMMAND=op-auth; needs_name=true ;;
+        d|docker)    COMMAND=docker; needs_name=true ;;
         b|build)     COMMAND=build;  needs_name=true ;;
         u|uninstall) COMMAND=uninstall; needs_name=true ;;
         *)           abort "Unknown command: $1 (try: qs --help)" ;;
@@ -276,6 +298,11 @@ parse_args() {
                 MEMORY_REPO="$3"
                 ;;
             gcp-auth) GCP_TARGET_PROJECTS=("${@:3}") ;;
+            docker)
+                DOCKER_ACTION="${3:-on}"
+                [[ "$DOCKER_ACTION" == "on" || "$DOCKER_ACTION" == "off" ]] \
+                    || abort "qs docker accepts 'off' or nothing (got: $DOCKER_ACTION)"
+                ;;
         esac
     fi
 }
@@ -317,6 +344,13 @@ derive_constants() {
     readonly QS_MEMORY_DIR="$SHARED_WORKSPACE/memory"
     readonly QS_MEMORY_MANIFEST="$INSTALL_DIR/memory-$SANDBOX_NAME"
     readonly QS_SSH_DIR="$QS_PRIVATE_DIR/.ssh"
+    # Docker broker (see `qs docker`): the LaunchAgent label/plist and the
+    # host-side staged copy of the broker script. The staged copy lives under
+    # $INSTALL_DIR — never in the shared workspace — because it runs as the
+    # host user and the sandbox must not be able to edit it.
+    readonly QS_DOCKER_LABEL="com.quicksand.docker-broker.$SANDBOX_NAME"
+    readonly QS_DOCKER_PLIST="$HOME/Library/LaunchAgents/$QS_DOCKER_LABEL.plist"
+    readonly QS_DOCKER_BROKER_STAGED="$INSTALL_DIR/docker-broker-$SANDBOX_NAME.sh"
     readonly HOST_USER="$USER"
     QS_SESSION_ID="$(/usr/bin/uuidgen)"
     readonly QS_SESSION_ID
@@ -571,6 +605,61 @@ cleanup_gcp() {
     done
 
     rm -f "$QS_GCP_MANIFEST"
+}
+
+# Install (or refresh) the docker broker for this sandbox: stage the broker
+# script host-side (it runs as the host user, so the sandbox must never be
+# able to edit it), stage the qs-docker client into the workspace for
+# profile.d/63-docker-shim.sh to pick up, render the LaunchAgent with the
+# docker/jq paths pinned at install time, and (re)load it. launchd owns the
+# socket and spawns one broker process per connection — no daemon runs idle.
+docker_broker_install() {
+    local docker_bin="$1" jq_bin="$2"
+
+    mkdir -p "$INSTALL_DIR"
+    /usr/bin/install -m 0755 "$QS_DOCKER_BROKER_SOURCE" "$QS_DOCKER_BROKER_STAGED"
+
+    mkdir -p "$QS_PRIVATE_DIR/bin"
+    /usr/bin/install -m 0755 "$QS_DOCKER_SHIM_SOURCE" "$QS_PRIVATE_DIR/bin/qs-docker"
+
+    mkdir -p "$HOME/Library/LaunchAgents"
+    sed -e "s|@SANDBOX_NAME@|$SANDBOX_NAME|g" \
+        -e "s|@BROKER_SCRIPT@|$QS_DOCKER_BROKER_STAGED|g" \
+        -e "s|@SHARED_WORKSPACE@|$SHARED_WORKSPACE|g" \
+        -e "s|@DOCKER_BIN@|$docker_bin|g" \
+        -e "s|@JQ_BIN@|$jq_bin|g" \
+        "$QS_DOCKER_PLIST_TEMPLATE" > "$QS_DOCKER_PLIST"
+
+    launchctl bootout "gui/$(id -u)/$QS_DOCKER_LABEL" 2>/dev/null || true
+    rm -f "$QS_PRIVATE_DIR/docker-broker.sock"
+    launchctl bootstrap "gui/$(id -u)" "$QS_DOCKER_PLIST" \
+        || abort "Failed to load the docker broker LaunchAgent — inspect with: launchctl print gui/$(id -u)/$QS_DOCKER_LABEL"
+}
+
+# Undo what `qs docker` provisioned: unload the LaunchAgent, remove the
+# staged broker/client/socket, and (when the host has docker) reap the
+# containers and images labeled for this sandbox. Best-effort throughout so
+# uninstall always completes.
+cleanup_docker() {
+    launchctl bootout "gui/$(id -u)/$QS_DOCKER_LABEL" 2>/dev/null || true
+    rm -f "$QS_DOCKER_PLIST" "$QS_DOCKER_BROKER_STAGED" \
+          "$INSTALL_DIR/docker-broker-$SANDBOX_NAME.log" \
+          "${QS_PRIVATE_DIR:+$QS_PRIVATE_DIR/docker-broker.sock}" \
+          "${QS_PRIVATE_DIR:+$QS_PRIVATE_DIR/bin/qs-docker}"
+    command -v docker >/dev/null 2>&1 || return 0
+    local ids
+    ids="$(docker ps -aq --filter "label=quicksand.sandbox=$SANDBOX_NAME" 2>/dev/null || true)"
+    if [[ -n "$ids" ]]; then
+        if xargs docker rm -f <<< "$ids" >/dev/null 2>&1; then
+            info "Removed this sandbox's containers."
+        fi
+    fi
+    ids="$(docker images -q --filter "label=quicksand.sandbox=$SANDBOX_NAME" 2>/dev/null || true)"
+    if [[ -n "$ids" ]]; then
+        if xargs docker rmi -f <<< "$ids" >/dev/null 2>&1; then
+            info "Removed this sandbox's images."
+        fi
+    fi
 }
 
 # Append a clone record to the manifest (see QS_CLONES_MANIFEST, or
@@ -1099,6 +1188,22 @@ EOF
             "$QS_CUSTOM_DIR/" "$QS_CUSTOM_SANDBOX_DIR/"
     fi
 
+    # Keep an enabled docker broker in step with the repo: a rebuild
+    # re-stages the broker and client and re-renders/reloads the agent, so
+    # changes to config/qs-docker* (which are fingerprinted) roll out like
+    # profile.d changes. No-op for sandboxes without the broker.
+    if [[ -f "$QS_DOCKER_PLIST" ]]; then
+        local docker_bin jq_bin
+        docker_bin="$(command -v docker 2>/dev/null || true)"
+        jq_bin="$(command -v jq 2>/dev/null || true)"
+        if [[ -n "$docker_bin" && -n "$jq_bin" ]]; then
+            debug "Refreshing docker broker"
+            docker_broker_install "$docker_bin" "$jq_bin"
+        else
+            warn "Docker broker is enabled for '$SANDBOX_NAME' but docker/jq are missing on the host — broker refresh skipped."
+        fi
+    fi
+
     # First line: config fingerprint (compared on every run); second:
     # build time, for humans.
     mkdir -p "$INSTALL_DIR"
@@ -1130,6 +1235,7 @@ cmd_uninstall() {
     cleanup_memory_artifacts
     run_all_auth_providers cleanup
     cleanup_gcp
+    cleanup_docker
 
     # Best-effort: tear down any running session for this sandbox user.
     # `|| true` swallows pipefail-induced ERR when the user is already
@@ -1301,6 +1407,40 @@ cmd_op_auth() {
     local args=()
     [[ "$OP_WRITE" == "true" ]] && args+=(--write)
     run_auth_provider op provision "${args[@]+"${args[@]}"}" || exit $?
+}
+
+# Enable (or refresh) the host docker broker for a sandbox, letting agents
+# run containers on the host engine without ever seeing the Docker socket
+# (raw socket access could bind-mount any host path — see the broker script
+# for the full security model). 'qs docker NAME off' disables it again; the
+# in-sandbox client then fails cleanly with a pointer back to this command.
+cmd_docker() {
+    (( ${#COMMAND_ARGS[@]} == 0 )) \
+        || abort "qs docker doesn't accept '--' args"
+    if [[ "$DOCKER_ACTION" == "off" ]]; then
+        launchctl bootout "gui/$(id -u)/$QS_DOCKER_LABEL" 2>/dev/null || true
+        rm -f "$QS_DOCKER_PLIST" "$QS_DOCKER_BROKER_STAGED" \
+              "$QS_PRIVATE_DIR/docker-broker.sock" "$QS_PRIVATE_DIR/bin/qs-docker"
+        info "Docker broker disabled for '$SANDBOX_NAME'."
+        return 0
+    fi
+
+    local docker_bin jq_bin
+    docker_bin="$(command -v docker 2>/dev/null || true)"
+    [[ -n "$docker_bin" ]] \
+        || abort "docker CLI not found on host — install OrbStack or Docker Desktop first."
+    jq_bin="$(command -v jq 2>/dev/null || true)"
+    [[ -n "$jq_bin" ]] \
+        || abort "jq not found on host — the broker needs it (brew install jq)."
+    docker_broker_install "$docker_bin" "$jq_bin"
+
+    info ""
+    info "Docker broker enabled for '$SANDBOX_NAME':"
+    info "  Engine:  $docker_bin (runs as $HOST_USER; policy enforced host-side)"
+    info "  Socket:  $QS_PRIVATE_DIR/docker-broker.sock"
+    info "  Client:  qs-docker inside the sandbox — run / build / pull / ps / logs / stop"
+    info "  Policy:  mounts $SHARED_WORKSPACE only; caps dropped; 4g/4cpu limits;"
+    info "           image builds tagged under qs-$SANDBOX_NAME/; disable with: qs docker $SANDBOX_NAME off"
 }
 
 # Enter the sandbox: sanity-check the build artifacts, assemble the
@@ -1491,6 +1631,10 @@ main() {
         op-auth)
             ensure_built
             cmd_op_auth
+            ;;
+        docker)
+            ensure_built
+            cmd_docker
             ;;
         shell|claude)
             ensure_built

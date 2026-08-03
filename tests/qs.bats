@@ -107,6 +107,97 @@ qs_run() {
 
 
 ###############################################################################
+# build_session_command (in-sandbox zsh command assembly)
+###############################################################################
+
+@test "build_session_command assembles TMPDIR, cd, hooks and the logout trap" {
+    qs_run 'QUICKSAND_USER=qs-demo SHARED_WORKSPACE=/ws INITIAL_DIR=/ws/repos/proj
+            COMMAND=shell COMMAND_ARGS=()
+            build_session_command true; printf "%s" "$ZSH_COMMAND"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == "export TMPDIR="* ]]
+    [[ "$output" == *"cd /ws/repos/proj "* ]]
+    [[ "$output" == *"2>/dev/null || cd ~"* ]]
+    [[ "$output" == *"setopt null_glob"* ]]
+    [[ "$output" == *"/ws/_quicksand/profile.d/*.sh /ws/_quicksand/custom/profile.d/*.sh"* ]]
+    [[ "$output" == *"trap 'for s in /ws/_quicksand/logout.d/*.sh"*"' EXIT"* ]]
+}
+
+@test "build_session_command claude: bypass flag, zshrc source, tab label" {
+    qs_run 'QUICKSAND_USER=qs-demo SHARED_WORKSPACE=/ws INITIAL_DIR=
+            COMMAND=claude COMMAND_ARGS=(--resume abc)
+            build_session_command true
+            printf "%s\n%s" "$QS_SESSION_KIND" "$ZSH_COMMAND"'
+    [ "$status" -eq 0 ]
+    [ "${lines[0]}" == "Claude" ]
+    [[ "$output" == *"cd /Users/qs-demo "* ]]
+    [[ "$output" == *"[[ -r ~/.zshrc ]] && source ~/.zshrc; claude --dangerously-skip-permissions --resume abc"* ]]
+}
+
+@test "build_session_command one-off command: quoted payload, no tab label" {
+    qs_run 'QUICKSAND_USER=qs-demo SHARED_WORKSPACE=/ws INITIAL_DIR=
+            COMMAND=shell COMMAND_ARGS=(echo "a b")
+            build_session_command true
+            printf "[%s]\n%s" "$QS_SESSION_KIND" "$ZSH_COMMAND"'
+    [ "$status" -eq 0 ]
+    [ "${lines[0]}" == "[]" ]
+    [[ "$output" == *"source ~/.zshrc; echo a\\ b"* ]]
+}
+
+@test "build_session_command interactive shell: zsh -i, Shell label, no zshrc double-source" {
+    qs_run 'QUICKSAND_USER=qs-demo SHARED_WORKSPACE=/ws INITIAL_DIR=
+            COMMAND=shell COMMAND_ARGS=()
+            build_session_command true
+            printf "%s\n%s" "$QS_SESSION_KIND" "$ZSH_COMMAND"'
+    [ "$status" -eq 0 ]
+    [ "${lines[0]}" == "Shell" ]
+    [[ "$output" == *"; /bin/zsh -i" ]]
+    [[ "$output" != *"source ~/.zshrc"* ]]
+}
+
+@test "build_session_command piped stdin: plain zsh with zshrc sourced, no label" {
+    qs_run 'QUICKSAND_USER=qs-demo SHARED_WORKSPACE=/ws INITIAL_DIR=
+            COMMAND=shell COMMAND_ARGS=()
+            build_session_command false
+            printf "[%s]\n%s" "$QS_SESSION_KIND" "$ZSH_COMMAND"'
+    [ "$status" -eq 0 ]
+    [ "${lines[0]}" == "[]" ]
+    [[ "$output" == *"source ~/.zshrc; /bin/zsh" ]]
+}
+
+# The end-to-end check for all three quoting layers: actually run the
+# assembled command in zsh, with hooks and the initial dir under the test
+# tmpdir. HOME is overridden so no real ~/.zshrc is sourced.
+@test "assembled session command runs hooks, cds, round-trips args, fires the exit trap" {
+    mkdir -p "$BATS_TEST_TMPDIR/ws/_quicksand/profile.d" \
+             "$BATS_TEST_TMPDIR/ws/_quicksand/logout.d" \
+             "$BATS_TEST_TMPDIR/start dir"
+    printf '#!/bin/bash\necho profile-ran >> "%s"\n' "$STUB_LOG" \
+        > "$BATS_TEST_TMPDIR/ws/_quicksand/profile.d/10-t.sh"
+    printf '#!/bin/bash\necho logout-ran >> "%s"\n' "$STUB_LOG" \
+        > "$BATS_TEST_TMPDIR/ws/_quicksand/logout.d/10-t.sh"
+    chmod +x "$BATS_TEST_TMPDIR/ws/_quicksand/profile.d/10-t.sh" \
+             "$BATS_TEST_TMPDIR/ws/_quicksand/logout.d/10-t.sh"
+    # The tricky characters ride as an argv element — the assembly's
+    # guarantee is that COMMAND_ARGS survive exactly one zsh re-parse and
+    # arrive verbatim as arguments, not that they survive being spliced
+    # into yet another nested shell script.
+    qs_run 'QUICKSAND_USER=qs-demo
+            SHARED_WORKSPACE="$BATS_TEST_TMPDIR/ws"
+            INITIAL_DIR="$BATS_TEST_TMPDIR/start dir"
+            COMMAND=shell
+            COMMAND_ARGS=(/bin/sh -c "pwd; printf \"%s\n\" \"\$1\"" sh "it'\''s a b\$c")
+            build_session_command false
+            HOME="$BATS_TEST_TMPDIR" /bin/zsh -c "$ZSH_COMMAND"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"/start dir"* ]]
+    [[ "$output" == *"it's a b\$c"* ]]
+    grep -q profile-ran "$STUB_LOG"
+    grep -q logout-ran "$STUB_LOG"
+}
+
+
+###############################################################################
 # next_free_id (dscl stubbed)
 ###############################################################################
 

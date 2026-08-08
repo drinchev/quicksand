@@ -107,7 +107,7 @@ qs gcp-token NAME                        refresh the GCP access token (~1h)
 qs op-auth   NAME [--write]              provision a 1Password vault for secrets
 qs docker    NAME [off]                  let the sandbox run containers via a broker
 qs uninstall NAME                        remove the sandbox completely
-qs list                                  list sandboxes
+qs list                                  list sandboxes, their clones and memory repo
 
 Short aliases: b, s, cl, c, g, gp, gt, o, d, u, l.
 ```

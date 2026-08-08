@@ -1012,15 +1012,50 @@ EOF
 ###############################################################################
 # Commands
 ###############################################################################
+# Print the OWNER/REPO recorded for ENTRY_NAME in MANIFEST (clone and
+# memory manifests share the NAME\tOWNER/REPO\tLOCAL format), or nothing
+# if the manifest or entry is missing / the clone wasn't from GitHub.
+manifest_owner_repo() {
+    local manifest="$1" entry_name="$2" line rest
+    [[ -f "$manifest" ]] || return 0
+    while IFS= read -r line; do
+        [[ "$line" == "$entry_name"$'\t'* ]] || continue
+        rest="${line#*$'\t'}"
+        printf '%s' "${rest%%$'\t'*}"
+        return 0
+    done < "$manifest"
+}
+
 cmd_list() {
     echo "Sandboxes:"
-    local home name found=false
+    # The roots are fixed on macOS; the QS_LIST_* overrides exist only so
+    # the tests can point cmd_list at a fixture tree.
+    local homes="${QS_LIST_HOMES_DIR:-/Users}"
+    local shared="${QS_LIST_SHARED_DIR:-/Users/Shared}"
+    local install_dir="$HOME/.config/quicksand"
+    local home name found=false repo repo_name owner_repo
     shopt -s nullglob
-    for home in /Users/qs-*/; do
-        name="${home#/Users/qs-}"
+    for home in "$homes"/qs-*/; do
+        name="${home#"$homes"/qs-}"
         name="${name%/}"
         printf "  %s\n" "$name"
         found=true
+        # Clones live in the shared workspace (they survive rebuilds);
+        # the host-side manifest adds the GitHub OWNER/REPO when known.
+        for repo in "$shared/qs-$name/repos"/*/; do
+            repo_name="$(basename "$repo")"
+            owner_repo="$(manifest_owner_repo "$install_dir/clones-$name" "$repo_name")"
+            printf "    %s%s\n" "$repo_name" "${owner_repo:+ ($owner_repo)}"
+        done
+        if [[ -d "$shared/qs-$name/memory/.git" ]]; then
+            # The memory manifest holds exactly one entry (see cmd_memory);
+            # its second field is the OWNER/REPO.
+            owner_repo=""
+            if [[ -f "$install_dir/memory-$name" ]]; then
+                IFS=$'\t' read -r _ owner_repo _ < "$install_dir/memory-$name" || true
+            fi
+            printf "    memory%s\n" "${owner_repo:+ ($owner_repo)}"
+        fi
     done
     shopt -u nullglob
     [[ "$found" == "true" ]] || echo "  (none — run 'qs build <NAME>')"

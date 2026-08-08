@@ -223,15 +223,21 @@ storage`, and `bq` just work.
 **No downloadable keys.** Most GCP orgs enforce
 `constraints/iam.disableServiceAccountKeyCreation`, which blocks SA key files
 outright. quicksand sidesteps that entirely by using **impersonated tokens**
-instead of keys. The trade-off is lifetime: impersonated tokens last about an
-hour (and 1h is a hard cap unless an org admin allows lifetime extension).
+instead of keys. The trade-off is lifetime: impersonated tokens last an hour
+by default. `QS_GCP_TOKEN_LIFETIME` (`900`, `30m`, `2h`) changes that — set
+it once on any `qs gcp-auth`/`qs gcp-token`/launch and it's remembered per
+sandbox (`_quicksand/gcp-lifetime`). Values over `1h` require an org admin
+to allow `constraints/iam.allowServiceAccountCredentialLifetimeExtension`
+on the SA's project; without it GCP caps lifetimes at an hour and longer
+mints fail.
 
 quicksand handles the expiry for you in two ways:
 
 - **On launch:** every `qs shell`/`qs claude` mints a fresh token on the host
-  before entering (skipped if the current one is under ~50 min old, and
-  best-effort — a failed mint never blocks entry). So any session under an hour
-  needs nothing manual.
+  before entering (skipped while the current one is younger than the
+  lifetime minus a 10-minute margin, and best-effort — a failed mint never
+  blocks entry). So any session shorter than the token lifetime needs
+  nothing manual.
 - **Mid-session:** for a session that outlives its token, refresh from another
   host terminal — the sandbox re-reads the token file on every gcloud call, so
   it picks up the new one live, no re-entry:

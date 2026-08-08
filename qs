@@ -149,8 +149,10 @@ grants roles/viewer + roles/artifactregistry.reader on each PROJECT (override
 with QS_GCP_ROLES), lets your host impersonate the SA, mints a short-lived
 access token into the sandbox, and pins the first PROJECT as the default.
 'uninstall' unbinds the roles and deletes the SA. Downloadable keys are
-intentionally not used (orgs commonly disable them); the token lasts ~1h, so
-'gcp-token' re-mints one without redoing the SA/role setup.
+intentionally not used (orgs commonly disable them); the token lasts 1h by
+default, so 'gcp-token' re-mints one without redoing the SA/role setup.
+QS_GCP_TOKEN_LIFETIME ("900", "30m", "2h") changes the lifetime and is
+remembered per sandbox; over 1h needs an org policy allowing extension.
 
 'docker' lets the sandbox run containers on the host Docker engine (OrbStack,
 Docker Desktop) WITHOUT seeing the Docker socket — raw socket access would be

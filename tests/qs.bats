@@ -69,6 +69,56 @@ qs_run() {
 
 
 ###############################################################################
+# cmd_list (fixture roots via the QS_LIST_* test seams)
+###############################################################################
+
+@test "cmd_list shows each sandbox's clones and memory repo" {
+    mkdir -p "$BATS_TEST_TMPDIR/homes/qs-work" \
+             "$BATS_TEST_TMPDIR/homes/qs-toy" \
+             "$BATS_TEST_TMPDIR/shared/qs-work/repos/proj" \
+             "$BATS_TEST_TMPDIR/shared/qs-work/repos/tools" \
+             "$BATS_TEST_TMPDIR/shared/qs-work/memory/.git" \
+             "$BATS_TEST_TMPDIR/fakehome/.config/quicksand"
+    printf 'proj\tme/proj\t\n'  > "$BATS_TEST_TMPDIR/fakehome/.config/quicksand/clones-work"
+    printf 'tools\t\t/l/tools\n' >> "$BATS_TEST_TMPDIR/fakehome/.config/quicksand/clones-work"
+    printf 'agent-memory\tme/agent-memory\t\n' \
+        > "$BATS_TEST_TMPDIR/fakehome/.config/quicksand/memory-work"
+    qs_run 'HOME="$BATS_TEST_TMPDIR/fakehome"
+            QS_LIST_HOMES_DIR="$BATS_TEST_TMPDIR/homes"
+            QS_LIST_SHARED_DIR="$BATS_TEST_TMPDIR/shared"
+            cmd_list'
+    [ "$status" -eq 0 ]
+    [ "${lines[0]}" == "Sandboxes:" ]
+    [ "${lines[1]}" == "  toy" ]
+    [ "${lines[2]}" == "  work" ]
+    [ "${lines[3]}" == "    proj (me/proj)" ]
+    [ "${lines[4]}" == "    tools" ]
+    [ "${lines[5]}" == "    memory (me/agent-memory)" ]
+}
+
+@test "cmd_list survives a missing workspace and manifests" {
+    mkdir -p "$BATS_TEST_TMPDIR/homes/qs-bare" "$BATS_TEST_TMPDIR/shared" \
+             "$BATS_TEST_TMPDIR/fakehome"
+    qs_run 'HOME="$BATS_TEST_TMPDIR/fakehome"
+            QS_LIST_HOMES_DIR="$BATS_TEST_TMPDIR/homes"
+            QS_LIST_SHARED_DIR="$BATS_TEST_TMPDIR/shared"
+            cmd_list'
+    [ "$status" -eq 0 ]
+    [ "${lines[1]}" == "  bare" ]
+    [ "${#lines[@]}" -eq 2 ]
+}
+
+@test "cmd_list prints the none hint when no sandboxes exist" {
+    mkdir -p "$BATS_TEST_TMPDIR/homes"
+    qs_run 'QS_LIST_HOMES_DIR="$BATS_TEST_TMPDIR/homes"
+            QS_LIST_SHARED_DIR="$BATS_TEST_TMPDIR/shared"
+            cmd_list'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"(none — run 'qs build <NAME>')"* ]]
+}
+
+
+###############################################################################
 # validate_sandbox_name
 ###############################################################################
 

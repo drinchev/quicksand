@@ -32,6 +32,9 @@
 #   QS_VERBOSE       verbosity (0-3)
 # Pass-through:
 #   QS_GCP_ROLES     comma-separated roles overriding the provision defaults
+#   QS_GCP_TOKEN_LIFETIME
+#                    token lifetime ("900", "30m", "2h"); persisted to
+#                    gcp-lifetime on first use so refresh keeps honoring it
 #
 # Runs straight from the repo checkout like qs itself; nothing here is
 # baked into sandboxes, so edits don't trigger rebuilds.
@@ -56,6 +59,54 @@ QS_GCP_MANIFEST="$QS_INSTALL_DIR/gcp-$SANDBOX_NAME"
 # IAM roles granted on each target project by `provision`. Override
 # per-invocation with QS_GCP_ROLES="role1,role2".
 readonly QS_GCP_DEFAULT_ROLES=(roles/viewer roles/artifactregistry.reader)
+
+# Token lifetime. gcloud's default (and GCP's ceiling without the org
+# policy constraints/iam.allowServiceAccountCredentialLifetimeExtension,
+# which raises it to 12h) is 3600s. QS_GCP_TOKEN_LIFETIME — "900", "30m",
+# "2h" — overrides it; once seen it is persisted to
+# $QS_PRIVATE_DIR/gcp-lifetime so the launch-time auto-refresh keeps
+# minting (and freshness-checking) with the same lifetime without the
+# env var being set on every entry.
+readonly QS_GCP_DEFAULT_LIFETIME=3600
+QS_GCP_LIFETIME_FILE="$QS_PRIVATE_DIR/gcp-lifetime"
+
+# Normalize a lifetime spec (NN, NNs, NNm, NNh) to seconds. Prints the
+# seconds; fails on anything else or on zero.
+lifetime_to_seconds() {
+    local spec="$1" n unit
+    [[ "$spec" =~ ^([0-9]+)([smh]?)$ ]] \
+        || { warn "Bad QS_GCP_TOKEN_LIFETIME '$spec' — expected e.g. 900, 30m or 2h."; return 1; }
+    n="${BASH_REMATCH[1]}" unit="${BASH_REMATCH[2]}"
+    case "$unit" in
+        h) n=$(( n * 3600 )) ;;
+        m) n=$(( n * 60 )) ;;
+    esac
+    (( n > 0 )) || { warn "QS_GCP_TOKEN_LIFETIME must be positive."; return 1; }
+    printf '%s' "$n"
+}
+
+# Resolve the effective token lifetime in seconds: the env override wins
+# (and is persisted for future refreshes), else the persisted value, else
+# the default. Never fails — a bad env value warns and falls through.
+gcp_token_lifetime() {
+    local secs
+    if [[ -n "${QS_GCP_TOKEN_LIFETIME:-}" ]] \
+        && secs="$(lifetime_to_seconds "$QS_GCP_TOKEN_LIFETIME")"; then
+        if (( secs > 3600 )); then
+            warn "Lifetimes over 1h need the org policy constraints/iam.allowServiceAccountCredentialLifetimeExtension on the service account's project — minting will fail without it."
+        fi
+        mkdir -p "$QS_PRIVATE_DIR"
+        printf '%s\n' "$secs" > "$QS_GCP_LIFETIME_FILE"
+        printf '%s' "$secs"
+        return 0
+    fi
+    if [[ -f "$QS_GCP_LIFETIME_FILE" ]] \
+        && secs="$(lifetime_to_seconds "$(<"$QS_GCP_LIFETIME_FILE")" 2>/dev/null)"; then
+        printf '%s' "$secs"
+        return 0
+    fi
+    printf '%s' "$QS_GCP_DEFAULT_LIFETIME"
+}
 
 require_gcloud() {
     command -v gcloud >/dev/null 2>&1 \
@@ -83,35 +134,42 @@ gcp_sa_id_from_name() {
 # failure so callers decide whether it's fatal; a "quiet" second arg suppresses
 # the normal progress lines (used by the launch-time auto-refresh).
 gcp_mint_token() {
-    local sa_email="$1" quiet="${2:-}" token
-    [[ "$quiet" == quiet ]] || info "Minting access token for $sa_email (impersonation)..."
+    local sa_email="$1" quiet="${2:-}" token lifetime
+    lifetime="$(gcp_token_lifetime)"
+    [[ "$quiet" == quiet ]] || info "Minting access token for $sa_email (impersonation, ${lifetime}s)..."
     if ! token="$(gcloud auth print-access-token \
-            --impersonate-service-account="$sa_email" 2>/dev/null)" \
+            --impersonate-service-account="$sa_email" \
+            --lifetime="${lifetime}s" 2>/dev/null)" \
         || [[ -z "$token" ]]; then
-        warn "Could not mint a GCP token for $sa_email — confirm the host has roles/iam.serviceAccountTokenCreator on it."
+        warn "Could not mint a GCP token for $sa_email — confirm the host has roles/iam.serviceAccountTokenCreator on it$( (( lifetime > 3600 )) && printf '%s' ", and that the org allows lifetimes over 1h")."
         return 1
     fi
     mkdir -p "$QS_PRIVATE_DIR"
     local token_file="$QS_PRIVATE_DIR/gcp-token"
     ( umask 077; printf '%s\n' "$token" > "$token_file" )
     chmod 0600 "$token_file"
-    [[ "$quiet" == quiet ]] || info "Token written (valid ~1h) — refresh with: qs gcp-token $SANDBOX_NAME"
+    [[ "$quiet" == quiet ]] || info "Token written (valid ~$(( lifetime / 60 ))m) — refresh with: qs gcp-token $SANDBOX_NAME"
 }
 
 # Best-effort: refresh the sandbox's GCP token on the host just before entering
-# an interactive session, so it starts with a fresh ~1h credential. No-op for
-# sandboxes without GCP (no recorded SA). Skips when the current token is still
-# young (minted under 50 minutes ago) to avoid a needless API call on every
-# entry, and never blocks or fails the launch — minting needs host gcloud auth,
-# which may be offline or lapsed (in which case the existing token still works
-# until it expires, or this session simply has no GCP).
+# an interactive session, so it starts with a fresh credential. No-op for
+# sandboxes without GCP (no recorded SA). Skips when the current token is
+# still young — older than the lifetime minus a 10-minute margin counts as
+# stale (floor 5 minutes, so very short lifetimes still get a skip window)
+# — to avoid a needless API call on every entry, and never blocks or fails
+# the launch: minting needs host gcloud auth, which may be offline or
+# lapsed (in which case the existing token still works until it expires,
+# or this session simply has no GCP).
 gcp_auto_refresh() {
     local sa_file="$QS_PRIVATE_DIR/gcp-sa"
     [[ -f "$sa_file" ]] || return 0
     command -v gcloud >/dev/null 2>&1 || return 0
 
+    local fresh_mins
+    fresh_mins=$(( $(gcp_token_lifetime) / 60 - 10 ))
+    (( fresh_mins >= 5 )) || fresh_mins=5
     local token_file="$QS_PRIVATE_DIR/gcp-token"
-    if [[ -f "$token_file" && -z "$(find "$token_file" -mmin +50 2>/dev/null)" ]]; then
+    if [[ -f "$token_file" && -z "$(find "$token_file" -mmin "+$fresh_mins" 2>/dev/null)" ]]; then
         debug "GCP token is fresh; skipping launch refresh"
         return 0
     fi

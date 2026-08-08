@@ -908,7 +908,77 @@ gcloud_provision_stub() {
             gcp_mint_token qs-work@owner.iam.gserviceaccount.com'
     [ "$status" -eq 0 ]
     [ "$(cat "$PRIV/gcp-token")" == "ya29.minted" ]
-    grep -q "print-access-token --impersonate-service-account=qs-work@owner.iam.gserviceaccount.com" "$STUB_LOG"
+    grep -q "print-access-token --impersonate-service-account=qs-work@owner.iam.gserviceaccount.com --lifetime=3600s" "$STUB_LOG"
+}
+
+@test "QS_GCP_TOKEN_LIFETIME changes the mint lifetime and is persisted" {
+    make_stub gcloud 'echo "gcloud $*" >> "$STUB_LOG"
+        [[ "$1 $2" == "auth print-access-token" ]] && echo "ya29.short"
+        exit 0'
+    export PRIV="$BATS_TEST_TMPDIR/priv"
+    gcp_run 'PATH="$STUBS:$PATH"; QS_PRIVATE_DIR="$PRIV"
+            QS_GCP_LIFETIME_FILE="$PRIV/gcp-lifetime"
+            QS_GCP_TOKEN_LIFETIME=30m
+            gcp_mint_token qs-work@owner.iam.gserviceaccount.com'
+    [ "$status" -eq 0 ]
+    grep -q -- "--lifetime=1800s" "$STUB_LOG"
+    [ "$(cat "$PRIV/gcp-lifetime")" == "1800" ]
+}
+
+@test "a persisted lifetime is honored without the env var" {
+    make_stub gcloud 'echo "gcloud $*" >> "$STUB_LOG"
+        [[ "$1 $2" == "auth print-access-token" ]] && echo "ya29.x"
+        exit 0'
+    export PRIV="$BATS_TEST_TMPDIR/priv"; mkdir -p "$PRIV"
+    echo "900" > "$PRIV/gcp-lifetime"
+    gcp_run 'PATH="$STUBS:$PATH"; QS_PRIVATE_DIR="$PRIV"
+            QS_GCP_LIFETIME_FILE="$PRIV/gcp-lifetime"
+            gcp_mint_token qs-work@owner.iam.gserviceaccount.com'
+    [ "$status" -eq 0 ]
+    grep -q -- "--lifetime=900s" "$STUB_LOG"
+}
+
+@test "a bad QS_GCP_TOKEN_LIFETIME warns and falls back to the default" {
+    make_stub gcloud 'echo "gcloud $*" >> "$STUB_LOG"
+        [[ "$1 $2" == "auth print-access-token" ]] && echo "ya29.x"
+        exit 0'
+    export PRIV="$BATS_TEST_TMPDIR/priv"
+    gcp_run 'PATH="$STUBS:$PATH"; QS_PRIVATE_DIR="$PRIV"
+            QS_GCP_LIFETIME_FILE="$PRIV/gcp-lifetime"
+            QS_GCP_TOKEN_LIFETIME=soon
+            gcp_mint_token qs-work@owner.iam.gserviceaccount.com'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Bad QS_GCP_TOKEN_LIFETIME"* ]]
+    grep -q -- "--lifetime=3600s" "$STUB_LOG"
+    [ ! -f "$PRIV/gcp-lifetime" ]
+}
+
+@test "a lifetime over 1h warns about the org policy" {
+    make_stub gcloud '[[ "$1 $2" == "auth print-access-token" ]] && echo "ya29.x"; exit 0'
+    export PRIV="$BATS_TEST_TMPDIR/priv"
+    gcp_run 'PATH="$STUBS:$PATH"; QS_PRIVATE_DIR="$PRIV"
+            QS_GCP_LIFETIME_FILE="$PRIV/gcp-lifetime"
+            QS_GCP_TOKEN_LIFETIME=2h
+            gcp_mint_token qs-work@owner.iam.gserviceaccount.com'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"allowServiceAccountCredentialLifetimeExtension"* ]]
+}
+
+@test "refresh's freshness window follows the persisted lifetime" {
+    make_stub gcloud 'echo "gcloud $*" >> "$STUB_LOG"
+        [[ "$1 $2" == "auth print-access-token" ]] && echo "ya29.new"
+        exit 0'
+    export PRIV="$BATS_TEST_TMPDIR/priv"; mkdir -p "$PRIV"
+    printf 'qs-work@owner.iam.gserviceaccount.com\n' > "$PRIV/gcp-sa"
+    printf 'ya29.old\n' > "$PRIV/gcp-token"
+    # Token minted 2h ago: stale under the default 1h lifetime, but still
+    # fresh under a persisted 24h lifetime (window = 1430 min).
+    touch -t "$(date -v-2H +%Y%m%d%H%M)" "$PRIV/gcp-token"
+    echo "86400" > "$PRIV/gcp-lifetime"
+    gcp_exec refresh
+    [ "$status" -eq 0 ]
+    [ "$(cat "$PRIV/gcp-token")" == "ya29.old" ]
+    [ ! -f "$STUB_LOG" ] || ! grep -q "print-access-token" "$STUB_LOG"
 }
 
 @test "qs-auth-gcp mint requires a provisioned service account" {

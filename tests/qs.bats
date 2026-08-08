@@ -5,6 +5,10 @@
 # PATH where needed. Nothing here touches sudo or real sandboxes.
 
 setup() {
+    # qs refuses to load inside a quicksand session (its nested-sandbox
+    # guard); drop the marker so the suite runs in a sandbox too — where
+    # agents develop quicksand itself.
+    unset QS_SESSION_ID
     REPO_COPY="$BATS_TEST_TMPDIR/repo"
     mkdir -p "$REPO_COPY"
     cp "$BATS_TEST_DIRNAME/../qs" "$REPO_COPY/qs"
@@ -1394,4 +1398,80 @@ lib_run() {
     lib_run 'QMD="$STUBS/qmd"; ensure_collection /x --name bad'
     [ "$status" -ne 0 ]
     [[ "$output" == *"boom"* ]]
+}
+
+
+###############################################################################
+# host_default_browser / profile.d/70-default-browser.sh
+###############################################################################
+
+# Write a LaunchServices-prefs-shaped plist fixture; prints the path qs and
+# the hook expect (defaults(1) appends .plist to the file it creates).
+make_ls_prefs() {
+    local plist="$BATS_TEST_TMPDIR/ls-prefs"
+    defaults write "$plist" LSHandlers -array "$@"
+    echo "$plist"
+}
+
+@test "host_default_browser extracts the https handler bundle id" {
+    plist="$(make_ls_prefs \
+        '{ LSHandlerContentType = "public.html"; LSHandlerRoleAll = "org.mozilla.firefox"; }' \
+        '{ LSHandlerPreferredVersions = { LSHandlerRoleAll = "-"; }; LSHandlerRoleAll = "company.thebrowser.dia"; LSHandlerURLScheme = https; }' \
+        '{ LSHandlerRoleAll = "com.apple.dt.xcode"; LSHandlerURLScheme = xcode; }')"
+    qs_run "host_default_browser '$plist'"
+    [ "$status" -eq 0 ]
+    [ "$output" == "company.thebrowser.dia" ]
+}
+
+@test "host_default_browser fails when no https handler is recorded" {
+    plist="$(make_ls_prefs \
+        '{ LSHandlerContentType = "public.html"; LSHandlerRoleAll = "org.mozilla.firefox"; }')"
+    qs_run "host_default_browser '$plist'"
+    [ "$status" -ne 0 ]
+    [[ "$output" != *"org.mozilla.firefox"* ]]
+}
+
+@test "host_default_browser fails when the prefs plist is missing" {
+    qs_run "host_default_browser '$BATS_TEST_TMPDIR/absent'"
+    [ "$status" -ne 0 ]
+}
+
+# The hook tests point QS_LS_PREFS at a literal file: defaults(1) treats a
+# path under $HOME/Library/Preferences as a cfprefsd domain, so faking HOME
+# would make the hook write into the *invoking* user's real preferences.
+
+@test "70-default-browser no-ops when QS_HOST_BROWSER is unset" {
+    run env -u QS_HOST_BROWSER QS_LS_PREFS="$BATS_TEST_TMPDIR/prefs/ls" \
+        "$REPO_COPY/profile.d/70-default-browser.sh"
+    [ "$status" -eq 0 ]
+    [ ! -e "$BATS_TEST_TMPDIR/prefs" ]
+}
+
+@test "70-default-browser rejects a bundle id that could break the plist" {
+    run env QS_HOST_BROWSER='bad"; LSHandlerRoleAll = "oops' \
+        QS_LS_PREFS="$BATS_TEST_TMPDIR/prefs/ls" \
+        "$REPO_COPY/profile.d/70-default-browser.sh"
+    [ "$status" -eq 0 ]
+    [ ! -e "$BATS_TEST_TMPDIR/prefs" ]
+}
+
+@test "70-default-browser writes both schemes idempotently; parser reads it back" {
+    prefs="$BATS_TEST_TMPDIR/prefs/ls"
+    run env QS_HOST_BROWSER=company.thebrowser.dia QS_LS_PREFS="$prefs" \
+        "$REPO_COPY/profile.d/70-default-browser.sh"
+    [ "$status" -eq 0 ]
+    run defaults read "$prefs" LSHandlers
+    [[ "$output" == *"LSHandlerURLScheme = http;"* ]]
+    [[ "$output" == *"LSHandlerURLScheme = https;"* ]]
+    # A second run must take the already-configured early exit — proven by
+    # making a rewrite physically impossible (read-only prefs dir).
+    chmod -w "$BATS_TEST_TMPDIR/prefs"
+    run env QS_HOST_BROWSER=company.thebrowser.dia QS_LS_PREFS="$prefs" \
+        "$REPO_COPY/profile.d/70-default-browser.sh"
+    chmod +w "$BATS_TEST_TMPDIR/prefs"
+    [ "$status" -eq 0 ]
+    # Round-trip: the launcher-side detector parses what the hook wrote.
+    qs_run "host_default_browser '$prefs'"
+    [ "$status" -eq 0 ]
+    [ "$output" == "company.thebrowser.dia" ]
 }

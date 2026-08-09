@@ -388,6 +388,7 @@ sandbox (first run installs, later runs are no-ops):
 | `61-gcp-auth.sh` | point `gcloud`/`gsutil` at the impersonated token from `qs gcp-auth` |
 | `62-op-auth.sh` | export `OP_SERVICE_ACCOUNT_TOKEN` from the token staged by `qs op-auth` |
 | `63-docker-shim.sh` | install the `qs-docker` client staged by `qs docker` (or remove it when disabled) |
+| `70-default-browser.sh` | mirror the host's default browser (forwarded as `QS_HOST_BROWSER`) so URL opens — Claude Code's `/login`, `gh` web flows — don't fall back to Safari |
 
 After the `profile.d/` scripts run, the launcher sources the sandbox's
 `~/.zshrc` before starting the session — for `qs claude`, one-off `-- command`

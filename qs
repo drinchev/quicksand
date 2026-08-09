@@ -61,6 +61,27 @@ quote_zsh_args() {
     /bin/zsh -fc 'for arg; do printf "%s " "${(q)arg}"; done' -- "$@"
 }
 
+# Bundle id of the host user's default browser: the LSHandlerRoleAll of the
+# https entry in the LaunchServices prefs ($1 overrides the plist path for
+# tests). Parsing leans on `defaults read` printing dict keys alphabetically,
+# so within an entry a nested LSHandlerPreferredVersions block (whose "{"
+# resets the state) comes before LSHandlerRoleAll, which precedes
+# LSHandlerURLScheme. No https entry (Safari is the system fallback, never
+# recorded as a choice) or no readable plist → status 1, no output.
+# shellcheck disable=SC2120 # the plist-path arg is only passed by the tests
+host_default_browser() {
+    local plist="${1:-$HOME/Library/Preferences/com.apple.LaunchServices/com.apple.launchservices.secure}"
+    local id
+    id="$(defaults read "$plist" LSHandlers 2>/dev/null | awk '
+        /\{/                       { role = ""; scheme = "" }
+        /^ *LSHandlerRoleAll = /   { gsub(/[";]/, ""); role = $NF }
+        /^ *LSHandlerURLScheme = / { gsub(/[";]/, ""); scheme = $NF }
+        /\}/ && scheme == "https" && role != "" && role != "-" { print role; exit }
+    ')"
+    [[ -n "$id" ]] || return 1
+    printf '%s\n' "$id"
+}
+
 # Fingerprint of everything a build bakes into a sandbox: qs version, sandbox
 # profile template, the quicksand.md asset, canonical profile.d/ and logout.d/,
 # and the host-side custom overlay (contents, relative names, and file modes — the
@@ -1384,6 +1405,16 @@ cmd_launch() {
     QS_GIT_USER_EMAIL="$(git config --global --get user.email 2>/dev/null || true)"
     [[ -n "$QS_GIT_USER_NAME"  ]] && EXTRA_ENV+=("QS_GIT_USER_NAME=$QS_GIT_USER_NAME")
     [[ -n "$QS_GIT_USER_EMAIL" ]] && EXTRA_ENV+=("QS_GIT_USER_EMAIL=$QS_GIT_USER_EMAIL")
+
+    # Host default browser (the LaunchServices https handler bundle id),
+    # consumed by profile.d/70-default-browser.sh so URLs opened inside the
+    # sandbox (Claude Code's /login, gh) land in the host's browser instead
+    # of the fresh account's Safari fallback. Resolved at every invocation so
+    # a changed host default propagates on the next session.
+    local QS_HOST_BROWSER
+    # shellcheck disable=SC2119 # no arg: read the host user's own LS prefs
+    QS_HOST_BROWSER="$(host_default_browser || true)"
+    [[ -n "$QS_HOST_BROWSER" ]] && EXTRA_ENV+=("QS_HOST_BROWSER=$QS_HOST_BROWSER")
 
     # PATH inside the sandbox: only system binaries plus the sandbox user's
     # own install locations. Host Homebrew is intentionally *not* on this PATH

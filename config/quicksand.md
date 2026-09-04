@@ -11,6 +11,8 @@ home directory, files, or credentials.
 - No access: every other /Users/* home, /Volumes/*, and /Library/Keychains.
 
 ## GitHub access
+<!-- The authoritative permission list is the PAT URL in
+     libexec/qs-auth-gh — keep this description in sync with it. -->
 - Use the `gh` CLI for all GitHub API work: opening and commenting on pull
   requests, reading commits and branches, and reading or re-running CI.
 - `gh` is signed in (when `qs gh-auth` has been run) with a fine-grained token

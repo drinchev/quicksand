@@ -87,6 +87,10 @@ gh_token_setup() {
     url+="&description=$(url_encode "$desc")"
     url+="&target_name=$(url_encode "$owner")"
     url+="&expires_in=90"
+    # THE permission list — prose descriptions of it live in three more
+    # places: README (## GitHub API access), config/quicksand.md, and the
+    # gh-auth paragraph of `qs --help`. Changing it here means updating
+    # those too.
     url+="&contents=read&pull_requests=write&actions=write&checks=read&statuses=read&actions_variables=read"
 
     cat <<EOF

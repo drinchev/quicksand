@@ -9,7 +9,7 @@
 set -Eeuo pipefail
 trap 'echo >&2 "${BASH_SOURCE[0]}: line $LINENO: $BASH_COMMAND: exitcode $?"' ERR
 
-readonly VERSION="0.1.0"
+readonly VERSION="0.2.0"
 readonly SANDBOX_NAME_MAX_LEN=16
 
 # Resolve the directory holding qs (and its sibling profile.d/) following

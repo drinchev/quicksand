@@ -56,6 +56,9 @@ context between Claude Code instances and across sessions.
   every future session.
 - The index refreshes automatically at session start; run `qmd update` to
   make just-written notes searchable immediately.
+- A Stop hook may interject an end-of-session memory check when a long
+  session saved nothing. Treat it as a checklist: save what is genuinely
+  durable, otherwise just finish — never invent notes to satisfy it.
 
 ### Cross-sandbox memory
 

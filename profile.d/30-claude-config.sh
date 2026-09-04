@@ -10,8 +10,11 @@
 #                               build syncs in; refreshed every run.
 #   3. ~/.claude/CLAUDE.md     — the user-level memory file, which we touch only
 #                               to ensure it imports quicksand.md (@import).
+#   4. ~/.claude/settings.json — hooks (hooks can't be configured via
+#                               CLAUDE.md): a Stop hook that nudges the agent
+#                               to save durable context to shared memory.
 #
-# Idempotent. The onboarding file and CLAUDE.md are only created/extended, never
+# Idempotent. Every file is only created or minimally extended, never
 # clobbered, so manual edits (and Claude's own `#` memory writes) survive.
 set -Eeuo pipefail
 
@@ -41,4 +44,42 @@ if [[ -f "$src" ]]; then
     claude_md="$HOME/.claude/CLAUDE.md"
     touch "$claude_md"
     grep -qxF '@quicksand.md' "$claude_md" || printf '@quicksand.md\n' >> "$claude_md"
+fi
+
+# 4. settings.json — add the Stop hook. Created whole when missing; an
+# existing file (it holds user prefs like theme/model) is merged via
+# python3 instead of clobbered. Skipped once the hook is present.
+settings="$HOME/.claude/settings.json"
+hook_cmd="${SHARED_WORKSPACE:?}/_quicksand/hooks/stop-memory-nudge.sh"
+if [[ -x "$hook_cmd" ]] && ! grep -qs "stop-memory-nudge" "$settings"; then
+    if [[ ! -f "$settings" ]]; then
+        cat > "$settings" <<JSON
+{
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "$hook_cmd" }
+        ]
+      }
+    ]
+  }
+}
+JSON
+    elif ! SETTINGS="$settings" HOOK_CMD="$hook_cmd" /usr/bin/python3 <<'PY'
+import json, os
+
+path = os.environ["SETTINGS"]
+with open(path) as f:
+    data = json.load(f)
+data.setdefault("hooks", {}).setdefault("Stop", []).append(
+    {"hooks": [{"type": "command", "command": os.environ["HOOK_CMD"]}]}
+)
+with open(path, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+PY
+    then
+        echo "Could not add the memory Stop hook to $settings — add it manually or fix the file." >&2
+    fi
 fi

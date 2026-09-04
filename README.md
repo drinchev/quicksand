@@ -22,7 +22,8 @@ built from plain Unix primitives: user accounts, group ACLs, `sudo`, and
 - **Shared agent memory** — a per-sandbox `notes/` knowledge base in the
   shared workspace, indexed by [qmd](https://github.com/tobi/qmd) alongside
   Claude Code's auto-memory, so agent sessions keep context across runs
-  (shared host ↔ sandbox, never across sandboxes)
+  (shared host ↔ sandbox, never across sandboxes); a Stop hook nudges the
+  agent once when a long session is about to end without saving anything
 - **Cross-sandbox memory (opt-in)** — `qs memory` attaches a private GitHub
   "memory repo" cloned per sandbox with its own deploy key; agents share
   knowledge by opening PRs you merge, with commits authored per sandbox —

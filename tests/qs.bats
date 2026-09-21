@@ -1682,27 +1682,77 @@ run_say_hook() {
     [ ! -e "$SETTINGS" ]
 }
 
-@test "31-claude-say installs the client and seeds Notification + Stop hooks naming the sandbox" {
+@test "31-claude-say installs the client and seeds idle + attention Notification hooks, no Stop hook" {
     say_fixture
     run_say_hook
     [ "$status" -eq 0 ]
-    [[ "$output" == *"will speak when it needs you"* ]]
+    [[ "$output" == *"once it has been waiting on you"* ]]
     [ -x "$FAKE_HOME/.local/bin/qs-say" ]
     cmp "$REPO_COPY/config/qs-say" "$FAKE_HOME/.local/bin/qs-say"
     run jq -r '.hooks.Notification[0].matcher' "$SETTINGS"
-    [ "$output" == "permission_prompt|idle_prompt|agent_needs_input" ]
-    run jq -r '.hooks.Notification[0].hooks[0].command' "$SETTINGS"
-    [ "$output" == "$FAKE_HOME/.local/bin/qs-say \"work needs your attention\"" ]
-    run jq -r '.hooks.Stop[0].hooks[0] | .type + " " + .command' "$SETTINGS"
+    [ "$output" == "idle_prompt" ]
+    run jq -r '.hooks.Notification[0].hooks[0] | .type + " " + .command' "$SETTINGS"
     [ "$output" == "command $FAKE_HOME/.local/bin/qs-say \"work is waiting for your input\"" ]
+    run jq -r '.hooks.Notification[1].matcher' "$SETTINGS"
+    [ "$output" == "permission_prompt|agent_needs_input" ]
+    run jq -r '.hooks.Notification[1].hooks[0].command' "$SETTINGS"
+    [ "$output" == "$FAKE_HOME/.local/bin/qs-say \"work needs your attention\"" ]
+    # Stop fires after every response, background work or not — never seeded.
+    run jq -r '.hooks | has("Stop")' "$SETTINGS"
+    [ "$output" == "false" ]
 }
 
 @test "31-claude-say falls back to a neutral subject for an unsafe or missing name" {
     say_fixture
     run_say_hook 'bad"; rm -rf /; "'
     [ "$status" -eq 0 ]
-    run jq -r '.hooks.Stop[0].hooks[0].command' "$SETTINGS"
+    run jq -r '.hooks.Notification[0].hooks[0].command' "$SETTINGS"
     [ "$output" == "$FAKE_HOME/.local/bin/qs-say \"Claude is waiting for your input\"" ]
+}
+
+@test "31-claude-say migrates the first-release Stop + combined-Notification shape, keeping the user's hooks" {
+    say_fixture
+    mkdir -p "$(dirname "$SETTINGS")"
+    cat > "$SETTINGS" <<JSON
+{"model":"opus","hooks":{
+  "Stop":[{"hooks":[{"type":"command","command":"/x/other.sh"}]},
+          {"hooks":[{"type":"command","command":"$FAKE_HOME/.local/bin/qs-say \"work is waiting for your input\""}]}],
+  "Notification":[{"matcher":"permission_prompt|idle_prompt|agent_needs_input",
+                   "hooks":[{"type":"command","command":"$FAKE_HOME/.local/bin/qs-say \"work needs your attention\""}]},
+                  {"matcher":"idle_prompt","hooks":[{"type":"command","command":"/x/mine.sh"}]}]}}
+JSON
+    run_say_hook
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"qs-say hooks updated"* ]]
+    run jq -c '.hooks.Stop | map(.hooks[0].command)' "$SETTINGS"
+    [ "$output" == '["/x/other.sh"]' ]
+    run jq -c '.hooks.Notification | map(.matcher)' "$SETTINGS"
+    [ "$output" == '["idle_prompt","idle_prompt","permission_prompt|agent_needs_input"]' ]
+    run jq -r '.hooks.Notification[0].hooks[0].command' "$SETTINGS"
+    [ "$output" == "/x/mine.sh" ]
+    run jq -r '.model' "$SETTINGS"
+    [ "$output" == "opus" ]
+    # Migration is one-shot: a second run changes nothing.
+    cp "$SETTINGS" "$BATS_TEST_TMPDIR/migrated"
+    run_say_hook
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    cmp "$SETTINGS" "$BATS_TEST_TMPDIR/migrated"
+}
+
+@test "31-claude-say migration drops a qs-say Stop hook even when it was the only Stop entry" {
+    say_fixture
+    mkdir -p "$(dirname "$SETTINGS")"
+    cat > "$SETTINGS" <<JSON
+{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"$FAKE_HOME/.local/bin/qs-say \"work is waiting for your input\""}]}],
+          "Notification":[{"matcher":"idle_prompt","hooks":[{"type":"command","command":"$FAKE_HOME/.local/bin/qs-say \"work is waiting for your input\""}]}]}}
+JSON
+    run_say_hook
+    [ "$status" -eq 0 ]
+    run jq -r '.hooks | has("Stop")' "$SETTINGS"
+    [ "$output" == "false" ]
+    run jq -r '.hooks.Notification | length' "$SETTINGS"
+    [ "$output" == "1" ]
 }
 
 @test "31-claude-say merges into existing settings and hooks" {
@@ -1715,11 +1765,11 @@ run_say_hook() {
     run jq -r '.model' "$SETTINGS"
     [ "$output" == "opus" ]
     run jq -r '.hooks.Stop | length' "$SETTINGS"
-    [ "$output" == "2" ]
+    [ "$output" == "1" ]
     run jq -r '.hooks.Stop[0].hooks[0].command' "$SETTINGS"
     [ "$output" == "/x/other.sh" ]
     run jq -r '.hooks.Notification | length' "$SETTINGS"
-    [ "$output" == "1" ]
+    [ "$output" == "2" ]
 }
 
 @test "31-claude-say seeds once: reruns add nothing and a deleted entry stays deleted" {
@@ -1731,12 +1781,13 @@ run_say_hook() {
     [ "$status" -eq 0 ]
     [ -z "$output" ]
     cmp "$SETTINGS" "$BATS_TEST_TMPDIR/first"
-    # The user drops the Stop announcement but keeps the Notification one.
-    jq 'del(.hooks.Stop)' "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"
+    # The user drops the attention entry but keeps the idle one.
+    jq '.hooks.Notification |= map(select(.matcher == "idle_prompt"))' "$SETTINGS" \
+        > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"
     run_say_hook
     [ "$status" -eq 0 ]
-    run jq -r '.hooks | has("Stop")' "$SETTINGS"
-    [ "$output" == "false" ]
+    run jq -r '.hooks.Notification | length' "$SETTINGS"
+    [ "$output" == "1" ]
 }
 
 @test "31-claude-say refreshes an outdated client copy but leaves settings alone" {

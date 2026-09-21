@@ -60,6 +60,17 @@ fail()   { printf 'qs-docker: %s\n' "$1"; finish 125; }
 [[ -x "$DOCKER" ]] || fail "docker CLI not executable at $DOCKER — re-run 'qs docker $SANDBOX_NAME' on the host"
 [[ -x "$JQ" ]] || fail "jq not executable at $JQ — re-run 'qs docker $SANDBOX_NAME' on the host"
 
+# docker execs the credential helper named in the host's ~/.docker/config.json
+# (docker-credential-osxkeychain, ...) via $PATH, but launchd spawns this
+# broker with the bare system PATH — so pull (and the implicit pull in
+# run/build) dies with "docker-credential-... not found in $PATH", even for
+# public images. Prepend the directories engines install helpers into: the
+# CLI's own directory, its resolved location (the CLI is typically a
+# /usr/local/bin symlink into OrbStack/Docker Desktop), and /usr/local/bin.
+DOCKER_REAL="$(realpath -q "$DOCKER" 2>/dev/null || printf '%s' "$DOCKER")"
+PATH="$(dirname "$DOCKER"):$(dirname "$DOCKER_REAL"):/usr/local/bin:$PATH"
+export PATH
+
 IFS= read -r REQUEST || exit 0
 (( ${#REQUEST} <= 65536 )) || fail "request too large"
 

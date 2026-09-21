@@ -1321,6 +1321,16 @@ broker() {
     [[ "$output" != *"DOCKER:"* ]]
 }
 
+@test "docker broker puts the docker CLI's directory on PATH (credential helpers)" {
+    # docker resolves docker-credential-* helpers via $PATH; under launchd's
+    # bare PATH a pull would fail even for public images.
+    make_stub docker 'printf "PATH:%s\n" "$PATH"'
+    broker '{"v":1,"verb":"pull","image":"postgres:17-alpine"}'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"PATH:$STUBS:"* ]]
+    [[ "$output" == *":/usr/local/bin:"* ]]
+}
+
 
 ###############################################################################
 # qs docker — CLI plumbing and host-side helpers

@@ -40,6 +40,13 @@ readonly QS_LIBEXEC_DIR="$QS_REPO_DIR/libexec"
 readonly QS_DOCKER_BROKER_SOURCE="$QS_REPO_DIR/config/qs-docker-broker"
 readonly QS_DOCKER_SHIM_SOURCE="$QS_REPO_DIR/config/qs-docker"
 readonly QS_DOCKER_PLIST_TEMPLATE="$QS_REPO_DIR/config/com.quicksand.docker-broker.plist.tmpl"
+# Speech broker assets (see config/qs-say): the host-side broker that runs
+# `say` as the host user, the sandbox-side client, and the LaunchAgent
+# template that ties them together. Installed by every build — a sandbox
+# user has no GUI session and therefore no speech services of its own.
+readonly QS_SAY_BROKER_SOURCE="$QS_REPO_DIR/config/qs-say-broker"
+readonly QS_SAY_CLIENT_SOURCE="$QS_REPO_DIR/config/qs-say"
+readonly QS_SAY_PLIST_TEMPLATE="$QS_REPO_DIR/config/com.quicksand.say-broker.plist.tmpl"
 
 QS_VERBOSE="${QS_VERBOSE:-0}"
 abort() { echo >&2 "ERROR: $*"; exit 1; }
@@ -92,6 +99,9 @@ config_fingerprint() {
         echo "$VERSION"
         /usr/bin/shasum -a 256 < "$QS_SANDBOX_PROFILE_TEMPLATE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_QUICKSAND_MD" 2>/dev/null || true
+        /usr/bin/shasum -a 256 < "$QS_SAY_BROKER_SOURCE" 2>/dev/null || true
+        /usr/bin/shasum -a 256 < "$QS_SAY_CLIENT_SOURCE" 2>/dev/null || true
+        /usr/bin/shasum -a 256 < "$QS_SAY_PLIST_TEMPLATE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_DOCKER_BROKER_SOURCE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_DOCKER_SHIM_SOURCE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_DOCKER_PLIST_TEMPLATE" 2>/dev/null || true
@@ -364,6 +374,11 @@ derive_constants() {
     readonly QS_DOCKER_LABEL="com.quicksand.docker-broker.$SANDBOX_NAME"
     readonly QS_DOCKER_PLIST="$HOME/Library/LaunchAgents/$QS_DOCKER_LABEL.plist"
     readonly QS_DOCKER_BROKER_STAGED="$INSTALL_DIR/docker-broker-$SANDBOX_NAME.sh"
+    # Speech broker (see config/qs-say): same shape as the docker broker,
+    # but installed by every build rather than opted into.
+    readonly QS_SAY_LABEL="com.quicksand.say-broker.$SANDBOX_NAME"
+    readonly QS_SAY_PLIST="$HOME/Library/LaunchAgents/$QS_SAY_LABEL.plist"
+    readonly QS_SAY_BROKER_STAGED="$INSTALL_DIR/say-broker-$SANDBOX_NAME.sh"
     readonly HOST_USER="$USER"
     QS_SESSION_ID="$(/usr/bin/uuidgen)"
     readonly QS_SESSION_ID
@@ -425,11 +440,14 @@ configure_shared_folder_permissions() {
         trace "Configuring $SHARED_WORKSPACE ownership and ACLs"
         sudo /usr/sbin/chown -f -R "$HOST_USER:$QUICKSAND_GROUP" "$SHARED_WORKSPACE"
         sudo /bin/chmod 0770 "$SHARED_WORKSPACE"
+        # Sockets are skipped: macOS can't set ACLs on them ("Operation not
+        # supported on socket"), and the broker sockets launchd leaves in
+        # _quicksand/ (say.sock, docker-broker.sock) are already 0666.
         sudo find "$SHARED_WORKSPACE" \
             \( -type d -exec /bin/chmod -h +a "$QS_DIR_RIGHTS"          {} + \
                        -exec /bin/chmod -h +a "$QS_FILE_INHERIT_RIGHTS" {} + \) \
             -o \
-            \( ! -type d -exec /bin/chmod -h +a "$QS_FILE_RIGHTS"       {} + \)
+            \( ! -type d ! -type s -exec /bin/chmod -h +a "$QS_FILE_RIGHTS" {} + \)
     else
         trace "Restoring $SHARED_WORKSPACE to host user"
         sudo /usr/sbin/chown -f -R "$HOST_USER:$(id -gn)" "$SHARED_WORKSPACE"
@@ -631,6 +649,42 @@ cleanup_docker() {
             info "Removed this sandbox's images."
         fi
     fi
+}
+
+# Install (or refresh) the speech broker for this sandbox: stage the broker
+# script host-side (it runs as the host user, so the sandbox must never be
+# able to edit it), stage the qs-say client into the workspace for
+# profile.d/31-claude-say.sh to pick up, render the LaunchAgent and (re)load
+# it into the host's GUI session — the only session type whose launchd
+# domain carries the speech services a `say` needs. Best-effort: a host
+# without a GUI session (ssh) still builds, just without speech.
+say_broker_install() {
+    mkdir -p "$INSTALL_DIR"
+    /usr/bin/install -m 0755 "$QS_SAY_BROKER_SOURCE" "$QS_SAY_BROKER_STAGED"
+
+    mkdir -p "$QS_PRIVATE_DIR/bin"
+    /usr/bin/install -m 0755 "$QS_SAY_CLIENT_SOURCE" "$QS_PRIVATE_DIR/bin/qs-say"
+
+    mkdir -p "$HOME/Library/LaunchAgents"
+    sed -e "s|@SANDBOX_NAME@|$SANDBOX_NAME|g" \
+        -e "s|@BROKER_SCRIPT@|$QS_SAY_BROKER_STAGED|g" \
+        -e "s|@SHARED_WORKSPACE@|$SHARED_WORKSPACE|g" \
+        "$QS_SAY_PLIST_TEMPLATE" > "$QS_SAY_PLIST"
+
+    launchctl bootout "gui/$(id -u)/$QS_SAY_LABEL" 2>/dev/null || true
+    rm -f "$QS_PRIVATE_DIR/say.sock"
+    launchctl bootstrap "gui/$(id -u)" "$QS_SAY_PLIST" \
+        || warn "Failed to load the speech broker LaunchAgent — qs-say won't work in the sandbox. Inspect with: launchctl print gui/$(id -u)/$QS_SAY_LABEL"
+}
+
+# Undo what the build provisioned for speech: unload the LaunchAgent and
+# remove the staged broker, client, socket and log. Best-effort.
+cleanup_say() {
+    launchctl bootout "gui/$(id -u)/$QS_SAY_LABEL" 2>/dev/null || true
+    rm -f "$QS_SAY_PLIST" "$QS_SAY_BROKER_STAGED" \
+          "$INSTALL_DIR/say-broker-$SANDBOX_NAME.log" \
+          "${QS_PRIVATE_DIR:+$QS_PRIVATE_DIR/say.sock}" \
+          "${QS_PRIVATE_DIR:+$QS_PRIVATE_DIR/bin/qs-say}"
 }
 
 # Append a clone record to the manifest (see QS_CLONES_MANIFEST, or
@@ -987,6 +1041,12 @@ EOF
         --checksum --perms --times \
         "$QS_QUICKSAND_MD" "$QS_PRIVATE_DIR/quicksand.md"
 
+    # Speech: stage the qs-say client and (re)load the host-side broker —
+    # every build, so config/qs-say* changes (fingerprinted) roll out like
+    # profile.d changes.
+    debug "Installing speech broker"
+    say_broker_install
+
     # Per-session logout scripts (logout.d/) are the exit-time counterpart of
     # profile.d/: synced the same way and run as the sandbox user when the
     # session ends (see the EXIT trap in cmd_launch). Optional — unlike
@@ -1089,6 +1149,7 @@ cmd_uninstall() {
     cleanup_memory_artifacts
     run_all_auth_providers cleanup
     cleanup_docker
+    cleanup_say
 
     # Best-effort: tear down any running session for this sandbox user.
     # `|| true` swallows pipefail-induced ERR when the user is already

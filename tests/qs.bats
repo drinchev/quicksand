@@ -318,6 +318,14 @@ qs_run() {
     [ "$output" != "$before" ]
 }
 
+@test "config_fingerprint changes when the speech broker changes" {
+    qs_run 'QS_CUSTOM_DIR=/nonexistent; config_fingerprint'
+    local before="$output"
+    echo "# tweak" >> "$REPO_COPY/config/qs-say-broker"
+    qs_run 'QS_CUSTOM_DIR=/nonexistent; config_fingerprint'
+    [ "$output" != "$before" ]
+}
+
 @test "config_fingerprint changes when the sandbox profile template changes" {
     qs_run 'QS_CUSTOM_DIR=/nonexistent; config_fingerprint'
     local before="$output"
@@ -1524,4 +1532,282 @@ make_ls_prefs() {
     qs_run "host_default_browser '$prefs'"
     [ "$status" -eq 0 ]
     [ "$output" == "company.thebrowser.dia" ]
+}
+
+
+###############################################################################
+# configure_shared_folder_permissions (sudo stubbed to run the command as-is)
+###############################################################################
+
+# The ACL pass must skip Unix sockets: chmod +a fails on them ("Operation
+# not supported on socket"), and launchd leaves broker sockets in
+# _quicksand/. Run against a real fixture with a real socket; ACLs on the
+# regular file prove the pass still did its job.
+@test "workspace ACL pass skips sockets and still labels files" {
+    make_stub sudo 'exec "$@"'
+    # Short path: Unix socket paths are capped at 104 bytes, and
+    # $BATS_TEST_TMPDIR alone is longer than that.
+    export ACL_WS
+    ACL_WS="$(mktemp -d /tmp/qs-acl.XXXXXX)"
+    ws="$ACL_WS"
+    mkdir -p "$ws/_quicksand"
+    echo x > "$ws/_quicksand/file"
+    nc -lU "$ws/_quicksand/say.sock" &
+    listener=$!
+    for _ in $(seq 1 50); do [ -S "$ws/_quicksand/say.sock" ] && break; sleep 0.1; done
+    kill -9 "$listener" 2>/dev/null; wait "$listener" 2>/dev/null || true
+    [ -S "$ws/_quicksand/say.sock" ]
+    qs_run 'PATH="$STUBS:$PATH"; SHARED_WORKSPACE="$ACL_WS"
+            HOST_USER="$(id -un)"; QUICKSAND_GROUP=everyone
+            QS_DIR_RIGHTS="group:everyone allow read,search,list,directory_inherit"
+            QS_FILE_INHERIT_RIGHTS="group:everyone allow read,file_inherit"
+            QS_FILE_RIGHTS="group:everyone allow read"
+            configure_shared_folder_permissions true'
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"not supported on socket"* ]]
+    ls -le "$ws/_quicksand/file" | grep -q "group:everyone allow read"
+    rm -rf "$ws"
+}
+
+
+###############################################################################
+# Speech: config/qs-say-broker, config/qs-say, profile.d/31-claude-say.sh,
+# say_broker_install / cleanup_say
+###############################################################################
+
+# Run the broker as launchd would (request on stdin, socket = stdout) with
+# a stub `say` that records what it was given on stdin. HOME/lock/log are
+# pointed under the test tmpdir.
+say_broker() {
+    make_stub say 'printf "SAY:%s\n" "$(cat)" >> "$STUB_LOG"'
+    run bash -c "PATH=\"$STUBS:/usr/bin:/bin\" HOME=\"$BATS_TEST_TMPDIR\" \
+        QS_SAY_LOCK=\"$BATS_TEST_TMPDIR/lock\" QS_SAY_LOG=\"$BATS_TEST_TMPDIR/broker.log\" \
+        bash \"$REPO_COPY/config/qs-say-broker\" work <<< \"\$1\"" _ "$1"
+}
+
+@test "say broker speaks the line it was sent, via stdin, and logs it" {
+    say_broker "quicksand is waiting for your input"
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]                                  # nothing goes back to the client
+    grep -qx "SAY:quicksand is waiting for your input" "$STUB_LOG"
+    grep -q "quicksand is waiting for your input" "$BATS_TEST_TMPDIR/broker.log"
+    [ ! -d "$BATS_TEST_TMPDIR/lock" ]                 # lock released
+}
+
+@test "say broker strips control characters and caps the length" {
+    say_broker "$(printf 'hi\033]0;pwned\007 there\t!')"
+    [ "$status" -eq 0 ]
+    grep -qx "SAY:hi]0;pwned there!" "$STUB_LOG"
+    say_broker "$(printf 'x%.0s' $(seq 1 400))"
+    [ "$status" -eq 0 ]
+    # BSD grep caps {n} at 255, so measure the spoken line instead.
+    [ "$(awk '/^SAY:x+$/ { print length($0) - 4 }' "$STUB_LOG")" == "300" ]
+}
+
+@test "say broker ignores an empty or whitespace-only message" {
+    say_broker "   "
+    [ "$status" -eq 0 ]
+    [ ! -e "$STUB_LOG" ] || ! grep -q "^SAY:" "$STUB_LOG"
+}
+
+@test "say broker only ever gives say a single argv-free line" {
+    make_stub say 'printf "ARGS:%d\n" "$#" >> "$STUB_LOG"; cat >/dev/null'
+    run bash -c "PATH=\"$STUBS:/usr/bin:/bin\" HOME=\"$BATS_TEST_TMPDIR\" \
+        QS_SAY_LOCK=\"$BATS_TEST_TMPDIR/lock\" QS_SAY_LOG=\"$BATS_TEST_TMPDIR/broker.log\" \
+        bash \"$REPO_COPY/config/qs-say-broker\" work <<< '-v Zarvox --rm -rf'"
+    [ "$status" -eq 0 ]
+    grep -qx "ARGS:0" "$STUB_LOG"
+}
+
+@test "qs-say fails cleanly without a broker socket" {
+    run env SHARED_WORKSPACE="$BATS_TEST_TMPDIR/ws" QS_SANDBOX_NAME=work \
+        "$REPO_COPY/config/qs-say" hello
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"broker socket not found"* ]]
+    [[ "$output" == *"qs build work --rebuild"* ]]
+}
+
+@test "qs-say requires a message" {
+    run env QS_SAY_SOCK="$BATS_TEST_TMPDIR/none" "$REPO_COPY/config/qs-say"
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"usage: qs-say"* ]]
+}
+
+@test "qs-say delivers one flattened line over the socket" {
+    sock="$BATS_TEST_TMPDIR/say.sock"
+    # A one-shot listener standing in for launchd + broker; perl's alarm
+    # keeps a broken client from hanging the suite.
+    perl -e 'alarm 10; exec @ARGV' nc -lU "$sock" > "$BATS_TEST_TMPDIR/got" &
+    listener=$!
+    for _ in $(seq 1 50); do [ -S "$sock" ] && break; sleep 0.1; done
+    run perl -e 'alarm 10; exec @ARGV' env QS_SAY_SOCK="$sock" \
+        "$REPO_COPY/config/qs-say" "hello" "$(printf 'multi\nline')" "world"
+    wait "$listener" || true
+    [ "$status" -eq 0 ]
+    [ "$(cat "$BATS_TEST_TMPDIR/got")" == "hello multi line world" ]
+}
+
+# Fixture for the hook: a staged client under a fake workspace, a fake HOME
+# for the ~/.local/bin install, and QS_CLAUDE_SETTINGS pointing at a file
+# under that HOME (the seam exists so the suite never touches real settings).
+say_fixture() {
+    WS="$BATS_TEST_TMPDIR/ws"
+    FAKE_HOME="$BATS_TEST_TMPDIR/home"
+    SETTINGS="$FAKE_HOME/.claude/settings.json"
+    mkdir -p "$WS/_quicksand/bin" "$FAKE_HOME"
+    cp "$REPO_COPY/config/qs-say" "$WS/_quicksand/bin/qs-say"
+}
+
+run_say_hook() {
+    run env HOME="$FAKE_HOME" SHARED_WORKSPACE="$WS" QS_CLAUDE_SETTINGS="$SETTINGS" \
+        QS_SANDBOX_NAME="${1-work}" "$REPO_COPY/profile.d/31-claude-say.sh"
+}
+
+@test "31-claude-say no-ops when no client is staged" {
+    say_fixture
+    rm "$WS/_quicksand/bin/qs-say"
+    run_say_hook
+    [ "$status" -eq 0 ]
+    [ ! -e "$FAKE_HOME/.local" ]
+    [ ! -e "$SETTINGS" ]
+}
+
+@test "31-claude-say installs the client and seeds Notification + Stop hooks naming the sandbox" {
+    say_fixture
+    run_say_hook
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"will speak when it needs you"* ]]
+    [ -x "$FAKE_HOME/.local/bin/qs-say" ]
+    cmp "$REPO_COPY/config/qs-say" "$FAKE_HOME/.local/bin/qs-say"
+    run jq -r '.hooks.Notification[0].matcher' "$SETTINGS"
+    [ "$output" == "permission_prompt|idle_prompt|agent_needs_input" ]
+    run jq -r '.hooks.Notification[0].hooks[0].command' "$SETTINGS"
+    [ "$output" == "$FAKE_HOME/.local/bin/qs-say \"work needs your attention\"" ]
+    run jq -r '.hooks.Stop[0].hooks[0] | .type + " " + .command' "$SETTINGS"
+    [ "$output" == "command $FAKE_HOME/.local/bin/qs-say \"work is waiting for your input\"" ]
+}
+
+@test "31-claude-say falls back to a neutral subject for an unsafe or missing name" {
+    say_fixture
+    run_say_hook 'bad"; rm -rf /; "'
+    [ "$status" -eq 0 ]
+    run jq -r '.hooks.Stop[0].hooks[0].command' "$SETTINGS"
+    [ "$output" == "$FAKE_HOME/.local/bin/qs-say \"Claude is waiting for your input\"" ]
+}
+
+@test "31-claude-say merges into existing settings and hooks" {
+    say_fixture
+    mkdir -p "$(dirname "$SETTINGS")"
+    echo '{"model":"opus","hooks":{"Stop":[{"hooks":[{"type":"command","command":"/x/other.sh"}]}]}}' \
+        > "$SETTINGS"
+    run_say_hook
+    [ "$status" -eq 0 ]
+    run jq -r '.model' "$SETTINGS"
+    [ "$output" == "opus" ]
+    run jq -r '.hooks.Stop | length' "$SETTINGS"
+    [ "$output" == "2" ]
+    run jq -r '.hooks.Stop[0].hooks[0].command' "$SETTINGS"
+    [ "$output" == "/x/other.sh" ]
+    run jq -r '.hooks.Notification | length' "$SETTINGS"
+    [ "$output" == "1" ]
+}
+
+@test "31-claude-say seeds once: reruns add nothing and a deleted entry stays deleted" {
+    say_fixture
+    run_say_hook
+    [ "$status" -eq 0 ]
+    cp "$SETTINGS" "$BATS_TEST_TMPDIR/first"
+    run_say_hook
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    cmp "$SETTINGS" "$BATS_TEST_TMPDIR/first"
+    # The user drops the Stop announcement but keeps the Notification one.
+    jq 'del(.hooks.Stop)' "$SETTINGS" > "$SETTINGS.tmp" && mv "$SETTINGS.tmp" "$SETTINGS"
+    run_say_hook
+    [ "$status" -eq 0 ]
+    run jq -r '.hooks | has("Stop")' "$SETTINGS"
+    [ "$output" == "false" ]
+}
+
+@test "31-claude-say refreshes an outdated client copy but leaves settings alone" {
+    say_fixture
+    run_say_hook
+    echo "# stale" >> "$FAKE_HOME/.local/bin/qs-say"
+    cp "$SETTINGS" "$BATS_TEST_TMPDIR/first"
+    run_say_hook
+    [ "$status" -eq 0 ]
+    cmp "$REPO_COPY/config/qs-say" "$FAKE_HOME/.local/bin/qs-say"
+    cmp "$SETTINGS" "$BATS_TEST_TMPDIR/first"
+}
+
+@test "31-claude-say leaves a settings file that is not a JSON object untouched" {
+    say_fixture
+    mkdir -p "$(dirname "$SETTINGS")"
+    echo 'not json {' > "$SETTINGS"
+    run_say_hook
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"not a JSON object"* ]]
+    [ "$(cat "$SETTINGS")" == 'not json {' ]
+    [ -x "$FAKE_HOME/.local/bin/qs-say" ]
+}
+
+@test "say_broker_install stages, renders, and loads the agent" {
+    make_stub launchctl 'echo "launchctl $*" >> "$STUB_LOG"'
+    export WORK="$BATS_TEST_TMPDIR/work"
+    mkdir -p "$WORK"
+    qs_run 'PATH="$STUBS:$PATH"; SANDBOX_NAME=work
+            SHARED_WORKSPACE="$WORK/ws"; QS_PRIVATE_DIR="$WORK/ws/_quicksand"
+            INSTALL_DIR="$WORK/install"
+            QS_SAY_LABEL=com.quicksand.say-broker.work
+            QS_SAY_PLIST="$WORK/agent.plist"
+            QS_SAY_BROKER_STAGED="$WORK/install/say-broker-work.sh"
+            HOME="$WORK"
+            say_broker_install'
+    [ "$status" -eq 0 ]
+    [ -x "$WORK/install/say-broker-work.sh" ]
+    cmp "$REPO_COPY/config/qs-say-broker" "$WORK/install/say-broker-work.sh"
+    [ -x "$WORK/ws/_quicksand/bin/qs-say" ]
+    grep -q "<string>com.quicksand.say-broker.work</string>" "$WORK/agent.plist"
+    grep -q "<string>$WORK/install/say-broker-work.sh</string>" "$WORK/agent.plist"
+    grep -q "<string>work</string>" "$WORK/agent.plist"
+    grep -q "$WORK/ws/_quicksand/say.sock" "$WORK/agent.plist"
+    grep -q "launchctl bootstrap gui/$(id -u) $WORK/agent.plist" "$STUB_LOG"
+}
+
+@test "say_broker_install warns but succeeds when the agent can't be loaded" {
+    make_stub launchctl 'case "$1" in bootstrap) exit 1 ;; esac'
+    export WORK="$BATS_TEST_TMPDIR/work"
+    mkdir -p "$WORK"
+    qs_run 'PATH="$STUBS:$PATH"; SANDBOX_NAME=work
+            SHARED_WORKSPACE="$WORK/ws"; QS_PRIVATE_DIR="$WORK/ws/_quicksand"
+            INSTALL_DIR="$WORK/install"
+            QS_SAY_LABEL=com.quicksand.say-broker.work
+            QS_SAY_PLIST="$WORK/agent.plist"
+            QS_SAY_BROKER_STAGED="$WORK/install/say-broker-work.sh"
+            HOME="$WORK"
+            say_broker_install'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"WARNING: Failed to load the speech broker"* ]]
+    [ -x "$WORK/ws/_quicksand/bin/qs-say" ]
+}
+
+@test "cleanup_say unloads the agent and removes everything it staged" {
+    make_stub launchctl 'echo "launchctl $*" >> "$STUB_LOG"'
+    export WORK="$BATS_TEST_TMPDIR/work"
+    mkdir -p "$WORK/install" "$WORK/ws/_quicksand/bin"
+    touch "$WORK/agent.plist" "$WORK/install/say-broker-work.sh" \
+          "$WORK/install/say-broker-work.log" "$WORK/ws/_quicksand/bin/qs-say"
+    qs_run 'PATH="$STUBS:/usr/bin:/bin"; SANDBOX_NAME=work
+            QS_PRIVATE_DIR="$WORK/ws/_quicksand"
+            INSTALL_DIR="$WORK/install"
+            QS_SAY_LABEL=com.quicksand.say-broker.work
+            QS_SAY_PLIST="$WORK/agent.plist"
+            QS_SAY_BROKER_STAGED="$WORK/install/say-broker-work.sh"
+            cleanup_say'
+    [ "$status" -eq 0 ]
+    grep -q "launchctl bootout gui/$(id -u)/com.quicksand.say-broker.work" "$STUB_LOG"
+    [ ! -f "$WORK/agent.plist" ]
+    [ ! -f "$WORK/install/say-broker-work.sh" ]
+    [ ! -f "$WORK/install/say-broker-work.log" ]
+    [ ! -f "$WORK/ws/_quicksand/bin/qs-say" ]
 }

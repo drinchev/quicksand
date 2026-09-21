@@ -374,13 +374,20 @@ under `~/.config/quicksand/` and loads it as a socket-activated LaunchAgent
 works; launchd owns the socket (`_quicksand/say.sock`) and spawns one
 short-lived broker per message, so nothing runs while idle. Inside the
 sandbox, `profile.d/31-claude-say.sh` installs the `qs-say` client on the
-PATH and, once per sandbox, seeds two Claude Code hooks into the sandbox's
-`~/.claude/settings.json`:
+PATH and, once per sandbox, seeds two Claude Code `Notification` hooks into
+the sandbox's `~/.claude/settings.json`:
 
-| Hook | Says |
-|---|---|
-| `Notification` (`permission_prompt`, `idle_prompt`, `agent_needs_input`) | "NAME needs your attention" |
-| `Stop` | "NAME is waiting for your input" |
+| Matcher | Fires when | Says |
+|---|---|---|
+| `idle_prompt` | Claude finished about 60 s ago and you haven't typed | "NAME is waiting for your input" |
+| `permission_prompt`, `agent_needs_input` | a permission prompt or a background agent has been waiting on you | "NAME needs your attention" |
+
+Deliberately no `Stop` hook: `Stop` fires after *every* response — including
+when Claude ends a turn to let background agents run and will resume on its
+own — and its payload carries nothing that tells "waiting for you" from
+"turn over, work continues". `idle_prompt` is Claude Code's own idle
+detector; the minute's delay is the price of no false alarms. (Sandboxes
+seeded by the first release, which used `Stop`, are migrated automatically.)
 
 ```bash
 qs-say "build finished"        # from a sandbox shell, or from Claude
@@ -394,8 +401,8 @@ are serialized so overlapping calls queue rather than talk over each other,
 and the broker hangs up before speaking so hooks never wait for the speech.
 
 The hooks are seeded only while `settings.json` doesn't mention `qs-say`, so
-edits stick: delete the `Stop` entry if an announcement after every turn is
-too much, or both to go quiet. The broker is loaded per build; on a host
+edits stick: delete the attention entry if permission prompts shouldn't
+speak, or both to go quiet. The broker is loaded per build; on a host
 without a GUI session (building over ssh) the build warns and continues
 without speech.
 
@@ -419,7 +426,7 @@ sandbox (first run installs, later runs are no-ops):
 | `21-install-gh.sh` | install the GitHub CLI (`gh`) from its release tarball |
 | `22-install-op.sh` | install the 1Password CLI (`op`) from its release zip |
 | `30-claude-config.sh` | seed onboarding flags, plus a `~/.claude/CLAUDE.md` import of `config/quicksand.md` describing the sandbox boundary, `gh` access and credentials |
-| `31-claude-say.sh` | install `qs-say` and seed Claude Code hooks so the Mac says "`<sandbox>` is waiting for your input" when Claude needs you — see [Speech](#speech-from-the-sandbox-qs-say) |
+| `31-claude-say.sh` | install `qs-say` and seed Claude Code hooks so the Mac says "`<sandbox>` is waiting for your input" once Claude has been waiting on you — see [Speech](#speech-from-the-sandbox-qs-say) |
 | `40-gitconfig.sh` | seed the host's git identity + `safe.directory` |
 | `45-install-oh-my-zsh.sh` | Oh My Zsh + custom themes/plugins; disables auto-title so a manual tab name sticks |
 | `46-install-pnpm.sh` | pnpm + Node.js 24 (pnpm as the version manager) |

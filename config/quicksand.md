@@ -32,9 +32,10 @@ home directory, files, or credentials.
   Don't reach for them.
 - `qs-say "message"` speaks on the host instead, in the user's own voice
   (a host-side broker runs `say`). Claude Code is already hooked up to it
-  (Notification and Stop hooks in ~/.claude/settings.json announce
-  "<sandbox> is waiting for your input"), so don't call it after every
-  turn — use it when a long job the user is waiting on finishes.
+  (Notification hooks in ~/.claude/settings.json announce "<sandbox> is
+  waiting for your input" once you've been idle a minute), so don't call
+  it yourself after every turn — use it when a long job the user is
+  waiting on finishes.
 
 ## Shared memory (notes + qmd)
 

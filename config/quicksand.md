@@ -26,6 +26,16 @@ home directory, files, or credentials.
   (the gh token and, if configured, a short-lived GCP token).
 - Network access is unrestricted.
 
+## Getting the user's attention
+- `say`, `afplay` and `osascript -e beep` all exit 0 in silence here: this
+  account has no GUI session, so macOS's speech services never load for it.
+  Don't reach for them.
+- `qs-say "message"` speaks on the host instead, in the user's own voice
+  (a host-side broker runs `say`). Claude Code is already hooked up to it
+  (Notification and Stop hooks in ~/.claude/settings.json announce
+  "<sandbox> is waiting for your input"), so don't call it after every
+  turn — use it when a long job the user is waiting on finishes.
+
 ## Shared memory (notes + qmd)
 
 Sessions in this sandbox share a durable, searchable memory. Use it to keep

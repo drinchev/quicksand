@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- LaunchAgent for the qs speech broker (config/qs-say-broker). Rendered
+     per sandbox by every build (@SANDBOX_NAME@ etc. substituted) into
+     ~/Library/LaunchAgents/ and loaded into the host user's GUI session —
+     the only session type whose launchd domain carries the speech
+     services. launchd owns the socket and spawns one broker process per
+     connection (inetd nowait): nothing runs while idle, and the broker
+     script lives host-side where the sandbox can't rewrite it. -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.quicksand.say-broker.@SANDBOX_NAME@</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>@BROKER_SCRIPT@</string>
+        <string>@SANDBOX_NAME@</string>
+    </array>
+    <key>inetdCompatibility</key>
+    <dict>
+        <key>Wait</key>
+        <false/>
+    </dict>
+    <key>Sockets</key>
+    <dict>
+        <key>Listener</key>
+        <dict>
+            <key>SockFamily</key>
+            <string>Unix</string>
+            <key>SockPathName</key>
+            <string>@SHARED_WORKSPACE@/_quicksand/say.sock</string>
+            <!-- 0666 (438): connecting needs write on the socket file, and
+                 reaching it at all needs traversal through the 0770
+                 workspace — only the host user and this sandbox's user
+                 get that far. -->
+            <key>SockPathMode</key>
+            <integer>438</integer>
+        </dict>
+    </dict>
+</dict>
+</plist>

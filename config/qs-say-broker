@@ -1,0 +1,48 @@
+#!/bin/bash
+# qs-say-broker — host-side speech for one quicksand sandbox.
+#
+# Spawned by launchd per connection (inetd "nowait" style — see
+# config/com.quicksand.say-broker.plist.tmpl): stdin/stdout ARE the client
+# socket. Runs as the HOST user inside their GUI session, the only place
+# macOS text-to-speech works (see config/qs-say for why the sandbox user
+# can't). The client is the sandboxed agent and is UNTRUSTED: the text it
+# sends is never parsed by a shell or passed as an argument — control
+# characters are stripped, the length is capped, and what remains is piped
+# to `say` on stdin. The worst a hostile sandbox can do is make the Mac
+# say something.
+#
+# Protocol: one line of text. The broker closes the connection as soon as
+# it has read it, then speaks; messages are serialized through a lock so
+# overlapping calls queue instead of talking over each other.
+set -uo pipefail
+
+SANDBOX_NAME="${1:?usage: qs-say-broker NAME}"
+LOG_FILE="${QS_SAY_LOG:-$HOME/.config/quicksand/say-broker-$SANDBOX_NAME.log}"
+LOCK_DIR="${QS_SAY_LOCK:-${TMPDIR:-/tmp}/qs-say-$SANDBOX_NAME.lock}"
+MAX_BYTES=300
+
+# stderr goes to a host-side log, never to the client.
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+exec 2>>"$LOG_FILE"
+
+# Read one line, bounded in both time and size so a client that never
+# sends a newline can't hold a broker process open. Then hang up: closing
+# the socket fds ends the client's wait before any speech starts.
+REQUEST=""
+IFS= read -r -t 10 -n 4096 REQUEST || true
+exec <&- >&-
+
+MSG="$(printf '%s' "$REQUEST" | LC_ALL=C tr -d '\000-\037\177' | head -c "$MAX_BYTES")"
+[[ -n "${MSG//[[:space:]]/}" ]] || exit 0
+echo "$(date '+%F %T') $MSG" >&2
+
+# Serialize: wait up to ~20 s for the previous message to finish, then
+# speak regardless (a stuck lock must not silence the sandbox for good).
+have_lock=false
+for _ in $(seq 1 100); do
+    if mkdir "$LOCK_DIR" 2>/dev/null; then have_lock=true; break; fi
+    sleep 0.2
+done
+$have_lock && trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+
+printf '%s\n' "$MSG" | say >/dev/null

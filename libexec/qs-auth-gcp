@@ -60,9 +60,11 @@ QS_GCP_MANIFEST="$QS_INSTALL_DIR/gcp-$SANDBOX_NAME"
 # per-invocation with QS_GCP_ROLES="role1,role2".
 readonly QS_GCP_DEFAULT_ROLES=(roles/viewer roles/artifactregistry.reader)
 
-# Token lifetime. gcloud's default (and GCP's ceiling without the org
-# policy constraints/iam.allowServiceAccountCredentialLifetimeExtension,
-# which raises it to 12h) is 3600s. QS_GCP_TOKEN_LIFETIME — "900", "30m",
+# Token lifetime. gcloud's default (and GCP's ceiling) is 3600s. The org
+# policy constraints/iam.allowServiceAccountCredentialLifetimeExtension — a
+# list constraint whose allowed values name the *impersonated* service
+# accounts, i.e. the SA whose token is minted, not the caller — raises the
+# ceiling to 12h (43200s) for the listed SAs. QS_GCP_TOKEN_LIFETIME — "900", "30m",
 # "2h" — overrides it; once seen it is persisted to
 # $QS_PRIVATE_DIR/gcp-lifetime so the launch-time auto-refresh keeps
 # minting (and freshness-checking) with the same lifetime without the
@@ -92,8 +94,10 @@ gcp_token_lifetime() {
     local secs
     if [[ -n "${QS_GCP_TOKEN_LIFETIME:-}" ]] \
         && secs="$(lifetime_to_seconds "$QS_GCP_TOKEN_LIFETIME")"; then
-        if (( secs > 3600 )); then
-            warn "Lifetimes over 1h need the org policy constraints/iam.allowServiceAccountCredentialLifetimeExtension on the service account's project — minting will fail without it."
+        if (( secs > 43200 )); then
+            warn "QS_GCP_TOKEN_LIFETIME exceeds GCP's 12h (43200s) ceiling for impersonated tokens — minting will fail."
+        elif (( secs > 3600 )); then
+            warn "Lifetimes over 1h need the org policy constraints/iam.allowServiceAccountCredentialLifetimeExtension with the impersonated service account (the SA quicksand mints for, not the host identity) in its allow-list; that raises the ceiling to 12h. Minting will fail without it."
         fi
         mkdir -p "$QS_PRIVATE_DIR"
         printf '%s\n' "$secs" > "$QS_GCP_LIFETIME_FILE"
@@ -141,7 +145,7 @@ gcp_mint_token() {
             --impersonate-service-account="$sa_email" \
             --lifetime="${lifetime}s" 2>/dev/null)" \
         || [[ -z "$token" ]]; then
-        warn "Could not mint a GCP token for $sa_email — confirm the host has roles/iam.serviceAccountTokenCreator on it$( (( lifetime > 3600 )) && printf '%s' ", and that the org allows lifetimes over 1h")."
+        warn "Could not mint a GCP token for $sa_email — confirm the host has roles/iam.serviceAccountTokenCreator on it$( (( lifetime > 3600 )) && printf '%s' ", and that the org policy constraints/iam.allowServiceAccountCredentialLifetimeExtension lists $sa_email (lifetimes over 1h, up to 12h)")."
         return 1
     fi
     mkdir -p "$QS_PRIVATE_DIR"

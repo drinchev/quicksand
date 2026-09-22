@@ -226,10 +226,11 @@ outright. quicksand sidesteps that entirely by using **impersonated tokens**
 instead of keys. The trade-off is lifetime: impersonated tokens last an hour
 by default. `QS_GCP_TOKEN_LIFETIME` (`900`, `30m`, `2h`) changes that — set
 it once on any `qs gcp-auth`/`qs gcp-token`/launch and it's remembered per
-sandbox (`_quicksand/gcp-lifetime`). Values over `1h` require an org admin
-to allow `constraints/iam.allowServiceAccountCredentialLifetimeExtension`
-on the SA's project; without it GCP caps lifetimes at an hour and longer
-mints fail.
+sandbox (`_quicksand/gcp-lifetime`). GCP caps impersonated tokens at an
+hour; values over `1h` need an org admin to add the *impersonated* service
+account (the one quicksand mints for, not your own identity) to the
+allow-list of `constraints/iam.allowServiceAccountCredentialLifetimeExtension`,
+which raises the ceiling to 12h. Without it, longer mints fail.
 
 quicksand handles the expiry for you in two ways:
 

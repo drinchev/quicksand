@@ -1657,6 +1657,54 @@ say_broker() {
     [ "$(cat "$BATS_TEST_TMPDIR/got")" == "hello multi line world" ]
 }
 
+# 30-claude-config against a fake HOME and workspace; QS_CLAUDE_SETTINGS is
+# the same seam 31-claude-say uses, so the suite never touches real settings.
+run_claude_config() {
+    FAKE_HOME="$BATS_TEST_TMPDIR/home"
+    SETTINGS="$FAKE_HOME/.claude/settings.json"
+    mkdir -p "$FAKE_HOME" "$BATS_TEST_TMPDIR/ws/_quicksand"
+    run env HOME="$FAKE_HOME" SHARED_WORKSPACE="$BATS_TEST_TMPDIR/ws" \
+        QS_CLAUDE_SETTINGS="$SETTINGS" "$REPO_COPY/profile.d/30-claude-config.sh"
+}
+
+@test "30-claude-config seeds cleanupPeriodDays so session transcripts are kept" {
+    run_claude_config
+    [ "$status" -eq 0 ]
+    run jq -r '.cleanupPeriodDays' "$SETTINGS"
+    [ "$output" == "3650" ]
+}
+
+@test "30-claude-config adds cleanupPeriodDays to existing settings without disturbing them" {
+    mkdir -p "$BATS_TEST_TMPDIR/home/.claude"
+    echo '{"model":"opus","hooks":{"Stop":[{"hooks":[{"type":"command","command":"/x/mine.sh"}]}]}}' \
+        > "$BATS_TEST_TMPDIR/home/.claude/settings.json"
+    chmod 0600 "$BATS_TEST_TMPDIR/home/.claude/settings.json"
+    run_claude_config
+    [ "$status" -eq 0 ]
+    run jq -c '[.model, .hooks.Stop[0].hooks[0].command, .cleanupPeriodDays]' "$SETTINGS"
+    [ "$output" == '["opus","/x/mine.sh",3650]' ]
+    [ "$(stat -f '%Lp' "$SETTINGS")" == "600" ]
+}
+
+@test "30-claude-config never overrides a cleanupPeriodDays the user set" {
+    mkdir -p "$BATS_TEST_TMPDIR/home/.claude"
+    echo '{"cleanupPeriodDays":7}' > "$BATS_TEST_TMPDIR/home/.claude/settings.json"
+    run_claude_config
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+    run jq -c . "$SETTINGS"
+    [ "$output" == '{"cleanupPeriodDays":7}' ]
+}
+
+@test "30-claude-config leaves a settings.json that is not a JSON object alone" {
+    mkdir -p "$BATS_TEST_TMPDIR/home/.claude"
+    echo 'not json' > "$BATS_TEST_TMPDIR/home/.claude/settings.json"
+    run_claude_config
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"not a JSON object"* ]]
+    [ "$(cat "$SETTINGS")" == "not json" ]
+}
+
 # Fixture for the hook: a staged client under a fake workspace, a fake HOME
 # for the ~/.local/bin install, and QS_CLAUDE_SETTINGS pointing at a file
 # under that HOME (the seam exists so the suite never touches real settings).

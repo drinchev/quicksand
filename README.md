@@ -425,7 +425,7 @@ sandbox (first run installs, later runs are no-ops):
 | `20-install-claude.sh` | install Claude Code via its native installer |
 | `21-install-gh.sh` | install the GitHub CLI (`gh`) from its release tarball |
 | `22-install-op.sh` | install the 1Password CLI (`op`) from its release zip |
-| `30-claude-config.sh` | seed onboarding flags, plus a `~/.claude/CLAUDE.md` import of `config/quicksand.md` describing the sandbox boundary, `gh` access and credentials |
+| `30-claude-config.sh` | seed onboarding flags, plus a `~/.claude/CLAUDE.md` import of `config/quicksand.md` describing the sandbox boundary, `gh` access and credentials; set `cleanupPeriodDays` to 3650 in `~/.claude/settings.json` (only while unset) so Claude Code keeps session transcripts instead of deleting them after 30 days |
 | `31-claude-say.sh` | install `qs-say` and seed Claude Code hooks so the Mac says "`<sandbox>` is waiting for your input" once Claude has been waiting on you — see [Speech](#speech-from-the-sandbox-qs-say) |
 | `40-gitconfig.sh` | seed the host's git identity + `safe.directory` |
 | `45-install-oh-my-zsh.sh` | Oh My Zsh + custom themes/plugins; disables auto-title so a manual tab name sticks |

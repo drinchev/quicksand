@@ -10,10 +10,13 @@
 #                               build syncs in; refreshed every run.
 #   3. ~/.claude/CLAUDE.md     — the user-level memory file, which we touch only
 #                               to ensure it imports quicksand.md (@import).
-#   4. ~/.claude/settings.json — cleanupPeriodDays, so Claude Code keeps session
-#                               transcripts instead of deleting them after its
-#                               default 30 days (old sessions then vanish from
-#                               the resume picker).
+#   4. ~/.claude/settings.json — quicksand's defaults, from the
+#                               config/claude-settings.json template the build
+#                               syncs in. Each top-level key is added only
+#                               while absent. One of them, cleanupPeriodDays,
+#                               stops Claude Code deleting session transcripts
+#                               after its default 30 days (old sessions then
+#                               vanish from the resume picker).
 #
 # Idempotent. The onboarding file, CLAUDE.md and settings.json are only
 # created/extended, never clobbered, so manual edits (and Claude's own `#`
@@ -48,29 +51,41 @@ if [[ -f "$src" ]]; then
     grep -qxF '@quicksand.md' "$claude_md" || printf '@quicksand.md\n' >> "$claude_md"
 fi
 
-# 4. settings.json — keep session transcripts. Claude Code sweeps transcripts
-# older than cleanupPeriodDays (default 30) at startup; a sandbox is a
-# long-lived workspace whose history is worth resuming, so seed ~10 years.
-# Added only while the key is absent, so any value the user sets — a shorter
-# one included — sticks. A settings.json that isn't a JSON object is left
-# alone with a warning rather than risk clobbering it.
+# 4. settings.json — merge in the defaults from the claude-settings.json
+# template the build syncs into _quicksand/. settings.json is not ours alone:
+# Claude Code writes runtime state into it (/model, /theme, accepted prompts)
+# and the user edits it, so the template is never copied over it. Instead each
+# top-level key is added only while absent — whatever is already there wins,
+# and a new default added to the template still reaches existing sandboxes.
+# The merge is top-level only: hooks are seeded by their own scripts (see
+# 31-claude-say.sh), which need per-sandbox values and seed-once semantics.
+# A settings.json or template that isn't a JSON object is left alone with a
+# warning rather than risk clobbering anything.
 # QS_CLAUDE_SETTINGS overrides the settings path for tests.
 SETTINGS="${QS_CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
-RETENTION_DAYS=3650
+TEMPLATE="$SHARED_WORKSPACE/_quicksand/claude-settings.json"
+# Not staged (the build predates the template) — nothing to merge.
+[[ -f "$TEMPLATE" ]] || exit 0
 if ! command -v jq >/dev/null 2>&1; then
-    grep -qF '"cleanupPeriodDays"' "$SETTINGS" 2>/dev/null \
-        || echo "quicksand: jq not found — not setting cleanupPeriodDays in $SETTINGS (Claude Code will delete session transcripts after 30 days)" >&2
+    echo "quicksand: jq not found — not merging quicksand's defaults into $SETTINGS" >&2
+    exit 0
+fi
+if ! jq -e 'type == "object"' "$TEMPLATE" >/dev/null 2>&1; then
+    echo "quicksand: $TEMPLATE is not a JSON object — not merging it into $SETTINGS" >&2
     exit 0
 fi
 mkdir -p "$(dirname "$SETTINGS")"
 [[ -s "$SETTINGS" ]] || echo '{}' > "$SETTINGS"
 if ! jq -e 'type == "object"' "$SETTINGS" >/dev/null 2>&1; then
-    echo "quicksand: $SETTINGS is not a JSON object — not setting cleanupPeriodDays" >&2
+    echo "quicksand: $SETTINGS is not a JSON object — not merging quicksand's defaults into it" >&2
     exit 0
 fi
-if ! jq -e 'has("cleanupPeriodDays")' "$SETTINGS" >/dev/null 2>&1; then
+# Rewrite only when the template has a key the settings lack.
+if jq -e -s '(.[0] | keys) - (.[1] | keys) | length > 0' "$TEMPLATE" "$SETTINGS" >/dev/null 2>&1; then
     tmp="$(mktemp "$SETTINGS.XXXXXX")"
-    jq --argjson days "$RETENTION_DAYS" '.cleanupPeriodDays = $days' "$SETTINGS" > "$tmp"
+    # `+` is a shallow merge where the right side wins: existing settings
+    # override the template, key by key.
+    jq -s '.[0] + .[1]' "$TEMPLATE" "$SETTINGS" > "$tmp"
     # mktemp creates 0600; keep whatever mode the settings file already had.
     chmod "$(stat -f '%Lp' "$SETTINGS")" "$tmp"
     mv "$tmp" "$SETTINGS"

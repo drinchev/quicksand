@@ -1,0 +1,132 @@
+#!/bin/bash
+# qs-auth-broker — host-side credential refresh for one quicksand sandbox.
+#
+# `qs shell` / `qs claude` run the auth providers (libexec/qs-auth-*) on the
+# host just before entering a sandbox, which is how short-lived credentials
+# get there: the ~1h GCP token is re-minted, the 1Password token is read
+# from the host's own 1Password. A session that does not start from qs — an
+# SSH login (`qs ssh-auth`) — or one that simply outlives its token has no
+# host-side moment like that. This broker is that moment, on demand.
+#
+# Spawned by launchd per connection (inetd "nowait" style — see
+# config/com.quicksand.auth-broker.plist.tmpl): stdin/stdout ARE the client
+# socket. Runs as the HOST user inside their GUI session, where 1Password's
+# app integration and the host's gcloud login live. The client is the
+# sandboxed agent and is UNTRUSTED, so it gets to say exactly one thing —
+# "refresh" — and nothing it sends reaches a command line. The sandbox is
+# fixed by the LaunchAgent, not the request: all a hostile client can do is
+# ask the host to re-stage that sandbox's own credentials, which is what a
+# launch does anyway.
+#
+# Protocol: the client sends one line, `refresh`. The broker answers with
+# any provider messages (one per line, e.g. "unlock 1Password") and then a
+# final `done`. No `done` means the refresh did not complete.
+#
+# Requests are serialized through a lock; one that had to wait for another
+# to finish reuses that result instead of refreshing again, so a client
+# that logs in several times in a row triggers one refresh, not several.
+set -uo pipefail
+
+SANDBOX_NAME="${1:?usage: qs-auth-broker NAME}"
+LIBEXEC_DIR="${QS_AUTH_LIBEXEC:?qs-auth-broker is started by launchd, which sets QS_AUTH_LIBEXEC}"
+PRIVATE_DIR="${QS_AUTH_PRIVATE_DIR:?}"
+INSTALL_DIR="${QS_AUTH_INSTALL_DIR:-$HOME/.config/quicksand}"
+LOG_FILE="${QS_AUTH_LOG:-$INSTALL_DIR/auth-broker-$SANDBOX_NAME.log}"
+LOCK_DIR="${QS_AUTH_LOCK:-${TMPDIR:-/tmp}/qs-auth-$SANDBOX_NAME.lock}"
+# A provider can block on something only a person can clear (a 1Password
+# approval prompt on the host), so each one gets a deadline.
+PROVIDER_TIMEOUT="${QS_AUTH_PROVIDER_TIMEOUT:-30}"
+
+# stderr goes to a host-side log, never to the client.
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+exec 2>>"$LOG_FILE"
+log() { echo "$(date '+%F %T') $*" >&2; }
+
+# Send one line to the client, stripped of control characters and capped —
+# provider output is host-generated, but it ends up in a sandbox terminal.
+reply() { printf '%s\n' "$*" | LC_ALL=C tr -d '\000-\011\013-\037\177' | cut -c 1-500; }
+
+# Bounded in time and size so a client that never sends a newline can't
+# hold a broker process open.
+REQUEST=""
+IFS= read -r -t 10 -n 64 REQUEST || true
+if [[ "$REQUEST" != "refresh" ]]; then
+    log "rejected request"
+    reply "qs-auth-broker: unknown request"
+    exit 0
+fi
+
+# Serialize. Wait up to ~90 s for a refresh already in flight — long enough
+# for every provider to hit its deadline — then take the lock over: one
+# left behind by a killed broker must not block refreshes for good.
+waited=false
+have_lock=false
+for _ in $(seq 1 450); do
+    if mkdir "$LOCK_DIR" 2>/dev/null; then have_lock=true; break; fi
+    waited=true
+    sleep 0.2
+done
+if ! $have_lock; then
+    log "taking over stale lock $LOCK_DIR"
+    rmdir "$LOCK_DIR" 2>/dev/null || true
+    mkdir "$LOCK_DIR" 2>/dev/null || true
+    waited=false
+fi
+trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
+
+if $waited; then
+    log "refresh shared with a concurrent request"
+    reply "done"
+    exit 0
+fi
+
+if [[ ! -d "$LIBEXEC_DIR" ]]; then
+    log "provider directory missing: $LIBEXEC_DIR"
+    reply "quicksand's auth providers were not found on the host (was its checkout moved?) — rebuild there: qs build $SANDBOX_NAME --rebuild"
+    exit 0
+fi
+
+# Run one provider's `refresh` with the same environment contract qs gives
+# it (see run_auth_provider in qs), relaying what it prints. Its stdout and
+# stderr go to a file, not the socket: a child that outlives its deadline
+# must not keep the client's connection open.
+run_provider() {
+    local script="$1" name="${1##*/qs-auth-}" out pid watchdog rc line
+    out="$(mktemp "${TMPDIR:-/tmp}/qs-auth-out.XXXXXX")" || return 0
+    env QS_SANDBOX_NAME="$SANDBOX_NAME" \
+        QS_PRIVATE_DIR="$PRIVATE_DIR" \
+        QS_INSTALL_DIR="$INSTALL_DIR" \
+        QS_VERBOSE=0 \
+        "$script" refresh >"$out" 2>&1 </dev/null &
+    pid=$!
+    ( sleep "$PROVIDER_TIMEOUT"; pkill -P "$pid"; kill "$pid" ) >/dev/null 2>&1 </dev/null &
+    watchdog=$!
+    wait "$pid" 2>/dev/null
+    rc=$?
+    if kill -0 "$watchdog" 2>/dev/null; then
+        pkill -P "$watchdog" 2>/dev/null
+        kill "$watchdog" 2>/dev/null
+    else
+        rc=timeout
+    fi
+    wait "$watchdog" 2>/dev/null
+
+    while IFS= read -r line; do
+        [[ -n "$line" ]] || continue
+        log "$name: $line"
+        reply "$line"
+    done < <(head -c 4000 "$out")
+    rm -f "$out"
+    if [[ "$rc" == timeout ]]; then
+        log "$name: timed out after ${PROVIDER_TIMEOUT}s"
+        reply "WARNING: the host's $name credential refresh gave up after ${PROVIDER_TIMEOUT}s — it may be waiting for you to approve or unlock something on the host."
+    else
+        log "$name: refresh exit $rc"
+    fi
+}
+
+for script in "$LIBEXEC_DIR"/qs-auth-*; do
+    [[ -f "$script" && -x "$script" ]] || continue
+    run_provider "$script"
+done
+reply "done"

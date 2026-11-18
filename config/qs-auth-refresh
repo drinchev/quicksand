@@ -1,0 +1,61 @@
+#!/bin/zsh -f
+# qs-auth-refresh — ask the host to re-stage this sandbox's credentials.
+#
+# Short-lived credentials are put into a sandbox by the host: the GCP access
+# token (valid ~1h) and the 1Password service-account token are staged by
+# `qs shell` / `qs claude` just before the session starts. Run this when
+# that moment never happened or was too long ago — after an SSH login
+# (profile.d/11-auth-refresh.sh does it for you), or when a long session's
+# GCP token has expired:
+#
+#   qs-auth-refresh
+#
+# It sends the single word "refresh" to a host-side broker
+# (config/qs-auth-broker) over a Unix socket in _quicksand/. The broker runs
+# the same providers a launch runs, as the host user, and reports anything
+# that needs you — e.g. 1Password being locked on the host. Nothing else can
+# be asked of it.
+#
+# gcloud picks a new GCP token up at once (it reads the staged file on every
+# call). OP_SERVICE_ACCOUNT_TOKEN is an environment variable, so shells that
+# are already running keep the old value; new shells load the new one, or:
+#
+#   export OP_SERVICE_ACCOUNT_TOKEN="$(<"$SHARED_WORKSPACE/_quicksand/op-token")"
+#
+# zsh rather than bash for zsh/net/socket: `nc -U` hangs up as soon as its
+# stdin ends, before the host has answered.
+#
+# Staged into _quicksand/bin/ by the build and installed onto the sandbox
+# PATH by profile.d/11-auth-refresh.sh.
+
+sock="${QS_AUTH_SOCK:-${SHARED_WORKSPACE:?SHARED_WORKSPACE not set}/_quicksand/auth.sock}"
+# Longer than the broker's own worst case, so its answer wins the race.
+timeout="${QS_AUTH_REFRESH_TIMEOUT:-100}"
+
+if [[ ! -S $sock ]]; then
+    print -u2 -r -- "qs-auth-refresh: broker socket not found at $sock — rebuild the sandbox on the host: qs build ${QS_SANDBOX_NAME:-NAME} --rebuild"
+    exit 1
+fi
+
+zmodload zsh/net/socket || exit 1
+if ! zsocket $sock 2>/dev/null; then
+    print -u2 -r -- "qs-auth-refresh: the host's credential broker is not answering — it only runs while the host user is logged in to the Mac's desktop."
+    exit 1
+fi
+fd=$REPLY
+print -u $fd refresh
+
+completed=false
+while IFS= read -r -t $timeout -u $fd line; do
+    if [[ $line == done ]]; then
+        completed=true
+        break
+    fi
+    print -u2 -r -- "quicksand: $line"
+done
+exec {fd}>&-
+
+if ! $completed; then
+    print -u2 -r -- "qs-auth-refresh: the host did not finish refreshing credentials — see ~/.config/quicksand/auth-broker-${QS_SANDBOX_NAME:-NAME}.log on the host."
+    exit 1
+fi

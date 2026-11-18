@@ -274,9 +274,11 @@ vault and is independently **revocable and expiring**.
 
 On every launch, the host reads the token from your 1Password into a transient
 `_quicksand/op-token` (`0600`), which `62-op-auth.sh` exports as
-`OP_SERVICE_ACCOUNT_TOKEN`; `15-op-token.sh` removes it again at session exit.
-So the token is sourced fresh from 1Password each session and **never persists
-in the sandbox between sessions**. Inside the sandbox:
+`OP_SERVICE_ACCOUNT_TOKEN`; `15-op-token.sh` removes it again when the last
+session of the sandbox exits. So the token is sourced fresh from 1Password each
+session and **never persists in the sandbox between sessions**. Sessions that
+don't start from `qs` get it the same way, through the
+[credential broker](#credentials-on-demand-qs-auth-refresh). Inside the sandbox:
 
 ```bash
 op read "op://qs-NAME/<item>/<field>"     # one field to stdout
@@ -427,16 +429,73 @@ applies to any account named `qs-*`, quicksand's or not.
 
 Things that differ from a local session:
 
-- **Host-staged credentials aren't refreshed.** `qs shell`/`qs claude` run the
-  auth providers on the host before entering; sshd doesn't. The `gh` token is
-  a file and keeps working, but a GCP token expires (`qs gcp-token NAME` on
-  the host) and the 1Password token is only present while it has been staged
-  by a local launch.
+- **Host-staged credentials come through a broker.** `qs shell`/`qs claude`
+  run the auth providers on the host before entering; sshd doesn't. An SSH
+  session asks the host's [credential
+  broker](#credentials-on-demand-qs-auth-refresh) instead, which only answers
+  while you are logged in to the Mac's desktop — and 1Password has to be
+  unlocked there, as for a local launch.
 - **Hook output goes to stderr** for anything but a plain interactive login,
   and hooks get no stdin, so they can't corrupt or swallow a protocol stream.
   The hooks add roughly a second to each connection.
 - **`-x`/`--no-sandbox` has no SSH equivalent** — SSH sessions are always
   sandboxed.
+
+## Credentials on demand (`qs-auth-refresh`)
+
+Two credentials are deliberately short-lived and put into a sandbox *by the
+host*: the GCP access token (valid about an hour) and the 1Password
+service-account token (staged per session, never stored). `qs shell` and
+`qs claude` stage them just before entering. That leaves two gaps: a session
+that doesn't start from `qs` — an SSH login — never gets them, and a session
+that runs longer than an hour outlives its GCP token.
+
+A host-side broker closes both. Every build stages `config/qs-auth-broker`
+under `~/.config/quicksand/` and loads it as a socket-activated LaunchAgent
+(`com.quicksand.auth-broker.NAME`) in your GUI session, with its socket in the
+workspace. Inside the sandbox:
+
+```bash
+qs-auth-refresh     # ask the host to re-stage this sandbox's credentials
+```
+
+SSH sessions run it automatically at login (`profile.d/11-auth-refresh.sh`),
+before `~/.zshrc` is sourced, so they start with the same credentials a local
+session has. In a long session, run it yourself when `gcloud` starts failing;
+`gcloud` picks the new token up immediately. `OP_SERVICE_ACCOUNT_TOKEN` is an
+environment variable, so shells already running keep the old value — new
+shells get the new one.
+
+The broker runs the same providers (`libexec/qs-auth-*`) with the same
+`refresh` a launch runs, as you:
+
+- **The sandbox can ask for exactly one thing.** The request is the single
+  word `refresh`; nothing the sandbox sends reaches a command line, and which
+  sandbox is refreshed is fixed by the LaunchAgent, not the request. The worst
+  a hostile sandbox can do is make the host re-stage that sandbox's own
+  credentials — and, if 1Password is locked, make it ask you to unlock.
+- **It reports what needs you.** Provider messages ("unlock 1Password", a
+  lapsed `gcloud` login) are relayed to the session's stderr. Each provider
+  has 30 seconds; one that is waiting for an approval nobody gives is abandoned
+  with a note, and the session continues without that credential.
+- **A burst of logins is one refresh.** Requests are serialized, and one that
+  had to wait for another reuses its result. The GCP provider additionally
+  skips a token younger than 50 minutes.
+- **It needs your desktop session.** 1Password's app integration and your
+  `gcloud` login live there; with nobody logged in to the Mac the socket has
+  no listener, and SSH sessions say so and carry on.
+
+launchd gives agents a bare `PATH`, so the `PATH` of the shell that built the
+sandbox is pinned into the agent — that is where `op` and `gcloud` are looked
+up. If you install either later, rebuild (`qs build NAME -r`). Other
+environment from your shell (a custom `CLOUDSDK_CONFIG`, an `op` session
+variable) is not carried over. Requests are logged to
+`~/.config/quicksand/auth-broker-NAME.log`.
+
+Because sessions now overlap in ways that matter — a local `qs claude` beside
+an SSH login, or the several short logins an SSH client makes — sessions
+record themselves in `_quicksand/sessions/`, and the 1Password token is removed
+only when the last one exits.
 
 ## Speech from the sandbox (`qs-say`)
 
@@ -521,7 +580,7 @@ Hooks are not part of the template — the merge is top-level only, and the
 
 The install marker stores a fingerprint of everything a build bakes into a
 sandbox: the qs version, the `sandbox-exec` profile template, `profile.d/`,
-`logout.d/`, the `quicksand.md` and `claude-settings.json` assets, the speech broker assets, the SSH session wrapper and sshd templates, and your personal overlay — contents, names, and file modes. When any of it
+`logout.d/`, the `quicksand.md` and `claude-settings.json` assets, the speech and credential broker assets, the SSH session wrapper and sshd templates, and your personal overlay — contents, names, and file modes. When any of it
 changes (a `git pull` of this repo, an edit to your overlay), the next
 `qs shell`/`qs claude` rebuilds the sandbox automatically and tells you why.
 
@@ -532,7 +591,9 @@ sandbox (first run installs, later runs are no-ops):
 
 | Script | Purpose |
 |---|---|
+| `05-session-register.sh` | record the running session, so the 1Password token is only removed when the last one exits |
 | `10-keychain.sh` | create/unlock a login keychain (fresh users have none) |
+| `11-auth-refresh.sh` | install `qs-auth-refresh`; in an SSH session, ask the host for fresh credentials — see [Credentials on demand](#credentials-on-demand-qs-auth-refresh) |
 | `20-install-claude.sh` | install Claude Code via its native installer |
 | `21-install-gh.sh` | install the GitHub CLI (`gh`) from its release tarball |
 | `22-install-op.sh` | install the 1Password CLI (`op`) from its release zip |
@@ -602,7 +663,8 @@ existing sandboxes automatically on next entry.
 | SSH wrapper & authorized keys (`qs ssh-auth`) | `/var/quicksand/ssh-qs-NAME/` |
 | sshd `Match` block (`qs ssh-auth`) | `/etc/ssh/sshd_config.d/010-quicksand-qs-NAME.conf` |
 | sshd default rule for all sandboxes | `/etc/ssh/sshd_config.d/020-quicksand-default.conf` |
-| Install marker, clone & GCP manifests | `~/.config/quicksand/` |
+| Credential & speech broker sockets | `/Users/Shared/qs-NAME/_quicksand/auth.sock`, `say.sock` |
+| Install marker, clone & GCP manifests, staged brokers & their logs | `~/.config/quicksand/` |
 
 Sandbox names: up to 16 characters, `[A-Za-z0-9_-]+`.
 

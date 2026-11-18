@@ -2410,3 +2410,278 @@ session_hook() {
     [[ "$output" == *"only serves qs-someone-else"* ]]
     [[ "$output" != *"should-not-run"* ]]
 }
+
+
+###############################################################################
+# credential broker — config/qs-auth-broker run directly (stdin/stdout stand
+# in for the client socket) against a directory of stub providers
+###############################################################################
+
+# auth_fixture — a libexec dir of stub providers under $WORK. Each test adds
+# the providers it needs with auth_provider NAME BODY.
+auth_fixture() {
+    export WORK="$BATS_TEST_TMPDIR/work"
+    mkdir -p "$WORK/libexec" "$WORK/priv" "$WORK/install"
+}
+
+auth_provider() {
+    printf '#!/bin/bash\n%s\n' "$2" > "$WORK/libexec/qs-auth-$1"
+    chmod +x "$WORK/libexec/qs-auth-$1"
+}
+
+# run_auth_broker REQUEST — one broker invocation, as launchd would spawn it.
+run_auth_broker() {
+    run env QS_AUTH_LIBEXEC="$WORK/libexec" QS_AUTH_PRIVATE_DIR="$WORK/priv" \
+            QS_AUTH_INSTALL_DIR="$WORK/install" QS_AUTH_LOG="$WORK/broker.log" \
+            QS_AUTH_LOCK="$WORK/lock" QS_AUTH_PROVIDER_TIMEOUT="${AUTH_TIMEOUT:-10}" \
+            bash -c 'printf "%s\n" "$1" | "$REPO_COPY/config/qs-auth-broker" work' _ "$1"
+}
+
+@test "auth broker runs every provider's refresh with the qs environment contract" {
+    auth_fixture
+    auth_provider one 'echo "$1 $QS_SANDBOX_NAME $QS_PRIVATE_DIR $QS_INSTALL_DIR" > "$QS_PRIVATE_DIR/one"'
+    auth_provider two 'echo "$1" > "$QS_PRIVATE_DIR/two"'
+    run_auth_broker refresh
+    [ "$status" -eq 0 ]
+    [ "$output" == "done" ]
+    [ "$(cat "$WORK/priv/one")" == "refresh work $WORK/priv $WORK/install" ]
+    [ "$(cat "$WORK/priv/two")" == "refresh" ]
+    [ ! -d "$WORK/lock" ]
+}
+
+@test "auth broker relays provider messages and still completes when one fails" {
+    auth_fixture
+    auth_provider aaa 'echo "WARNING: unlock 1Password" >&2; exit 3'
+    auth_provider bbb 'echo "Refreshing GCP access token..."'
+    run_auth_broker refresh
+    [ "$status" -eq 0 ]
+    [ "${lines[0]}" == "WARNING: unlock 1Password" ]
+    [ "${lines[1]}" == "Refreshing GCP access token..." ]
+    [ "${lines[2]}" == "done" ]
+    grep -q "aaa: refresh exit 3" "$WORK/broker.log"
+}
+
+@test "auth broker accepts no request but 'refresh'" {
+    auth_fixture
+    auth_provider one 'touch "$QS_PRIVATE_DIR/ran"'
+    run_auth_broker 'refresh; rm -rf /'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"unknown request"* ]]
+    [[ "$output" != *"done"* ]]
+    [ ! -e "$WORK/priv/ran" ]
+    run_auth_broker 'provision'
+    [[ "$output" != *"done"* ]]
+    [ ! -e "$WORK/priv/ran" ]
+}
+
+@test "auth broker gives up on a provider that blocks, and says so" {
+    auth_fixture
+    auth_provider slow 'sleep 30'
+    auth_provider next 'touch "$QS_PRIVATE_DIR/next-ran"'
+    AUTH_TIMEOUT=1 run_auth_broker refresh
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"slow credential refresh gave up after 1s"* ]]
+    [ "${lines[${#lines[@]}-1]}" == "done" ]
+    [ -e "$WORK/priv/next-ran" ]
+    ! pgrep -f "$WORK/libexec/qs-auth-slow"
+}
+
+@test "auth broker reuses a refresh that was already in flight" {
+    auth_fixture
+    auth_provider one 'touch "$QS_PRIVATE_DIR/ran"'
+    mkdir "$WORK/lock"
+    ( sleep 1; rmdir "$WORK/lock" ) &
+    run_auth_broker refresh
+    wait
+    [ "$status" -eq 0 ]
+    [ "$output" == "done" ]
+    [ ! -e "$WORK/priv/ran" ]
+    grep -q "shared with a concurrent request" "$WORK/broker.log"
+}
+
+@test "auth broker reports a missing provider directory instead of claiming success" {
+    auth_fixture
+    rmdir "$WORK/libexec"
+    run_auth_broker refresh
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"auth providers were not found on the host"* ]]
+    [[ "$output" != *"done"* ]]
+}
+
+@test "qs-auth-refresh talks to the broker over the socket and reports its messages" {
+    auth_fixture
+    auth_provider one 'echo "WARNING: unlock 1Password"; touch "$QS_PRIVATE_DIR/ran"'
+    # Unix socket paths are capped at ~104 bytes; bats' temp paths are longer.
+    SOCK_DIR="$(mktemp -d /tmp/qs-auth.XXXXXX)"
+    mkfifo "$SOCK_DIR/back"
+    ( nc -lU "$SOCK_DIR/s" < "$SOCK_DIR/back" \
+        | env QS_AUTH_LIBEXEC="$WORK/libexec" QS_AUTH_PRIVATE_DIR="$WORK/priv" \
+              QS_AUTH_INSTALL_DIR="$WORK/install" QS_AUTH_LOG="$WORK/broker.log" \
+              QS_AUTH_LOCK="$WORK/lock" "$REPO_COPY/config/qs-auth-broker" work \
+        > "$SOCK_DIR/back" ) &
+    for _ in $(seq 1 50); do [ -S "$SOCK_DIR/s" ] && break; sleep 0.1; done
+    QS_AUTH_SOCK="$SOCK_DIR/s" QS_AUTH_REFRESH_TIMEOUT=10 run "$REPO_COPY/config/qs-auth-refresh"
+    wait
+    rm -rf "$SOCK_DIR"
+    [ "$status" -eq 0 ]
+    [ "$output" == "quicksand: WARNING: unlock 1Password" ]
+    [ -e "$WORK/priv/ran" ]
+}
+
+@test "qs-auth-refresh fails clearly when there is no broker socket" {
+    QS_AUTH_SOCK="$BATS_TEST_TMPDIR/nope.sock" QS_SANDBOX_NAME=work run "$REPO_COPY/config/qs-auth-refresh"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"broker socket not found"*"qs build work --rebuild"* ]]
+}
+
+@test "auth_broker_install stages, renders, and loads the agent" {
+    make_stub launchctl 'echo "launchctl $*" >> "$STUB_LOG"'
+    export WORK="$BATS_TEST_TMPDIR/work"
+    mkdir -p "$WORK"
+    qs_run 'PATH="$STUBS:/opt/a&b/bin:/usr/bin:/bin"; SANDBOX_NAME=work
+            SHARED_WORKSPACE="$WORK/ws"; QS_PRIVATE_DIR="$WORK/ws/_quicksand"
+            INSTALL_DIR="$WORK/install"
+            QS_AUTH_LABEL=com.quicksand.auth-broker.work
+            QS_AUTH_PLIST="$WORK/agent.plist"
+            QS_AUTH_BROKER_STAGED="$WORK/install/auth-broker-work.sh"
+            HOME="$WORK"
+            auth_broker_install'
+    [ "$status" -eq 0 ]
+    cmp "$REPO_COPY/config/qs-auth-broker" "$WORK/install/auth-broker-work.sh"
+    [ -x "$WORK/ws/_quicksand/bin/qs-auth-refresh" ]
+    grep -q "<string>com.quicksand.auth-broker.work</string>" "$WORK/agent.plist"
+    grep -q "<string>$WORK/install/auth-broker-work.sh</string>" "$WORK/agent.plist"
+    # qs resolves its own location through symlinks (pwd -P).
+    grep -q "<string>$(cd "$REPO_COPY" && pwd -P)/libexec</string>" "$WORK/agent.plist"
+    grep -q "<string>$WORK/ws/_quicksand/auth.sock</string>" "$WORK/agent.plist"
+    # The build shell's PATH is pinned, XML-escaped.
+    grep -qF "<string>$STUBS:/opt/a&amp;b/bin:/usr/bin:/bin</string>" "$WORK/agent.plist"
+    ! grep -qE '@[A-Z_]+@' "$WORK/agent.plist"
+    plutil -lint "$WORK/agent.plist"
+    grep -q "launchctl bootstrap gui/$(id -u) $WORK/agent.plist" "$STUB_LOG"
+}
+
+@test "auth_broker_install warns but succeeds when the agent can't be loaded" {
+    make_stub launchctl 'case "$1" in bootstrap) exit 1 ;; esac'
+    export WORK="$BATS_TEST_TMPDIR/work"
+    mkdir -p "$WORK"
+    qs_run 'PATH="$STUBS:$PATH"; SANDBOX_NAME=work
+            SHARED_WORKSPACE="$WORK/ws"; QS_PRIVATE_DIR="$WORK/ws/_quicksand"
+            INSTALL_DIR="$WORK/install"
+            QS_AUTH_LABEL=com.quicksand.auth-broker.work
+            QS_AUTH_PLIST="$WORK/agent.plist"
+            QS_AUTH_BROKER_STAGED="$WORK/install/auth-broker-work.sh"
+            HOME="$WORK"
+            auth_broker_install'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"WARNING: Failed to load the credential broker"* ]]
+    [ -x "$WORK/ws/_quicksand/bin/qs-auth-refresh" ]
+}
+
+@test "cleanup_auth_broker unloads the agent and removes everything it staged" {
+    make_stub launchctl 'echo "launchctl $*" >> "$STUB_LOG"'
+    export WORK="$BATS_TEST_TMPDIR/work"
+    mkdir -p "$WORK/install" "$WORK/ws/_quicksand/bin"
+    touch "$WORK/agent.plist" "$WORK/install/auth-broker-work.sh" \
+          "$WORK/install/auth-broker-work.log" "$WORK/ws/_quicksand/bin/qs-auth-refresh"
+    qs_run 'PATH="$STUBS:/usr/bin:/bin"; SANDBOX_NAME=work
+            QS_PRIVATE_DIR="$WORK/ws/_quicksand"
+            INSTALL_DIR="$WORK/install"
+            QS_AUTH_LABEL=com.quicksand.auth-broker.work
+            QS_AUTH_PLIST="$WORK/agent.plist"
+            QS_AUTH_BROKER_STAGED="$WORK/install/auth-broker-work.sh"
+            cleanup_auth_broker'
+    [ "$status" -eq 0 ]
+    grep -q "launchctl bootout gui/$(id -u)/com.quicksand.auth-broker.work" "$STUB_LOG"
+    [ ! -f "$WORK/agent.plist" ]
+    [ ! -f "$WORK/install/auth-broker-work.sh" ]
+    [ ! -f "$WORK/install/auth-broker-work.log" ]
+    [ ! -f "$WORK/ws/_quicksand/bin/qs-auth-refresh" ]
+}
+
+@test "config_fingerprint changes when the credential broker changes" {
+    qs_run 'QS_CUSTOM_DIR=/nonexistent; config_fingerprint'
+    before="$output"
+    echo "# changed" >> "$REPO_COPY/config/qs-auth-broker"
+    qs_run 'QS_CUSTOM_DIR=/nonexistent; config_fingerprint'
+    [ "$before" != "$output" ]
+}
+
+
+###############################################################################
+# session hooks around the broker — 05-session-register, 11-auth-refresh and
+# the last-session-out rule in logout.d/15-op-token
+###############################################################################
+
+# hooks_fixture — a workspace and home under $WORK with a staged client that
+# records each call instead of reaching for a socket.
+hooks_fixture() {
+    export WORK="$BATS_TEST_TMPDIR/work"
+    export SHARED_WORKSPACE="$WORK/ws" HOME="$WORK/home"
+    mkdir -p "$WORK/ws/_quicksand/bin" "$WORK/home"
+    printf '#!/bin/bash\necho called >> "%s"\n' "$WORK/refresh-calls" \
+        > "$WORK/ws/_quicksand/bin/qs-auth-refresh"
+    echo "ops_token" > "$WORK/ws/_quicksand/op-token"
+}
+
+@test "11-auth-refresh installs the client and leaves local sessions alone" {
+    hooks_fixture
+    unset SSH_CONNECTION
+    run "$REPO_COPY/profile.d/11-auth-refresh.sh"
+    [ "$status" -eq 0 ]
+    [ -x "$WORK/home/.local/bin/qs-auth-refresh" ]
+    cmp "$WORK/ws/_quicksand/bin/qs-auth-refresh" "$WORK/home/.local/bin/qs-auth-refresh"
+    [ ! -e "$WORK/refresh-calls" ]
+}
+
+@test "11-auth-refresh asks the host for credentials in an SSH session" {
+    hooks_fixture
+    SSH_CONNECTION="1.2.3.4 5 6.7.8.9 22" run "$REPO_COPY/profile.d/11-auth-refresh.sh"
+    [ "$status" -eq 0 ]
+    [ "$(cat "$WORK/refresh-calls")" == "called" ]
+}
+
+@test "11-auth-refresh never fails the session when the host can't answer" {
+    hooks_fixture
+    printf '#!/bin/bash\necho "broker down" >&2; exit 1\n' > "$WORK/ws/_quicksand/bin/qs-auth-refresh"
+    SSH_CONNECTION="1.2.3.4 5 6.7.8.9 22" run "$REPO_COPY/profile.d/11-auth-refresh.sh"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"broker down"* ]]
+}
+
+@test "11-auth-refresh does nothing when the build staged no client" {
+    hooks_fixture
+    rm "$WORK/ws/_quicksand/bin/qs-auth-refresh"
+    SSH_CONNECTION="1.2.3.4 5 6.7.8.9 22" run "$REPO_COPY/profile.d/11-auth-refresh.sh"
+    [ "$status" -eq 0 ]
+    [ ! -e "$WORK/home/.local/bin/qs-auth-refresh" ]
+}
+
+@test "the op token survives a session ending while another is still running" {
+    hooks_fixture
+    # Each hook's parent is its session shell, so two long-lived shells play
+    # two sessions: both register, the first logs out.
+    run bash -c '
+        bash -c "\"$REPO_COPY/profile.d/05-session-register.sh\"; exec sleep 30" &
+        other=$!
+        for _ in $(seq 1 50); do [ -e "$SHARED_WORKSPACE/_quicksand/sessions/$other" ] && break; sleep 0.1; done
+        bash -c "\"$REPO_COPY/profile.d/05-session-register.sh\"; \"$REPO_COPY/logout.d/15-op-token.sh\"; exit 0"
+        ls "$SHARED_WORKSPACE/_quicksand/sessions" | wc -l | tr -d " "
+        [ -e "$SHARED_WORKSPACE/_quicksand/op-token" ] && echo kept
+        kill $other'
+    [ "$status" -eq 0 ]
+    [ "${lines[0]}" == "1" ]
+    [ "${lines[1]}" == "kept" ]
+}
+
+@test "the op token is removed when the last session ends, pruning dead records" {
+    hooks_fixture
+    mkdir -p "$WORK/ws/_quicksand/sessions"
+    # A record whose process is long gone (a session that was SIGHUP'd).
+    bash -c 'echo $$' > "$WORK/dead-pid"
+    touch "$WORK/ws/_quicksand/sessions/$(cat "$WORK/dead-pid")"
+    run bash -c '"$REPO_COPY/profile.d/05-session-register.sh"; "$REPO_COPY/logout.d/15-op-token.sh"; exit 0'
+    [ "$status" -eq 0 ]
+    [ ! -e "$WORK/ws/_quicksand/op-token" ]
+    [ -z "$(ls -A "$WORK/ws/_quicksand/sessions")" ]
+}

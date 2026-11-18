@@ -24,15 +24,23 @@ home directory, files, or credentials.
 ## Credentials
 - Scoped credentials live as files under /Users/Shared/qs-*/_quicksand/
   (the gh token and, if configured, a short-lived GCP token).
+- The GCP token lasts about an hour, and it and the 1Password token are
+  staged by the host. When one is expired or missing, run `qs-auth-refresh`:
+  it asks a host-side broker to re-stage them and prints anything that needs
+  the user (e.g. 1Password locked on the host). `gcloud` sees a new token at
+  once; for 1Password, re-read it in your shell with
+  `export OP_SERVICE_ACCOUNT_TOKEN="$(<"$SHARED_WORKSPACE/_quicksand/op-token")"`.
+  It only works while the user is logged in to the Mac's desktop.
 - Network access is unrestricted.
 
 ## Sessions over SSH
 - The user may reach this sandbox over SSH (`qs ssh-auth` on the host) instead
   of a local terminal; `SSH_CONNECTION` is set when they did. Those sessions
   are sandboxed exactly like local ones.
-- Nothing on the host runs when an SSH session starts, so host-staged
-  credentials are not refreshed: an expired GCP token or a missing 1Password
-  token needs the user to run `qs gcp-token <name>` or open a local session.
+- An SSH session gets its host-staged credentials (GCP token, 1Password
+  token) by running `qs-auth-refresh` at login. If the host could not answer,
+  the login said so on stderr; run `qs-auth-refresh` again once the user is
+  at the Mac.
 - Which keys may log in is decided on the host, in a root-owned file. Don't
   manage SSH access from inside the sandbox (`~/.ssh/authorized_keys` is not
   consulted) — ask the user to run `qs ssh-auth <name> KEY.pub`.
@@ -148,8 +156,9 @@ sandboxes, indexed as the qmd collection `shared-memory`.
 - The token is loaded by a managed block in ~/.zshrc that reads
   $SHARED_WORKSPACE/_quicksand/op-token (a 0600 file). profile.d scripts are
   executed, not sourced, so a non-interactive shell may not have it — and if
-  the op-token file is absent, `op` isn't available to you at all. In that
-  case, hand the user a ready-to-run command instead of running it yourself.
+  the op-token file is absent, try `qs-auth-refresh` once. If it is still
+  absent, `op` isn't available to you: hand the user a ready-to-run command
+  instead of running it yourself.
 
 ### Secret handling when creating items
 

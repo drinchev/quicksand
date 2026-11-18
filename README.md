@@ -485,6 +485,15 @@ The broker runs the same providers (`libexec/qs-auth-*`) with the same
   `gcloud` login live there; with nobody logged in to the Mac the socket has
   no listener, and SSH sessions say so and carry on.
 
+On macOS 27, `op` started by a LaunchAgent reports "No accounts configured":
+it learns that the desktop-app integration is on from a settings file inside
+1Password's Group Container, and macOS only lets a process read that when the
+app behind it has the "data from other apps" permission — your terminal does,
+a background agent doesn't. The 1Password provider therefore retries a failed
+read with `OP_BIOMETRIC_UNLOCK_ENABLED=true`, which states the same thing
+through the environment. If a read still fails, the warning carries `op`'s own
+error text.
+
 launchd gives agents a bare `PATH`, so the `PATH` of the shell that built the
 sandbox is pinned into the agent — that is where `op` and `gcloud` are looked
 up. If you install either later, rebuild (`qs build NAME -r`). Other

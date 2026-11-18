@@ -51,6 +51,11 @@ readonly QS_DOCKER_PLIST_TEMPLATE="$QS_REPO_DIR/config/com.quicksand.docker-brok
 readonly QS_SAY_BROKER_SOURCE="$QS_REPO_DIR/config/qs-say-broker"
 readonly QS_SAY_CLIENT_SOURCE="$QS_REPO_DIR/config/qs-say"
 readonly QS_SAY_PLIST_TEMPLATE="$QS_REPO_DIR/config/com.quicksand.say-broker.plist.tmpl"
+# Inbound SSH assets (see `qs ssh-auth`): the session wrapper sshd forces
+# every login through, and the per-sandbox `Match User` block that forces it.
+# Both are templates, rendered and installed root-owned.
+readonly QS_SSH_SESSION_TEMPLATE="$QS_REPO_DIR/config/qs-ssh-session"
+readonly QS_SSHD_DROPIN_TEMPLATE="$QS_REPO_DIR/config/sshd-quicksand.conf.tmpl"
 
 QS_VERBOSE="${QS_VERBOSE:-0}"
 abort() { echo >&2 "ERROR: $*"; exit 1; }
@@ -111,6 +116,8 @@ config_fingerprint() {
         /usr/bin/shasum -a 256 < "$QS_DOCKER_BROKER_SOURCE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_DOCKER_SHIM_SOURCE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_DOCKER_PLIST_TEMPLATE" 2>/dev/null || true
+        /usr/bin/shasum -a 256 < "$QS_SSH_SESSION_TEMPLATE" 2>/dev/null || true
+        /usr/bin/shasum -a 256 < "$QS_SSHD_DROPIN_TEMPLATE" 2>/dev/null || true
         local dir
         for dir in "$QS_PROFILE_SOURCE_DIR" "$QS_LOGOUT_SOURCE_DIR" "$QS_CUSTOM_DIR"; do
             [[ -d "$dir" ]] || continue
@@ -149,6 +156,7 @@ Usage:
   qs gcp-token NAME
   qs op-auth   NAME [--write]
   qs docker    NAME [off]
+  qs ssh-auth  NAME [KEY.pub | off]
   qs uninstall NAME
   qs list
 
@@ -199,6 +207,19 @@ limited to the shared workspace, capabilities dropped, resources capped, and
 everything is labeled per sandbox so 'uninstall' can reap it. Inside the
 sandbox the 'qs-docker' client offers run/build/pull/ps/logs/stop; built
 image tags are forced under 'qs-NAME/'. 'qs docker NAME off' disables it.
+
+'ssh-auth' lets you SSH into the sandbox as its user ('ssh qs-NAME@host'),
+e.g. to use it as a remote environment for Claude Code. KEY.pub is a public
+key file (or a quoted 'ssh-ed25519 AAAA...' line) to authorize; each run adds
+one, and with none given the first run authorizes your own ~/.ssh/id_*.pub.
+Every SSH session — login shell, 'ssh host cmd', scp, sftp — is forced through
+a root-owned wrapper that enters the same sandbox-exec profile, environment
+and profile.d hooks as 'qs shell'. Authorized keys live in a root-owned file,
+so nothing inside the sandbox can grant itself access or shed the sandbox.
+Requires Remote Login to be on (System Settings > General > Sharing); qs does
+not switch it on for you. Credentials the host stages at launch (1Password
+token, GCP token) are not refreshed by SSH logins. 'qs ssh-auth NAME off'
+revokes all keys and removes the sshd configuration.
 
 'op-auth' sets up per-sandbox app-secret access via 1Password. Using your own
 host 1Password (so it must be signed in), it creates a vault 'qs-NAME', a
@@ -260,6 +281,7 @@ MEMORY_REPO=""
 GCP_TARGET_PROJECTS=()
 OP_WRITE=false
 DOCKER_ACTION="on"
+SSH_AUTH_ARG=""
 
 parse_args() {
     if [[ -n "${QUICKSAND_ARGS:-}" ]]; then
@@ -309,6 +331,7 @@ parse_args() {
         gt|gcp-token) COMMAND=gcp-token; needs_name=true ;;
         o|op-auth)   COMMAND=op-auth; needs_name=true ;;
         d|docker)    COMMAND=docker; needs_name=true ;;
+        sa|ssh-auth) COMMAND=ssh-auth; needs_name=true ;;
         b|build)     COMMAND=build;  needs_name=true ;;
         u|uninstall) COMMAND=uninstall; needs_name=true ;;
         *)           abort "Unknown command: $1 (try: qs --help)" ;;
@@ -335,6 +358,11 @@ parse_args() {
                 DOCKER_ACTION="${3:-on}"
                 [[ "$DOCKER_ACTION" == "on" || "$DOCKER_ACTION" == "off" ]] \
                     || abort "qs docker accepts 'off' or nothing (got: $DOCKER_ACTION)"
+                ;;
+            ssh-auth)
+                [[ $# -le 3 ]] \
+                    || abort "qs ssh-auth takes one KEY.pub (or 'off') — quote a pasted key line"
+                SSH_AUTH_ARG="${3:-}"
                 ;;
         esac
     fi
@@ -385,6 +413,18 @@ derive_constants() {
     readonly QS_SAY_LABEL="com.quicksand.say-broker.$SANDBOX_NAME"
     readonly QS_SAY_PLIST="$HOME/Library/LaunchAgents/$QS_SAY_LABEL.plist"
     readonly QS_SAY_BROKER_STAGED="$INSTALL_DIR/say-broker-$SANDBOX_NAME.sh"
+    # Inbound SSH (see `qs ssh-auth`). Everything sshd trusts lives root-owned
+    # next to the sandbox profile — never in the sandbox user's home or the
+    # shared workspace, both of which the sandbox can write.
+    readonly QS_SSHD_DIR="/var/quicksand/ssh-$QUICKSAND_USER"
+    readonly QS_SSHD_AUTHORIZED_KEYS="$QS_SSHD_DIR/authorized_keys"
+    readonly QS_SSHD_SESSION="$QS_SSHD_DIR/session"
+    readonly QS_SSHD_ZDOTDIR="$QS_SSHD_DIR/zdotdir"
+    readonly QS_SSHD_BIN="/usr/sbin/sshd"
+    readonly QS_SSHD_CONFIG="/etc/ssh/sshd_config"
+    # 010- sorts ahead of macOS's own 100-macos.conf: when several Match
+    # blocks apply, sshd keeps the first value it sees for each keyword.
+    readonly QS_SSHD_DROPIN="/etc/ssh/sshd_config.d/010-quicksand-$QUICKSAND_USER.conf"
     readonly HOST_USER="$USER"
     QS_SESSION_ID="$(/usr/bin/uuidgen)"
     readonly QS_SESSION_ID
@@ -691,6 +731,151 @@ cleanup_say() {
           "$INSTALL_DIR/say-broker-$SANDBOX_NAME.log" \
           "${QS_PRIVATE_DIR:+$QS_PRIVATE_DIR/say.sock}" \
           "${QS_PRIVATE_DIR:+$QS_PRIVATE_DIR/bin/qs-say}"
+}
+
+# Render an SSH template (the session wrapper or the sshd Match block) to
+# stdout, substituting this sandbox's identifiers and root-owned paths.
+ssh_render() {
+    sed -e "s|@SANDBOX_NAME@|$SANDBOX_NAME|g" \
+        -e "s|@QUICKSAND_USER@|$QUICKSAND_USER|g" \
+        -e "s|@QUICKSAND_USER_HOME@|/Users/$QUICKSAND_USER|g" \
+        -e "s|@SHARED_WORKSPACE@|$SHARED_WORKSPACE|g" \
+        -e "s|@SANDBOX_PROFILE@|$SANDBOX_PROFILE|g" \
+        -e "s|@HOST_USER@|$HOST_USER|g" \
+        -e "s|@AUTHORIZED_KEYS@|$QS_SSHD_AUTHORIZED_KEYS|g" \
+        -e "s|@SESSION_COMMAND@|$QS_SSHD_SESSION|g" \
+        -e "s|@ZDOTDIR@|$QS_SSHD_ZDOTDIR|g" \
+        "$1"
+}
+
+# Remove the sshd drop-in and abort. Used when a freshly installed drop-in
+# turns out invalid or ineffective: the host's sshd must never be left with
+# a broken configuration, nor the sandbox user with a half-applied one.
+ssh_rollback() {
+    sudo rm -f "$QS_SSHD_DROPIN"
+    abort "$* The sshd drop-in was removed again, so SSH access to '$SANDBOX_NAME' is off."
+}
+
+# Install (or refresh) inbound SSH for this sandbox: the root-owned session
+# wrapper, an empty root-owned ZDOTDIR, the authorized-keys file (created
+# empty, existing keys kept), and the sshd `Match User` drop-in that ties
+# them together. The drop-in goes in last and is verified twice — sshd must
+# accept the whole configuration, and the settings it would actually apply
+# to this user must be ours (an earlier Match block elsewhere could shadow
+# them). Either failure removes the drop-in again. macOS starts sshd per
+# connection, so there is nothing to reload.
+ssh_access_install() {
+    local dropin_dir
+    dropin_dir="$(dirname "$QS_SSHD_DROPIN")"
+    grep -E '^[[:space:]]*Include[[:space:]]' "$QS_SSHD_CONFIG" 2>/dev/null \
+        | grep -qF "$dropin_dir/" \
+        || abort "$QS_SSHD_CONFIG doesn't include $dropin_dir/ — add 'Include $dropin_dir/*' as its first line, then re-run."
+
+    local tmp
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/qs-ssh.XXXXXX")"
+    ssh_render "$QS_SSH_SESSION_TEMPLATE" > "$tmp/session"
+    ssh_render "$QS_SSHD_DROPIN_TEMPLATE" > "$tmp/dropin"
+
+    # Explicit modes throughout: sshd's StrictModes rejects a key file with a
+    # group/world-writable ancestor, and the wrapper must be world-executable
+    # but writable by nobody.
+    sudo mkdir -p "$QS_SSHD_ZDOTDIR"
+    sudo /bin/chmod 0755 "$(dirname "$QS_SSHD_DIR")" "$QS_SSHD_DIR" "$QS_SSHD_ZDOTDIR"
+    sudo /usr/bin/install -m 0555 "$tmp/session" "$QS_SSHD_SESSION"
+    [[ -f "$QS_SSHD_AUTHORIZED_KEYS" ]] \
+        || sudo /usr/bin/install -m 0644 /dev/null "$QS_SSHD_AUTHORIZED_KEYS"
+    sudo /bin/chmod 0644 "$QS_SSHD_AUTHORIZED_KEYS"
+    sudo /usr/bin/install -m 0644 "$tmp/dropin" "$QS_SSHD_DROPIN"
+    rm -rf "$tmp"
+
+    local err
+    err="$(sudo "$QS_SSHD_BIN" -t -f "$QS_SSHD_CONFIG" 2>&1)" \
+        || ssh_rollback "sshd rejected its configuration with the quicksand drop-in in place: $err."
+
+    local effective want
+    effective="$(sudo "$QS_SSHD_BIN" -T -f "$QS_SSHD_CONFIG" \
+        -C "user=$QUICKSAND_USER,host=localhost,addr=127.0.0.1" 2>/dev/null || true)"
+    for want in \
+        "forcecommand $QS_SSHD_SESSION" \
+        "authorizedkeysfile $QS_SSHD_AUTHORIZED_KEYS" \
+        "setenv ZDOTDIR=$QS_SSHD_ZDOTDIR" \
+        "passwordauthentication no" \
+        "kbdinteractiveauthentication no" \
+        "permituserrc no" \
+        "permituserenvironment no" \
+        "allowagentforwarding no"; do
+        grep -qixF -- "$want" <<< "$effective" \
+            || ssh_rollback "sshd would not apply '$want' to $QUICKSAND_USER — another setting in $QS_SSHD_CONFIG or $dropin_dir/ takes precedence (inspect with: sudo sshd -T -C user=$QUICKSAND_USER,host=localhost,addr=127.0.0.1)."
+    done
+
+    # With Remote Login limited to "only these users", macOS gates sshd on
+    # this group (renamed *-disabled while Remote Login is off); with "all
+    # users" neither exists and there is nothing to join.
+    local group
+    for group in com.apple.access_ssh com.apple.access_ssh-disabled; do
+        dscl . -read "/Groups/$group" &>/dev/null || continue
+        sudo dseditgroup -o edit -a "$QUICKSAND_USER" -t user "$group"
+    done
+}
+
+# Undo `qs ssh-auth`: drop the sshd Match block first (which alone ends
+# access), then the keys and wrapper, then the Remote Login group
+# membership. Best-effort and safe on a sandbox that never had SSH enabled.
+cleanup_ssh() {
+    sudo rm -f "$QS_SSHD_DROPIN"
+    sudo rm -rf "${QS_SSHD_DIR:?}"
+    local group
+    for group in com.apple.access_ssh com.apple.access_ssh-disabled; do
+        sudo dseditgroup -o edit -d "$QUICKSAND_USER" -t user "$group" &>/dev/null || true
+    done
+}
+
+# Count the keys currently authorized for SSH into this sandbox.
+ssh_key_count() {
+    local n
+    n="$(grep -cvE '^[[:space:]]*(#|$)' "$QS_SSHD_AUTHORIZED_KEYS" 2>/dev/null || true)"
+    printf '%s\n' "${n:-0}"
+}
+
+# Read public keys from SRC — a .pub file, or a literal key line — into
+# SSH_NEW_KEYS, validating every one. Only bare `TYPE BASE64 [comment]`
+# lines pass: no authorized_keys options, and never a private key. Runs
+# before anything is installed, so a wrong path changes nothing. The
+# offending text is deliberately not echoed back (it may be key material).
+SSH_NEW_KEYS=()
+ssh_read_keys() {
+    local src="$1" text line
+    local key_re='^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/]+=*( .*)?$'
+    SSH_NEW_KEYS=()
+    if [[ -f "$src" ]]; then text="$(<"$src")"; else text="$src"; fi
+    while IFS= read -r line; do
+        line="${line%$'\r'}"
+        line="${line#"${line%%[![:space:]]*}"}"
+        [[ -z "$line" || "$line" == \#* ]] && continue
+        if ! [[ "$line" =~ $key_re ]] || ! ssh-keygen -l -f - <<< "$line" &>/dev/null; then
+            if [[ -f "$src" ]]; then
+                abort "$src is not an OpenSSH public key file — pass the .pub file (lines like 'ssh-ed25519 AAAA... comment'), never a private key."
+            fi
+            abort "Expected a public key file or a quoted public key line ('ssh-ed25519 AAAA... comment'); the argument given is neither."
+        fi
+        SSH_NEW_KEYS+=("$line")
+    done <<< "$text"
+    (( ${#SSH_NEW_KEYS[@]} > 0 )) || abort "No public keys found in $src."
+}
+
+# Append SSH_NEW_KEYS to the root-owned authorized-keys file, skipping keys
+# already present (compared by key blob, so a changed comment is no new key).
+ssh_append_keys() {
+    local line blob
+    for line in "${SSH_NEW_KEYS[@]}"; do
+        read -r _ blob _ <<< "$line"
+        if awk -v b="$blob" '$2 == b { found = 1 } END { exit !found }' "$QS_SSHD_AUTHORIZED_KEYS"; then
+            info "  Already authorized: $(ssh-keygen -l -f - <<< "$line")"
+            continue
+        fi
+        printf '%s\n' "$line" | sudo tee -a "$QS_SSHD_AUTHORIZED_KEYS" > /dev/null
+        info "  Authorized: $(ssh-keygen -l -f - <<< "$line")"
+    done
 }
 
 # Append a clone record to the manifest (see QS_CLONES_MANIFEST, or
@@ -1096,6 +1281,14 @@ EOF
         fi
     fi
 
+    # Likewise an enabled `qs ssh-auth`: re-render the session wrapper and the
+    # sshd Match block (both fingerprinted) and re-verify them. Authorized
+    # keys are left as they are. No-op for sandboxes without SSH access.
+    if [[ -f "$QS_SSHD_DROPIN" ]]; then
+        debug "Refreshing SSH access"
+        ssh_access_install
+    fi
+
     # First line: config fingerprint (compared on every run); second:
     # build time, for humans.
     mkdir -p "$INSTALL_DIR"
@@ -1163,6 +1356,7 @@ cmd_uninstall() {
     run_all_auth_providers cleanup
     cleanup_docker
     cleanup_say
+    cleanup_ssh
 
     # Best-effort: tear down any running session for this sandbox user.
     # `|| true` swallows pipefail-induced ERR when the user is already
@@ -1342,6 +1536,61 @@ cmd_docker() {
     info "  Client:  qs-docker inside the sandbox — run / build / pull / ps / logs / stop"
     info "  Policy:  mounts $SHARED_WORKSPACE only; caps dropped; 4g/4cpu limits;"
     info "           image builds tagged under qs-$SANDBOX_NAME/; disable with: qs docker $SANDBOX_NAME off"
+}
+
+# Enable inbound SSH for a sandbox (`ssh qs-NAME@host`) and authorize a
+# public key for it — the way to use a sandbox as a remote environment.
+# sshd is configured to force every session of the sandbox user through a
+# root-owned wrapper (config/qs-ssh-session) that enters sandbox-exec, and
+# to read authorized keys from a root-owned file, so nothing running inside
+# the sandbox can authorize itself or log in around the sandbox. Each run
+# adds one key; 'qs ssh-auth NAME off' revokes them all. Remote Login
+# itself is the host owner's switch — qs reports it but never flips it.
+cmd_ssh_auth() {
+    (( ${#COMMAND_ARGS[@]} == 0 )) \
+        || abort "qs ssh-auth doesn't accept '--' args"
+
+    if [[ "$SSH_AUTH_ARG" == "off" ]]; then
+        sudo "-p Password required to remove SSH access to the sandbox: " true
+        cleanup_ssh
+        info "SSH access disabled for '$SANDBOX_NAME': keys revoked, sshd configuration removed."
+        info "Sessions that are already open stay open until they exit."
+        return 0
+    fi
+
+    # Settle which key to authorize before changing anything. With no
+    # argument, a first run falls back to the host user's own key (the
+    # common case: connecting from this Mac); later runs just refresh.
+    local key_src="$SSH_AUTH_ARG" candidate
+    if [[ -z "$key_src" && "$(ssh_key_count)" == "0" ]]; then
+        for candidate in "$HOME/.ssh/id_ed25519.pub" "$HOME/.ssh/id_ecdsa.pub" "$HOME/.ssh/id_rsa.pub"; do
+            [[ -f "$candidate" ]] || continue
+            key_src="$candidate"
+            break
+        done
+        [[ -n "$key_src" ]] \
+            || abort "No public key to authorize: none given, and no ~/.ssh/id_*.pub on this Mac. Pass one: qs ssh-auth $SANDBOX_NAME KEY.pub"
+    fi
+    SSH_NEW_KEYS=()
+    [[ -z "$key_src" ]] || ssh_read_keys "$key_src"
+
+    sudo "-p Password required to configure SSH access to the sandbox: " true
+    ssh_access_install
+    (( ${#SSH_NEW_KEYS[@]} == 0 )) || ssh_append_keys
+
+    local host
+    host="$(scutil --get LocalHostName 2>/dev/null || hostname -s)"
+    info ""
+    info "SSH access enabled for '$SANDBOX_NAME':"
+    info "  Connect:   ssh $QUICKSAND_USER@$host.local   (from this Mac: ssh $QUICKSAND_USER@localhost)"
+    info "  Keys:      $(ssh_key_count) authorized, in $QS_SSHD_AUTHORIZED_KEYS (root-owned)"
+    info "             add another with: qs ssh-auth $SANDBOX_NAME KEY.pub"
+    info "  Sessions:  forced into sandbox-exec with the 'qs shell' environment and"
+    info "             profile.d hooks — logins, 'ssh host cmd', scp and sftp alike"
+    info "  Disable:   qs ssh-auth $SANDBOX_NAME off"
+    if ! launchctl print system/com.openssh.sshd &>/dev/null; then
+        warn "Remote Login is off on this Mac, so nothing is listening for SSH yet. Turn it on in System Settings > General > Sharing > Remote Login (or: sudo systemsetup -setremotelogin on)."
+    fi
 }
 
 # Assemble the in-sandbox zsh command line: per-session TMPDIR, cd to the
@@ -1565,6 +1814,10 @@ main() {
         docker)
             ensure_built
             cmd_docker
+            ;;
+        ssh-auth)
+            ensure_built
+            cmd_ssh_auth
             ;;
         shell|claude)
             ensure_built

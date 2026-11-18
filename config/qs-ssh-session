@@ -1,0 +1,104 @@
+#!/bin/bash -p
+# qs-ssh-session — sshd ForceCommand for a quicksand sandbox user.
+#
+# Template: `qs ssh-auth NAME` renders the @TOKENS@ and installs the result
+# root-owned under /var/quicksand/, where the sandbox user can't edit it.
+# sshd runs it for EVERY session of that user (interactive login, `ssh host
+# cmd`, scp, the sftp subsystem), so an SSH login gets what `qs shell` gives
+# a local one: a scrubbed environment, sandbox-exec, the profile.d hooks,
+# and the logout.d hooks on exit. It is the SSH counterpart of cmd_launch /
+# build_session_command in qs — keep the two in step.
+#
+# Everything up to the final exec runs as the sandbox user but OUTSIDE
+# sandbox-exec, so nothing here may execute or source a file the sandbox
+# can write: absolute paths to system binaries only, `bash -p` (no
+# $BASH_ENV, no imported functions), and the sshd Match block points
+# ZDOTDIR at an empty root-owned directory so the `zsh -c` sshd wraps this
+# script in can't pick up the sandbox's ~/.zshenv either.
+#
+# Fails closed: without a readable sandbox profile there is no session.
+set -u
+
+readonly QS_USER="@QUICKSAND_USER@"
+readonly QS_HOME="@QUICKSAND_USER_HOME@"
+readonly QS_NAME="@SANDBOX_NAME@"
+readonly QS_WORKSPACE="@SHARED_WORKSPACE@"
+readonly QS_PROFILE="@SANDBOX_PROFILE@"
+readonly QS_HOST="@HOST_USER@"
+
+die() { echo >&2 "qs-ssh-session: $*"; exit 1; }
+
+[[ "$(/usr/bin/id -un)" == "$QS_USER" ]] \
+    || die "this session wrapper only serves $QS_USER"
+[[ -z "${QS_SESSION_ID:-}" ]] \
+    || die "already inside a quicksand sandbox"
+[[ -r "$QS_PROFILE" ]] \
+    || die "sandbox profile $QS_PROFILE is missing — on the host, run: qs build $QS_NAME --rebuild"
+
+# "Shell" labels the tab (profile.d/51-tab-name.sh) for a plain interactive
+# login; command, piped and subsystem sessions stay unlabeled, as in qs.
+SESSION_KIND=""
+[[ -z "${SSH_ORIGINAL_COMMAND:-}" && -t 0 ]] && SESSION_KIND="Shell"
+
+# The same curated environment cmd_launch builds — nothing sshd or the
+# client put in the environment survives except what is named here. LANG
+# defaults to UTF-8 because clients that run commands non-interactively
+# often send no locale, and the C locale garbles UTF-8 in git and python.
+SESSION_ENV=(
+    "HOME=$QS_HOME"
+    "USER=$QS_USER"
+    "SHELL=/bin/zsh"
+    "TERM=${TERM:-}"
+    "SHARED_WORKSPACE=$QS_WORKSPACE"
+    "QS_SESSION_ID=$(/usr/bin/uuidgen)"
+    "QS_SANDBOX_NAME=$QS_NAME"
+    "QS_SESSION_KIND=$SESSION_KIND"
+    "QS_HOST_USER=$QS_HOST"
+    "QS_VERBOSE=0"
+    "PATH=$QS_HOME/.local/bin:$QS_HOME/.claude/local:/usr/bin:/bin:/usr/sbin:/sbin"
+    "LANG=${LANG:-en_US.UTF-8}"
+)
+[[ -n "${LC_ALL:-}" ]] && SESSION_ENV+=("LC_ALL=$LC_ALL")
+# Let tools inside see that (and how) they are being reached over SSH.
+for var in SSH_CONNECTION SSH_CLIENT SSH_TTY SSH_ORIGINAL_COMMAND; do
+    [[ -n "${!var:-}" ]] && SESSION_ENV+=("$var=${!var}")
+done
+
+# The in-sandbox session, as a fixed zsh program: nothing is interpolated
+# into it — the client's command arrives as $SSH_ORIGINAL_COMMAND and is
+# handed to a nested `zsh -c` as one argument, exactly as sshd would have
+# run it. Not exec'd, so the EXIT trap's logout.d hooks run when it ends.
+#
+# Anything but a plain interactive login is treated as a transport: the
+# hooks and ~/.zshrc run with stdin detached and stdout sent to stderr, so
+# they can neither swallow the client's input nor corrupt a protocol stream
+# (sftp, scp, git, an editor's or agent's remote helper).
+IFS= read -r -d '' SESSION_PROGRAM <<'EOF' || true
+export TMPDIR=$(mktemp -d "$(getconf DARWIN_USER_TEMP_DIR)/qs.XXXXXX" 2>/dev/null || mktemp -d)
+cd ~
+setopt null_glob
+qs_hooks() {
+    local s
+    for s in $SHARED_WORKSPACE/_quicksand/$1/*.sh $SHARED_WORKSPACE/_quicksand/custom/$1/*.sh; do
+        [[ -f $s && -x $s ]] && $s
+    done
+}
+if [[ -z $SSH_ORIGINAL_COMMAND && -t 0 ]]; then
+    qs_hooks profile.d
+    trap 'qs_hooks logout.d' EXIT
+    /bin/zsh -i
+else
+    qs_hooks profile.d </dev/null >&2
+    trap 'qs_hooks logout.d </dev/null >&2' EXIT
+    [[ -r ~/.zshrc ]] && source ~/.zshrc </dev/null >&2
+    if [[ -n $SSH_ORIGINAL_COMMAND ]]; then
+        /bin/zsh -c $SSH_ORIGINAL_COMMAND
+    else
+        /bin/zsh
+    fi
+fi
+EOF
+
+exec /usr/bin/env -i "${SESSION_ENV[@]}" \
+    /usr/bin/sandbox-exec -f "$QS_PROFILE" \
+    /bin/zsh -c "$SESSION_PROGRAM"

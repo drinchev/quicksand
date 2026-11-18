@@ -406,11 +406,40 @@ speak, or both to go quiet. The broker is loaded per build; on a host
 without a GUI session (building over ssh) the build warns and continues
 without speech.
 
+## Claude Code settings defaults
+
+`config/claude-settings.json` holds the Claude Code settings every sandbox
+starts with:
+
+| Key | Default | Why |
+|---|---|---|
+| `cleanupPeriodDays` | `3650` | Claude Code deletes session transcripts older than this (30 days if unset), and old sessions then vanish from the resume picker |
+| `model` | `fable` | the model a new sandbox starts on |
+| `skipDangerousModePermissionPrompt` | `true` | the sandbox is the safety boundary, so skip the bypass-permissions warning |
+| `theme` | `dark` | |
+| `tui` | `fullscreen` | |
+
+The build stages the file into `_quicksand/`, and on every session entry
+`profile.d/30-claude-config.sh` merges it into the sandbox's
+`~/.claude/settings.json`. It is a merge, not a copy, because Claude Code
+writes its own state into that file (`/model`, `/theme`, accepted prompts)
+and so do you: each top-level key is added only while the sandbox's file
+doesn't have it. Whatever is already set wins, and a default added to the
+template later still reaches existing sandboxes on their next rebuild.
+
+To change a default for one sandbox, edit its `settings.json`; to change it
+for all new sandboxes, edit the template. Changing a value in the template
+does not alter sandboxes that already have that key.
+
+Hooks are not part of the template — the merge is top-level only, and the
+`qs-say` hooks need the sandbox's name and seed-once behaviour (see
+[Speech](#speech-from-the-sandbox-qs-say)).
+
 ## Automatic rebuilds
 
 The install marker stores a fingerprint of everything a build bakes into a
 sandbox: the qs version, the `sandbox-exec` profile template, `profile.d/`,
-`logout.d/`, the speech broker assets, and your personal overlay — contents, names, and file modes. When any of it
+`logout.d/`, the `quicksand.md` and `claude-settings.json` assets, the speech broker assets, and your personal overlay — contents, names, and file modes. When any of it
 changes (a `git pull` of this repo, an edit to your overlay), the next
 `qs shell`/`qs claude` rebuilds the sandbox automatically and tells you why.
 
@@ -425,7 +454,7 @@ sandbox (first run installs, later runs are no-ops):
 | `20-install-claude.sh` | install Claude Code via its native installer |
 | `21-install-gh.sh` | install the GitHub CLI (`gh`) from its release tarball |
 | `22-install-op.sh` | install the 1Password CLI (`op`) from its release zip |
-| `30-claude-config.sh` | seed onboarding flags, plus a `~/.claude/CLAUDE.md` import of `config/quicksand.md` describing the sandbox boundary, `gh` access and credentials; set `cleanupPeriodDays` to 3650 in `~/.claude/settings.json` (only while unset) so Claude Code keeps session transcripts instead of deleting them after 30 days |
+| `30-claude-config.sh` | seed onboarding flags, plus a `~/.claude/CLAUDE.md` import of `config/quicksand.md` describing the sandbox boundary, `gh` access and credentials; merge the defaults in `config/claude-settings.json` into `~/.claude/settings.json` — see [Claude Code settings defaults](#claude-code-settings-defaults) |
 | `31-claude-say.sh` | install `qs-say` and seed Claude Code hooks so the Mac says "`<sandbox>` is waiting for your input" once Claude has been waiting on you — see [Speech](#speech-from-the-sandbox-qs-say) |
 | `40-gitconfig.sh` | seed the host's git identity + `safe.directory` |
 | `45-install-oh-my-zsh.sh` | Oh My Zsh + custom themes/plugins; disables auto-title so a manual tab name sticks |

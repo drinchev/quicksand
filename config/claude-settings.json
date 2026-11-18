@@ -1,0 +1,7 @@
+{
+  "cleanupPeriodDays": 3650,
+  "model": "fable",
+  "skipDangerousModePermissionPrompt": true,
+  "theme": "dark",
+  "tui": "fullscreen"
+}

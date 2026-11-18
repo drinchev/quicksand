@@ -318,6 +318,14 @@ qs_run() {
     [ "$output" != "$before" ]
 }
 
+@test "config_fingerprint changes when the Claude settings template changes" {
+    qs_run 'QS_CUSTOM_DIR=/nonexistent; config_fingerprint'
+    local before="$output"
+    echo '{"cleanupPeriodDays":1}' > "$REPO_COPY/config/claude-settings.json"
+    qs_run 'QS_CUSTOM_DIR=/nonexistent; config_fingerprint'
+    [ "$output" != "$before" ]
+}
+
 @test "config_fingerprint changes when the speech broker changes" {
     qs_run 'QS_CUSTOM_DIR=/nonexistent; config_fingerprint'
     local before="$output"
@@ -1657,52 +1665,92 @@ say_broker() {
     [ "$(cat "$BATS_TEST_TMPDIR/got")" == "hello multi line world" ]
 }
 
-# 30-claude-config against a fake HOME and workspace; QS_CLAUDE_SETTINGS is
-# the same seam 31-claude-say uses, so the suite never touches real settings.
-run_claude_config() {
+# 30-claude-config against a fake HOME and a workspace with the settings
+# template staged; QS_CLAUDE_SETTINGS is the same seam 31-claude-say uses, so
+# the suite never touches real settings.
+claude_config_fixture() {
+    WS="$BATS_TEST_TMPDIR/ws"
     FAKE_HOME="$BATS_TEST_TMPDIR/home"
     SETTINGS="$FAKE_HOME/.claude/settings.json"
-    mkdir -p "$FAKE_HOME" "$BATS_TEST_TMPDIR/ws/_quicksand"
-    run env HOME="$FAKE_HOME" SHARED_WORKSPACE="$BATS_TEST_TMPDIR/ws" \
+    mkdir -p "$FAKE_HOME/.claude" "$WS/_quicksand"
+    cp "$REPO_COPY/config/claude-settings.json" "$WS/_quicksand/claude-settings.json"
+}
+
+run_claude_config() {
+    run env HOME="$FAKE_HOME" SHARED_WORKSPACE="$WS" \
         QS_CLAUDE_SETTINGS="$SETTINGS" "$REPO_COPY/profile.d/30-claude-config.sh"
 }
 
-@test "30-claude-config seeds cleanupPeriodDays so session transcripts are kept" {
-    run_claude_config
-    [ "$status" -eq 0 ]
-    run jq -r '.cleanupPeriodDays' "$SETTINGS"
-    [ "$output" == "3650" ]
+@test "config/claude-settings.json is a JSON object that keeps session transcripts" {
+    run jq -r 'type + " " + (.cleanupPeriodDays | tostring)' "$REPO_COPY/config/claude-settings.json"
+    [ "$output" == "object 3650" ]
+    # Hooks are seeded by their own scripts; a top-level merge can't do it.
+    run jq -r 'has("hooks")' "$REPO_COPY/config/claude-settings.json"
+    [ "$output" == "false" ]
 }
 
-@test "30-claude-config adds cleanupPeriodDays to existing settings without disturbing them" {
-    mkdir -p "$BATS_TEST_TMPDIR/home/.claude"
-    echo '{"model":"opus","hooks":{"Stop":[{"hooks":[{"type":"command","command":"/x/mine.sh"}]}]}}' \
-        > "$BATS_TEST_TMPDIR/home/.claude/settings.json"
-    chmod 0600 "$BATS_TEST_TMPDIR/home/.claude/settings.json"
+@test "30-claude-config seeds a new settings.json from the template" {
+    claude_config_fixture
     run_claude_config
     [ "$status" -eq 0 ]
-    run jq -c '[.model, .hooks.Stop[0].hooks[0].command, .cleanupPeriodDays]' "$SETTINGS"
-    [ "$output" == '["opus","/x/mine.sh",3650]' ]
+    run jq -S -c . "$SETTINGS"
+    [ "$output" == "$(jq -S -c . "$REPO_COPY/config/claude-settings.json")" ]
+}
+
+@test "30-claude-config acknowledges bypass mode in settings.json, not ~/.claude.json" {
+    claude_config_fixture
+    run_claude_config
+    [ "$status" -eq 0 ]
+    run jq -r '.skipDangerousModePermissionPrompt' "$SETTINGS"
+    [ "$output" == "true" ]
+    run jq -r '.hasCompletedOnboarding, has("bypassPermissionsModeAccepted")' "$FAKE_HOME/.claude.json"
+    [ "$output" == $'true\nfalse' ]
+}
+
+@test "30-claude-config adds missing template keys; existing settings win and survive" {
+    claude_config_fixture
+    echo '{"cleanupPeriodDays":3650,"theme":"dark","model":"sonnet"}' > "$WS/_quicksand/claude-settings.json"
+    echo '{"model":"opus","cleanupPeriodDays":7,"hooks":{"Stop":[{"hooks":[{"type":"command","command":"/x/mine.sh"}]}]}}' \
+        > "$SETTINGS"
+    chmod 0600 "$SETTINGS"
+    run_claude_config
+    [ "$status" -eq 0 ]
+    run jq -c '[.model, .cleanupPeriodDays, .theme, .hooks.Stop[0].hooks[0].command]' "$SETTINGS"
+    [ "$output" == '["opus",7,"dark","/x/mine.sh"]' ]
     [ "$(stat -f '%Lp' "$SETTINGS")" == "600" ]
 }
 
-@test "30-claude-config never overrides a cleanupPeriodDays the user set" {
-    mkdir -p "$BATS_TEST_TMPDIR/home/.claude"
-    echo '{"cleanupPeriodDays":7}' > "$BATS_TEST_TMPDIR/home/.claude/settings.json"
+@test "30-claude-config leaves settings untouched when no template key is missing" {
+    claude_config_fixture
+    echo '{"theme":"dark"}' > "$WS/_quicksand/claude-settings.json"
+    printf '{ "theme":"light",\n  "mine": 1 }\n' > "$SETTINGS"
+    cp "$SETTINGS" "$BATS_TEST_TMPDIR/before"
     run_claude_config
     [ "$status" -eq 0 ]
     [ -z "$output" ]
-    run jq -c . "$SETTINGS"
-    [ "$output" == '{"cleanupPeriodDays":7}' ]
+    cmp "$SETTINGS" "$BATS_TEST_TMPDIR/before"
 }
 
 @test "30-claude-config leaves a settings.json that is not a JSON object alone" {
-    mkdir -p "$BATS_TEST_TMPDIR/home/.claude"
-    echo 'not json' > "$BATS_TEST_TMPDIR/home/.claude/settings.json"
+    claude_config_fixture
+    echo 'not json' > "$SETTINGS"
     run_claude_config
     [ "$status" -eq 0 ]
     [[ "$output" == *"not a JSON object"* ]]
     [ "$(cat "$SETTINGS")" == "not json" ]
+}
+
+@test "30-claude-config skips the merge when the template is missing or malformed" {
+    claude_config_fixture
+    rm "$WS/_quicksand/claude-settings.json"
+    run_claude_config
+    [ "$status" -eq 0 ]
+    [ ! -e "$SETTINGS" ]
+    echo '["not","an","object"]' > "$WS/_quicksand/claude-settings.json"
+    run_claude_config
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"not a JSON object"* ]]
+    [ ! -e "$SETTINGS" ]
 }
 
 # Fixture for the hook: a staged client under a fake workspace, a fake HOME

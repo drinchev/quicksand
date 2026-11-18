@@ -29,6 +29,10 @@ readonly QS_SANDBOX_PROFILE_TEMPLATE="$QS_REPO_DIR/config/sandbox.sb"
 # ~/.claude/CLAUDE.md by profile.d/30-claude-config.sh. Kept as a plain file
 # (not a heredoc) so it's easy to edit.
 readonly QS_QUICKSAND_MD="$QS_REPO_DIR/config/quicksand.md"
+# Default Claude Code settings for a sandbox, as plain JSON. Staged into
+# _quicksand/ by the build; profile.d/30-claude-config.sh adds each top-level
+# key to the sandbox's ~/.claude/settings.json only while that key is absent.
+readonly QS_CLAUDE_SETTINGS_TEMPLATE="$QS_REPO_DIR/config/claude-settings.json"
 # Auth providers: standalone host-side scripts, one per credential
 # integration (libexec/qs-auth-*), each owning its provision/refresh/
 # cleanup lifecycle behind a small QS_* env contract (see run_auth_provider).
@@ -90,7 +94,8 @@ host_default_browser() {
 }
 
 # Fingerprint of everything a build bakes into a sandbox: qs version, sandbox
-# profile template, the quicksand.md asset, canonical profile.d/ and logout.d/,
+# profile template, the quicksand.md and claude-settings.json assets, canonical
+# profile.d/ and logout.d/,
 # and the host-side custom overlay (contents, relative names, and file modes — the
 # exec bit decides whether a script runs). A sandbox whose install marker
 # doesn't match is stale and gets rebuilt automatically.
@@ -99,6 +104,7 @@ config_fingerprint() {
         echo "$VERSION"
         /usr/bin/shasum -a 256 < "$QS_SANDBOX_PROFILE_TEMPLATE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_QUICKSAND_MD" 2>/dev/null || true
+        /usr/bin/shasum -a 256 < "$QS_CLAUDE_SETTINGS_TEMPLATE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_SAY_BROKER_SOURCE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_SAY_CLIENT_SOURCE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_SAY_PLIST_TEMPLATE" 2>/dev/null || true
@@ -1041,6 +1047,13 @@ EOF
         --checksum --perms --times \
         "$QS_QUICKSAND_MD" "$QS_PRIVATE_DIR/quicksand.md"
 
+    # Likewise the Claude Code settings defaults, which 30-claude-config.sh
+    # merges into the sandbox's ~/.claude/settings.json.
+    debug "Syncing $QS_CLAUDE_SETTINGS_TEMPLATE → $QS_PRIVATE_DIR/claude-settings.json"
+    /usr/bin/rsync \
+        --checksum --perms --times \
+        "$QS_CLAUDE_SETTINGS_TEMPLATE" "$QS_PRIVATE_DIR/claude-settings.json"
+
     # Speech: stage the qs-say client and (re)load the host-side broker —
     # every build, so config/qs-say* changes (fingerprinted) roll out like
     # profile.d changes.
@@ -1388,7 +1401,8 @@ build_session_command() {
         QS_SESSION_KIND="Claude"
         # sandbox-exec is already restricting file writes to the sandbox home
         # plus the shared workspace, so claude's per-action permission prompts
-        # are redundant. `bypassPermissionsModeAccepted: true` (seeded by the
+        # are redundant. `skipDangerousModePermissionPrompt: true` (a default
+        # in config/claude-settings.json, merged into settings.json by the
         # 30-claude-config.sh profile script) is the on-disk acknowledgement.
         # Not exec'd (unlike a bare launch) so the EXIT trap's logout.d hooks
         # run when claude quits.

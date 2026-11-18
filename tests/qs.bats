@@ -1697,6 +1697,16 @@ run_claude_config() {
     [ "$output" == "$(jq -S -c . "$REPO_COPY/config/claude-settings.json")" ]
 }
 
+@test "30-claude-config acknowledges bypass mode in settings.json, not ~/.claude.json" {
+    claude_config_fixture
+    run_claude_config
+    [ "$status" -eq 0 ]
+    run jq -r '.skipDangerousModePermissionPrompt' "$SETTINGS"
+    [ "$output" == "true" ]
+    run jq -r '.hasCompletedOnboarding, has("bypassPermissionsModeAccepted")' "$FAKE_HOME/.claude.json"
+    [ "$output" == $'true\nfalse' ]
+}
+
 @test "30-claude-config adds missing template keys; existing settings win and survive" {
     claude_config_fixture
     echo '{"cleanupPeriodDays":3650,"theme":"dark","model":"sonnet"}' > "$WS/_quicksand/claude-settings.json"

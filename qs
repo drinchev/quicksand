@@ -1401,7 +1401,8 @@ build_session_command() {
         QS_SESSION_KIND="Claude"
         # sandbox-exec is already restricting file writes to the sandbox home
         # plus the shared workspace, so claude's per-action permission prompts
-        # are redundant. `bypassPermissionsModeAccepted: true` (seeded by the
+        # are redundant. `skipDangerousModePermissionPrompt: true` (a default
+        # in config/claude-settings.json, merged into settings.json by the
         # 30-claude-config.sh profile script) is the on-disk acknowledgement.
         # Not exec'd (unlike a bare launch) so the EXIT trap's logout.d hooks
         # run when claude quits.

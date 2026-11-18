@@ -2,8 +2,7 @@
 # Seed Claude Code's configuration inside the sandbox:
 #
 #   1. ~/.claude.json         — onboarding flags so the first session isn't
-#                               stuck on welcome prompts or the permission-mode
-#                               warning.
+#                               stuck on welcome prompts.
 #   2. ~/.claude/quicksand.md — a description of the sandbox environment
 #                               (filesystem boundary, gh access, credentials),
 #                               copied from the config/quicksand.md asset the
@@ -28,7 +27,6 @@ if [[ ! -f "$HOME/.claude.json" ]]; then
     cat > "$HOME/.claude.json" <<'JSON'
 {
   "hasCompletedOnboarding": true,
-  "bypassPermissionsModeAccepted": true,
   "tipsHistory": { "new-user-warmup": 1 }
 }
 JSON
@@ -57,6 +55,10 @@ fi
 # and the user edits it, so the template is never copied over it. Instead each
 # top-level key is added only while absent — whatever is already there wins,
 # and a new default added to the template still reaches existing sandboxes.
+# skipDangerousModePermissionPrompt is what keeps `qs claude` (which runs
+# with --dangerously-skip-permissions) from stopping at the bypass-mode
+# warning; it replaces the bypassPermissionsModeAccepted flag this script used
+# to seed into ~/.claude.json, which Claude Code no longer keeps there.
 # The merge is top-level only: hooks are seeded by their own scripts (see
 # 31-claude-say.sh), which need per-sandbox values and seed-once semantics.
 # A settings.json or template that isn't a JSON object is left alone with a

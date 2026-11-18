@@ -1984,16 +1984,19 @@ SSH_GLOBALS='PATH="$STUBS:$PATH"; SANDBOX_NAME=work; QUICKSAND_USER=qs-work
     QS_SSHD_AUTHORIZED_KEYS="$QS_SSHD_DIR/authorized_keys"
     QS_SSHD_SESSION="$QS_SSHD_DIR/session"; QS_SSHD_ZDOTDIR="$QS_SSHD_DIR/zdotdir"
     QS_SSHD_BIN="$STUBS/sshd"; QS_SSHD_CONFIG="$WORK/etc/sshd_config"
-    QS_SSHD_DROPIN="$WORK/etc/sshd_config.d/010-quicksand-qs-work.conf"'
+    QS_SSHD_DROPIN="$WORK/etc/sshd_config.d/010-quicksand-qs-work.conf"
+    QS_SSHD_DEFAULT_DROPIN="$WORK/etc/sshd_config.d/020-quicksand-default.conf"'
 
 ssh_run() {
     qs_run "$SSH_GLOBALS; $1"
 }
 
-# A host whose sshd accepts the drop-in and reports it as effective: `sshd
-# -t` succeeds unless $WORK/sshd-t-fails exists, and `sshd -T` prints
-# $WORK/effective. No Remote Login access group exists unless a test
-# creates $WORK/access-group. Two real key pairs land in $WORK.
+# A host whose sshd accepts the drop-ins and reports them as effective:
+# `sshd -t` succeeds unless $WORK/sshd-t-fails exists, and `sshd -T` prints
+# $WORK/effective — or $WORK/effective-default when asked about the probe
+# user that stands for "a sandbox without ssh-auth". No Remote Login access
+# group exists unless a test creates $WORK/access-group. Two real key pairs
+# land in $WORK.
 ssh_fixture() {
     export WORK="$BATS_TEST_TMPDIR/work"
     mkdir -p "$WORK/etc/sshd_config.d" "$WORK/var" "$WORK/hosthome/.ssh"
@@ -2002,6 +2005,7 @@ ssh_fixture() {
     make_stub sshd 'echo "sshd $*" >> "$STUB_LOG"
         case " $* " in
             *" -t "*) if [[ -e "$WORK/sshd-t-fails" ]]; then echo "bad config" >&2; exit 255; fi ;;
+            *" -T "*"user=qs-.probe,"*) cat "$WORK/effective-default" ;;
             *" -T "*) cat "$WORK/effective" ;;
         esac'
     make_stub dscl '[[ -e "$WORK/access-group" && "$*" == *"/Groups/com.apple.access_ssh" ]]'
@@ -2018,6 +2022,14 @@ kbdinteractiveauthentication no
 permituserrc no
 permituserenvironment no
 allowagentforwarding no
+EOF
+    cat > "$WORK/effective-default" <<EOF
+port 22
+authorizedkeysfile none
+authorizedkeyscommand none
+authenticationmethods publickey
+passwordauthentication no
+kbdinteractiveauthentication no
 EOF
     ssh-keygen -q -t ed25519 -N "" -C first@test  -f "$WORK/k1"
     ssh-keygen -q -t ed25519 -N "" -C second@test -f "$WORK/k2"
@@ -2131,6 +2143,79 @@ EOF
     ssh_run 'ssh_access_install'
     [ "$status" -eq 0 ]
     grep -qx "dseditgroup -o edit -a qs-work -t user com.apple.access_ssh" "$STUB_LOG"
+}
+
+@test "ssh_default_deny_install installs the shared rule and checks it against a non-sandbox name" {
+    ssh_fixture
+    ssh_run 'ssh_default_deny_install'
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"WARNING"* ]]
+    dropin="$WORK/etc/sshd_config.d/020-quicksand-default.conf"
+    cmp "$REPO_COPY/config/sshd-quicksand-default.conf" "$dropin"
+    grep -qx "Match User qs-\*" "$dropin"
+    grep -qx "    AuthorizedKeysFile none" "$dropin"
+    [ "$(/usr/bin/stat -f %Lp "$dropin")" == "644" ]
+    grep -q "sshd -t -f $WORK/etc/sshd_config" "$STUB_LOG"
+    grep -q "sshd -T -f $WORK/etc/sshd_config -C user=qs-.probe," "$STUB_LOG"
+}
+
+@test "the shared rule sorts after every per-sandbox drop-in, so ssh-auth keys win" {
+    qs_run 'SANDBOX_NAME=zzzzzzzzzzzzzzzz; INITIAL_DIR=/tmp; QS_CUSTOM_DIR=/nonexistent
+            HOME="$BATS_TEST_TMPDIR"; USER=me; derive_constants
+            printf "%s\n" "$QS_SSHD_DEFAULT_DROPIN" "$QS_SSHD_DROPIN" | LC_ALL=C sort | head -n1
+            echo "$QS_SSHD_DROPIN"'
+    [ "$status" -eq 0 ]
+    [ "${lines[0]}" == "${lines[1]}" ]
+    [ "$(dirname "${lines[0]}")" == "/etc/ssh/sshd_config.d" ]
+}
+
+@test "ssh_default_deny_install warns and removes the rule when sshd rejects the config" {
+    ssh_fixture
+    touch "$WORK/sshd-t-fails"
+    ssh_run 'ssh_default_deny_install; echo "build-continues"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"WARNING: sshd rejected its configuration"*"bad config"* ]]
+    [[ "$output" == *"build-continues"* ]]
+    [ ! -e "$WORK/etc/sshd_config.d/020-quicksand-default.conf" ]
+}
+
+@test "ssh_default_deny_install warns and removes the rule when it would be shadowed" {
+    ssh_fixture
+    sed -i '' -e 's|^authorizedkeysfile none|authorizedkeysfile .ssh/authorized_keys|' "$WORK/effective-default"
+    ssh_run 'ssh_default_deny_install; echo "build-continues"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"WARNING: sshd would not apply 'authorizedkeysfile none' to sandbox users"* ]]
+    [[ "$output" == *"build-continues"* ]]
+    [ ! -e "$WORK/etc/sshd_config.d/020-quicksand-default.conf" ]
+}
+
+@test "ssh_default_deny_install warns and installs nothing without a drop-in Include" {
+    ssh_fixture
+    echo "Port 22" > "$WORK/etc/sshd_config"
+    ssh_run 'ssh_default_deny_install; echo "build-continues"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"WARNING: $WORK/etc/sshd_config doesn't include"* ]]
+    [[ "$output" == *"build-continues"* ]]
+    [ -z "$(ls -A "$WORK/etc/sshd_config.d")" ]
+}
+
+@test "ssh_default_deny_cleanup keeps the rule while any sandbox remains" {
+    ssh_fixture
+    ssh_run 'ssh_default_deny_install
+             touch "$WORK/var/sandbox-qs-other.sb"; ssh_default_deny_cleanup'
+    [ "$status" -eq 0 ]
+    [ -e "$WORK/etc/sshd_config.d/020-quicksand-default.conf" ]
+    ssh_run 'rm "$WORK/var/sandbox-qs-other.sb"; ssh_default_deny_cleanup'
+    [ "$status" -eq 0 ]
+    [ ! -e "$WORK/etc/sshd_config.d/020-quicksand-default.conf" ]
+}
+
+@test "config_fingerprint changes when the default SSH rule changes" {
+    qs_run 'QS_CUSTOM_DIR=/nonexistent; config_fingerprint'
+    before="$output"
+    echo "# changed" >> "$REPO_COPY/config/sshd-quicksand-default.conf"
+    qs_run 'QS_CUSTOM_DIR=/nonexistent; config_fingerprint'
+    [ "$before" != "$output" ]
 }
 
 @test "ssh keys are appended once, compared by key rather than comment" {

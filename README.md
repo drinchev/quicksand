@@ -411,6 +411,20 @@ If either check fails the drop-in is removed again, so a mistake can't break
 SSH for the rest of the Mac. Rebuilds re-render and re-verify it; your
 authorized keys are kept.
 
+**Sandboxes without `ssh-auth` accept no SSH login at all.** Left alone, sshd
+would read a sandbox user's own `~/.ssh/authorized_keys` — a file the sandbox
+can write — so an agent could authorize a key of its own, `ssh` to localhost
+and land in a plain shell outside `sandbox-exec`. Every build therefore
+installs one shared rule, `/etc/ssh/sshd_config.d/020-quicksand-default.conf`:
+for every `qs-*` user, no key file, no password, key-only authentication. It
+sorts after the per-sandbox `010-` files, and sshd keeps the first value it
+sees for a keyword, so a sandbox with `ssh-auth` keeps its own key list while
+all others have none. Because the rule is shared, the first build after an
+upgrade protects every sandbox at once. It is verified like the per-sandbox
+block; a host whose sshd can't take it gets a warning rather than a failed
+build, and the rule is removed when the last sandbox is uninstalled. It
+applies to any account named `qs-*`, quicksand's or not.
+
 Things that differ from a local session:
 
 - **Host-staged credentials aren't refreshed.** `qs shell`/`qs claude` run the
@@ -507,7 +521,7 @@ Hooks are not part of the template — the merge is top-level only, and the
 
 The install marker stores a fingerprint of everything a build bakes into a
 sandbox: the qs version, the `sandbox-exec` profile template, `profile.d/`,
-`logout.d/`, the `quicksand.md` and `claude-settings.json` assets, the speech broker assets, the SSH session wrapper and sshd template, and your personal overlay — contents, names, and file modes. When any of it
+`logout.d/`, the `quicksand.md` and `claude-settings.json` assets, the speech broker assets, the SSH session wrapper and sshd templates, and your personal overlay — contents, names, and file modes. When any of it
 changes (a `git pull` of this repo, an edit to your overlay), the next
 `qs shell`/`qs claude` rebuilds the sandbox automatically and tells you why.
 
@@ -587,6 +601,7 @@ existing sandboxes automatically on next entry.
 | Sandbox profile | `/var/quicksand/sandbox-qs-NAME.sb` |
 | SSH wrapper & authorized keys (`qs ssh-auth`) | `/var/quicksand/ssh-qs-NAME/` |
 | sshd `Match` block (`qs ssh-auth`) | `/etc/ssh/sshd_config.d/010-quicksand-qs-NAME.conf` |
+| sshd default rule for all sandboxes | `/etc/ssh/sshd_config.d/020-quicksand-default.conf` |
 | Install marker, clone & GCP manifests | `~/.config/quicksand/` |
 
 Sandbox names: up to 16 characters, `[A-Za-z0-9_-]+`.

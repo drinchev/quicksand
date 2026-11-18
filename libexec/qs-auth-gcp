@@ -108,7 +108,10 @@ gcp_mint_token() {
 gcp_auto_refresh() {
     local sa_file="$QS_PRIVATE_DIR/gcp-sa"
     [[ -f "$sa_file" ]] || return 0
-    command -v gcloud >/dev/null 2>&1 || return 0
+    command -v gcloud >/dev/null 2>&1 || {
+        warn "gcloud not on the host PATH — can't refresh the GCP token for '$SANDBOX_NAME'. Continuing with the one already staged, if any."
+        return 0
+    }
 
     local token_file="$QS_PRIVATE_DIR/gcp-token"
     if [[ -f "$token_file" && -z "$(find "$token_file" -mmin +50 2>/dev/null)" ]]; then

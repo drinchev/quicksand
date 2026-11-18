@@ -1176,6 +1176,32 @@ op_provision_stub() {
     [ ! -e "$BATS_TEST_TMPDIR/priv/op-token" ]
 }
 
+@test "qs-auth-op refresh retries with the app integration stated in the environment" {
+    # op as it behaves when macOS hides 1Password's settings file from it.
+    make_stub op 'echo "op $* biometric=${OP_BIOMETRIC_UNLOCK_ENABLED:-unset}" >> "$STUB_LOG"
+        if [[ "${OP_BIOMETRIC_UNLOCK_ENABLED:-}" != "true" ]]; then
+            echo "No accounts configured for use with 1Password CLI." >&2; exit 1
+        fi
+        echo "ops_via-env"'
+    printf 'qs-work\tquicksand-service-account\tqs-work\n' > "$BATS_TEST_TMPDIR/op-work"
+    op_exec refresh
+    [ "$status" -eq 0 ]
+    [[ "$output" != *"WARNING"* ]]
+    [ "$(cat "$BATS_TEST_TMPDIR/priv/op-token")" == "ops_via-env" ]
+    [ "$(grep -c "^op read" "$STUB_LOG")" -eq 2 ]
+    grep -q "biometric=unset" "$STUB_LOG"
+    grep -q "biometric=true" "$STUB_LOG"
+}
+
+@test "qs-auth-op refresh passes on op's own error when the read fails" {
+    make_stub op 'echo "[ERROR] 2026/11/18 connecting to desktop app: not running" >&2; exit 1'
+    printf 'qs-work\tquicksand-service-account\tqs-work\n' > "$BATS_TEST_TMPDIR/op-work"
+    op_exec refresh
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Could not read the 1Password token for 'work' (op said: [ERROR] 2026/11/18 connecting to desktop app: not running) — unlock"* ]]
+    [ ! -e "$BATS_TEST_TMPDIR/priv/op-token" ]
+}
+
 @test "qs-auth-op cleanup deletes the token item and reminds about the SA" {
     make_stub op 'echo "op $*" >> "$STUB_LOG"; exit 0'
     printf 'qs-work\tquicksand-service-account\tqs-work\n' > "$BATS_TEST_TMPDIR/op-work"

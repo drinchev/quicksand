@@ -135,10 +135,26 @@ op_auto_inject() {
     IFS=$'\t' read -r vault item sa < "$QS_OP_MANIFEST"
     [[ -n "$vault" && -n "$item" ]] || return 0
 
-    local token
-    token="$(op read "op://$vault/$item/password" 2>/dev/null || true)"
+    # Keep op's own error: "locked" and "no desktop app to ask" need different
+    # fixes, and when the credential broker runs this nobody sees op's stderr.
+    # It carries no secret — the token only ever goes to stdout.
+    local token err_file err=""
+    err_file="$(mktemp "${TMPDIR:-/tmp}/qs-op-err.XXXXXX")"
+    token="$(op read "op://$vault/$item/password" 2>"$err_file" || true)"
+    # op learns that the desktop-app integration is on from a settings file in
+    # 1Password's Group Container. macOS 27 blocks that read for processes
+    # whose responsible app lacks the "data from other apps" permission — a
+    # terminal usually has it, the credential broker's LaunchAgent does not —
+    # and op then reports "No accounts configured". Stating it through the
+    # environment skips the file; op still has to be authorized by the app.
+    if [[ -z "$token" && -z "${OP_BIOMETRIC_UNLOCK_ENABLED:-}" ]]; then
+        token="$(OP_BIOMETRIC_UNLOCK_ENABLED=true \
+            op read "op://$vault/$item/password" 2>"$err_file" || true)"
+    fi
+    err="$(head -n 3 "$err_file" | LC_ALL=C tr -s '\n\t' '  ' | cut -c 1-300)"
+    rm -f "$err_file"
     if [[ -z "$token" ]]; then
-        warn "Could not read the 1Password token for '$SANDBOX_NAME' — unlock 1Password or re-run 'qs op-auth $SANDBOX_NAME'. Continuing without it."
+        warn "Could not read the 1Password token for '$SANDBOX_NAME'${err:+ (op said: ${err% })} — unlock 1Password or re-run 'qs op-auth $SANDBOX_NAME'. Continuing without it."
         return 0
     fi
 

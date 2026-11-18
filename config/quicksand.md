@@ -26,6 +26,17 @@ home directory, files, or credentials.
   (the gh token and, if configured, a short-lived GCP token).
 - Network access is unrestricted.
 
+## Sessions over SSH
+- The user may reach this sandbox over SSH (`qs ssh-auth` on the host) instead
+  of a local terminal; `SSH_CONNECTION` is set when they did. Those sessions
+  are sandboxed exactly like local ones.
+- Nothing on the host runs when an SSH session starts, so host-staged
+  credentials are not refreshed: an expired GCP token or a missing 1Password
+  token needs the user to run `qs gcp-token <name>` or open a local session.
+- Which keys may log in is decided on the host, in a root-owned file. Don't
+  manage SSH access from inside the sandbox (`~/.ssh/authorized_keys` is not
+  consulted) — ask the user to run `qs ssh-auth <name> KEY.pub`.
+
 ## Getting the user's attention
 - `say`, `afplay` and `osascript -e beep` all exit 0 in silence here: this
   account has no GUI session, so macOS's speech services never load for it.

@@ -1968,3 +1968,360 @@ JSON
     [ ! -f "$WORK/install/say-broker-work.log" ]
     [ ! -f "$WORK/ws/_quicksand/bin/qs-say" ]
 }
+
+
+###############################################################################
+# qs ssh-auth — CLI plumbing and host-side helpers (sudo runs the command
+# as-is; sshd, dscl, dseditgroup and launchctl are stubs; root-owned paths
+# are redirected under $WORK)
+###############################################################################
+
+# Globals the SSH helpers read, pointed at a scratch tree.
+SSH_GLOBALS='PATH="$STUBS:$PATH"; SANDBOX_NAME=work; QUICKSAND_USER=qs-work
+    HOST_USER=me; COMMAND_ARGS=(); HOME="$WORK/hosthome"
+    SHARED_WORKSPACE="$WORK/ws"; SANDBOX_PROFILE="$WORK/var/sandbox-qs-work.sb"
+    QS_SSHD_DIR="$WORK/var/ssh-qs-work"
+    QS_SSHD_AUTHORIZED_KEYS="$QS_SSHD_DIR/authorized_keys"
+    QS_SSHD_SESSION="$QS_SSHD_DIR/session"; QS_SSHD_ZDOTDIR="$QS_SSHD_DIR/zdotdir"
+    QS_SSHD_BIN="$STUBS/sshd"; QS_SSHD_CONFIG="$WORK/etc/sshd_config"
+    QS_SSHD_DROPIN="$WORK/etc/sshd_config.d/010-quicksand-qs-work.conf"'
+
+ssh_run() {
+    qs_run "$SSH_GLOBALS; $1"
+}
+
+# A host whose sshd accepts the drop-in and reports it as effective: `sshd
+# -t` succeeds unless $WORK/sshd-t-fails exists, and `sshd -T` prints
+# $WORK/effective. No Remote Login access group exists unless a test
+# creates $WORK/access-group. Two real key pairs land in $WORK.
+ssh_fixture() {
+    export WORK="$BATS_TEST_TMPDIR/work"
+    mkdir -p "$WORK/etc/sshd_config.d" "$WORK/var" "$WORK/hosthome/.ssh"
+    echo "Include $WORK/etc/sshd_config.d/*" > "$WORK/etc/sshd_config"
+    make_stub sudo 'while [[ "${1:-}" == -* ]]; do shift; done; exec "$@"'
+    make_stub sshd 'echo "sshd $*" >> "$STUB_LOG"
+        case " $* " in
+            *" -t "*) if [[ -e "$WORK/sshd-t-fails" ]]; then echo "bad config" >&2; exit 255; fi ;;
+            *" -T "*) cat "$WORK/effective" ;;
+        esac'
+    make_stub dscl '[[ -e "$WORK/access-group" && "$*" == *"/Groups/com.apple.access_ssh" ]]'
+    make_stub dseditgroup 'echo "dseditgroup $*" >> "$STUB_LOG"'
+    make_stub launchctl 'exit 0'
+    make_stub scutil 'echo testmac'
+    cat > "$WORK/effective" <<EOF
+port 22
+forcecommand $WORK/var/ssh-qs-work/session
+authorizedkeysfile $WORK/var/ssh-qs-work/authorized_keys
+setenv ZDOTDIR=$WORK/var/ssh-qs-work/zdotdir
+passwordauthentication no
+kbdinteractiveauthentication no
+permituserrc no
+permituserenvironment no
+allowagentforwarding no
+EOF
+    ssh-keygen -q -t ed25519 -N "" -C first@test  -f "$WORK/k1"
+    ssh-keygen -q -t ed25519 -N "" -C second@test -f "$WORK/k2"
+}
+
+@test "parse_args accepts 'ssh-auth NAME' with an optional key or 'off'" {
+    qs_run 'parse_args ssh-auth work; echo "$COMMAND|$SANDBOX_NAME|$SSH_AUTH_ARG"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == "ssh-auth|work|" ]]
+    qs_run 'parse_args sa work off; echo "$COMMAND|$SSH_AUTH_ARG"'
+    [[ "$output" == "ssh-auth|off" ]]
+    qs_run 'parse_args ssh-auth work /tmp/key.pub; echo "$SSH_AUTH_ARG"'
+    [[ "$output" == "/tmp/key.pub" ]]
+}
+
+@test "parse_args rejects an unquoted key line for ssh-auth" {
+    qs_run 'parse_args ssh-auth work ssh-ed25519 AAAA me@host'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"quote a pasted key line"* ]]
+}
+
+@test "help lists the ssh-auth command" {
+    run "$QS" --help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"qs ssh-auth  NAME [KEY.pub | off]"* ]]
+}
+
+@test "config_fingerprint changes when the SSH session wrapper or sshd template changes" {
+    qs_run 'QS_CUSTOM_DIR=/nonexistent; config_fingerprint'
+    before="$output"
+    echo "# changed" >> "$REPO_COPY/config/qs-ssh-session"
+    qs_run 'QS_CUSTOM_DIR=/nonexistent; config_fingerprint'
+    middle="$output"
+    [ "$before" != "$middle" ]
+    echo "# changed" >> "$REPO_COPY/config/sshd-quicksand.conf.tmpl"
+    qs_run 'QS_CUSTOM_DIR=/nonexistent; config_fingerprint'
+    [ "$middle" != "$output" ]
+}
+
+@test "ssh_access_install installs the wrapper, key file and verified sshd drop-in" {
+    ssh_fixture
+    ssh_run 'ssh_access_install'
+    [ "$status" -eq 0 ]
+    dropin="$WORK/etc/sshd_config.d/010-quicksand-qs-work.conf"
+    grep -qx "Match User qs-work" "$dropin"
+    grep -qx "    ForceCommand $WORK/var/ssh-qs-work/session" "$dropin"
+    grep -qx "    AuthorizedKeysFile $WORK/var/ssh-qs-work/authorized_keys" "$dropin"
+    grep -qx "    SetEnv ZDOTDIR=$WORK/var/ssh-qs-work/zdotdir" "$dropin"
+    # Nothing a sandbox can write may be trusted by sshd.
+    [ "$(/usr/bin/stat -f %Lp "$WORK/var/ssh-qs-work/session")" == "555" ]
+    [ "$(/usr/bin/stat -f %Lp "$WORK/var/ssh-qs-work/authorized_keys")" == "644" ]
+    [ "$(/usr/bin/stat -f %Lp "$WORK/var/ssh-qs-work")" == "755" ]
+    [ -d "$WORK/var/ssh-qs-work/zdotdir" ]
+    [ -z "$(ls -A "$WORK/var/ssh-qs-work/zdotdir")" ]
+    # Every template token was substituted.
+    ! grep -qE '@[A-Z_]+@' "$dropin" "$WORK/var/ssh-qs-work/session"
+    grep -q 'readonly QS_USER="qs-work"' "$WORK/var/ssh-qs-work/session"
+    grep -q "readonly QS_PROFILE=\"$WORK/var/sandbox-qs-work.sb\"" "$WORK/var/ssh-qs-work/session"
+    grep -q "sshd -t -f $WORK/etc/sshd_config" "$STUB_LOG"
+    grep -q "sshd -T -f $WORK/etc/sshd_config -C user=qs-work," "$STUB_LOG"
+    ! grep -q dseditgroup "$STUB_LOG"
+}
+
+@test "ssh_access_install keeps authorized keys across a refresh" {
+    ssh_fixture
+    ssh_run 'ssh_access_install; ssh_read_keys "$WORK/k1.pub"; ssh_append_keys; ssh_access_install'
+    [ "$status" -eq 0 ]
+    grep -qF "$(cat "$WORK/k1.pub")" "$WORK/var/ssh-qs-work/authorized_keys"
+}
+
+@test "ssh_access_install removes the drop-in again when sshd rejects the config" {
+    ssh_fixture
+    touch "$WORK/sshd-t-fails"
+    ssh_run 'ssh_access_install'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"sshd rejected its configuration"*"bad config"* ]]
+    [ ! -e "$WORK/etc/sshd_config.d/010-quicksand-qs-work.conf" ]
+}
+
+@test "ssh_access_install removes the drop-in when its settings would be shadowed" {
+    ssh_fixture
+    sed -i '' -e 's|^forcecommand .*|forcecommand none|' "$WORK/effective"
+    ssh_run 'ssh_access_install'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"would not apply 'forcecommand $WORK/var/ssh-qs-work/session'"* ]]
+    [ ! -e "$WORK/etc/sshd_config.d/010-quicksand-qs-work.conf" ]
+}
+
+@test "ssh_access_install refuses a host that lets users set their own environment" {
+    ssh_fixture
+    sed -i '' -e 's|^permituserenvironment no|permituserenvironment yes|' "$WORK/effective"
+    ssh_run 'ssh_access_install'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"would not apply 'permituserenvironment no'"* ]]
+    [ ! -e "$WORK/etc/sshd_config.d/010-quicksand-qs-work.conf" ]
+}
+
+@test "ssh_access_install changes nothing when sshd_config has no drop-in Include" {
+    ssh_fixture
+    echo "Port 22" > "$WORK/etc/sshd_config"
+    ssh_run 'ssh_access_install'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"doesn't include $WORK/etc/sshd_config.d/"* ]]
+    [ ! -e "$WORK/var/ssh-qs-work" ]
+    [ -z "$(ls -A "$WORK/etc/sshd_config.d")" ]
+}
+
+@test "ssh_access_install joins the Remote Login access group when one exists" {
+    ssh_fixture
+    touch "$WORK/access-group"
+    ssh_run 'ssh_access_install'
+    [ "$status" -eq 0 ]
+    grep -qx "dseditgroup -o edit -a qs-work -t user com.apple.access_ssh" "$STUB_LOG"
+}
+
+@test "ssh keys are appended once, compared by key rather than comment" {
+    ssh_fixture
+    awk '{print $1, $2, "renamed@elsewhere"}' "$WORK/k1.pub" > "$WORK/k1-renamed.pub"
+    ssh_run 'ssh_access_install
+             ssh_read_keys "$WORK/k1.pub"; ssh_append_keys
+             ssh_read_keys "$WORK/k1-renamed.pub"; ssh_append_keys
+             ssh_read_keys "$(cat "$WORK/k2.pub")"; ssh_append_keys
+             ssh_key_count'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Authorized: 256 SHA256:"*"first@test"* ]]
+    [[ "$output" == *"Already authorized:"* ]]
+    [ "${lines[${#lines[@]}-1]}" == "2" ]
+    [ "$(wc -l < "$WORK/var/ssh-qs-work/authorized_keys" | tr -d ' ')" == "2" ]
+    grep -qF "second@test" "$WORK/var/ssh-qs-work/authorized_keys"
+}
+
+@test "ssh_read_keys refuses a private key without echoing it" {
+    ssh_fixture
+    ssh_run 'ssh_read_keys "$WORK/k1"'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"is not an OpenSSH public key file"* ]]
+    [[ "$output" != *"BEGIN OPENSSH PRIVATE KEY"* ]]
+}
+
+@test "ssh_read_keys refuses key lines that carry authorized_keys options" {
+    ssh_fixture
+    printf 'command="/bin/sh" %s\n' "$(cat "$WORK/k1.pub")" > "$WORK/opts.pub"
+    ssh_run 'ssh_read_keys "$WORK/opts.pub"'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"is not an OpenSSH public key file"* ]]
+}
+
+@test "ssh_read_keys refuses an argument that is neither a file nor a key" {
+    ssh_fixture
+    ssh_run 'ssh_read_keys "$WORK/nope.pub"'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"Expected a public key file or a quoted public key line"* ]]
+    ssh_run 'ssh_read_keys "ssh-ed25519 not_base64!"'
+    [ "$status" -ne 0 ]
+}
+
+@test "cmd_ssh_auth authorizes the host user's own key by default" {
+    ssh_fixture
+    cp "$WORK/k1.pub" "$WORK/hosthome/.ssh/id_ed25519.pub"
+    ssh_run 'SSH_AUTH_ARG=""; cmd_ssh_auth'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"SSH access enabled for 'work'"* ]]
+    [[ "$output" == *"ssh qs-work@testmac.local"* ]]
+    [[ "$output" == *"1 authorized"* ]]
+    [[ "$output" != *"WARNING"* ]]
+    grep -qF "$(cat "$WORK/k1.pub")" "$WORK/var/ssh-qs-work/authorized_keys"
+}
+
+@test "cmd_ssh_auth with no argument only refreshes once keys exist" {
+    ssh_fixture
+    cp "$WORK/k1.pub" "$WORK/hosthome/.ssh/id_ed25519.pub"
+    ssh_run 'SSH_AUTH_ARG="$WORK/k2.pub"; cmd_ssh_auth; SSH_AUTH_ARG=""; cmd_ssh_auth'
+    [ "$status" -eq 0 ]
+    [ "$(wc -l < "$WORK/var/ssh-qs-work/authorized_keys" | tr -d ' ')" == "1" ]
+    grep -qF "second@test" "$WORK/var/ssh-qs-work/authorized_keys"
+}
+
+@test "cmd_ssh_auth installs nothing when there is no key to authorize" {
+    ssh_fixture
+    ssh_run 'SSH_AUTH_ARG=""; cmd_ssh_auth'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"No public key to authorize"* ]]
+    [ ! -e "$WORK/var/ssh-qs-work" ]
+    ssh_run 'SSH_AUTH_ARG="$WORK/k1"; cmd_ssh_auth'
+    [ "$status" -ne 0 ]
+    [ ! -e "$WORK/var/ssh-qs-work" ]
+    [ -z "$(ls -A "$WORK/etc/sshd_config.d")" ]
+}
+
+@test "cmd_ssh_auth warns when Remote Login is off" {
+    ssh_fixture
+    make_stub launchctl 'exit 113'
+    ssh_run 'SSH_AUTH_ARG="$WORK/k1.pub"; cmd_ssh_auth'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"WARNING: Remote Login is off"* ]]
+}
+
+@test "cmd_ssh_auth off revokes the keys and removes the sshd configuration" {
+    ssh_fixture
+    ssh_run 'SSH_AUTH_ARG="$WORK/k1.pub"; cmd_ssh_auth; SSH_AUTH_ARG=off; cmd_ssh_auth'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"SSH access disabled for 'work'"* ]]
+    [ ! -e "$WORK/etc/sshd_config.d/010-quicksand-qs-work.conf" ]
+    [ ! -e "$WORK/var/ssh-qs-work" ]
+    grep -qx "dseditgroup -o edit -d qs-work -t user com.apple.access_ssh" "$STUB_LOG"
+}
+
+
+###############################################################################
+# config/qs-ssh-session — the rendered wrapper run directly, as sshd would,
+# with sandbox-exec swapped for a stub that logs and execs the rest
+###############################################################################
+
+# Render the wrapper for the current user (it refuses to serve anyone else)
+# against a scratch home, workspace and sandbox profile. $1 overrides the user.
+session_fixture() {
+    export WORK="$BATS_TEST_TMPDIR/work"
+    export SESSION="$WORK/session"
+    mkdir -p "$WORK/home" "$WORK/ws/_quicksand/profile.d" "$WORK/ws/_quicksand/logout.d"
+    touch "$WORK/profile.sb"
+    # The log path is baked in: the wrapper scrubs the environment, so the
+    # stub can't read $STUB_LOG from it.
+    make_stub sandbox-exec "echo \"sandbox-exec \$1 \$2\" >> \"$STUB_LOG\"; shift 2; exec \"\$@\""
+    sed -e "s|@SANDBOX_NAME@|work|g" \
+        -e "s|@QUICKSAND_USER@|${1:-$(id -un)}|g" \
+        -e "s|@QUICKSAND_USER_HOME@|$WORK/home|g" \
+        -e "s|@SHARED_WORKSPACE@|$WORK/ws|g" \
+        -e "s|@SANDBOX_PROFILE@|$WORK/profile.sb|g" \
+        -e "s|@HOST_USER@|me|g" \
+        -e "s|/usr/bin/sandbox-exec|$STUBS/sandbox-exec|g" \
+        "$REPO_COPY/config/qs-ssh-session" > "$SESSION"
+    chmod +x "$SESSION"
+}
+
+# session_hook DIR NAME BODY — add an executable hook to profile.d/logout.d.
+session_hook() {
+    printf '#!/bin/bash\n%s\n' "$3" > "$WORK/ws/_quicksand/$1/$2"
+    chmod +x "$WORK/ws/_quicksand/$1/$2"
+}
+
+@test "ssh session runs the client's command inside sandbox-exec" {
+    session_fixture
+    export SSH_ORIGINAL_COMMAND='echo "ran in $QS_SANDBOX_NAME at $PWD as $QS_HOST_USER"'
+    run bash -c '"$SESSION" </dev/null 2>/dev/null'
+    [ "$status" -eq 0 ]
+    [[ "$output" == "ran in work at $WORK/home as me" ]]
+    grep -qx "sandbox-exec -f $WORK/profile.sb" "$STUB_LOG"
+}
+
+@test "ssh session passes the command's exit status through" {
+    session_fixture
+    export SSH_ORIGINAL_COMMAND='exit 7'
+    run bash -c '"$SESSION" </dev/null 2>/dev/null'
+    [ "$status" -eq 7 ]
+}
+
+@test "ssh session builds a scrubbed environment" {
+    session_fixture
+    export LEAKED=from-sshd SSH_CONNECTION="1.2.3.4 5 6.7.8.9 22"
+    export SSH_ORIGINAL_COMMAND='echo "leak=[${LEAKED:-}] sid=${QS_SESSION_ID:+set} lang=$LANG conn=$SSH_CONNECTION shell=$SHELL path=$PATH"'
+    run bash -c 'unset LANG; "$SESSION" </dev/null 2>/dev/null'
+    [ "$status" -eq 0 ]
+    [[ "$output" == "leak=[] sid=set lang=en_US.UTF-8 conn=1.2.3.4 5 6.7.8.9 22 shell=/bin/zsh path=$WORK/home/.local/bin:$WORK/home/.claude/local:/usr/bin:/bin:/usr/sbin:/sbin" ]]
+}
+
+@test "ssh session keeps hook output and hook stdin away from the command's streams" {
+    session_fixture
+    session_hook profile.d 10-noisy.sh 'echo profile-noise; cat'
+    session_hook logout.d 10-bye.sh 'echo logout-noise; touch "$SHARED_WORKSPACE/logged-out"'
+    echo 'echo zshrc-noise; export FROM_ZSHRC=yes' > "$WORK/home/.zshrc"
+    export SSH_ORIGINAL_COMMAND='cat; echo " zshrc=$FROM_ZSHRC"'
+    run bash -c 'printf payload | "$SESSION" 2>"$WORK/stderr"'
+    [ "$status" -eq 0 ]
+    [[ "$output" == "payload zshrc=yes" ]]
+    grep -qx "profile-noise" "$WORK/stderr"
+    grep -qx "zshrc-noise" "$WORK/stderr"
+    grep -qx "logout-noise" "$WORK/stderr"
+    [ -e "$WORK/ws/logged-out" ]
+}
+
+@test "ssh session without a command runs piped stdin as a shell" {
+    session_fixture
+    unset SSH_ORIGINAL_COMMAND
+    run bash -c 'echo "echo piped-into-\$QS_SANDBOX_NAME" | "$SESSION" 2>/dev/null'
+    [ "$status" -eq 0 ]
+    [[ "$output" == "piped-into-work" ]]
+}
+
+@test "ssh session fails closed when the sandbox profile is missing" {
+    session_fixture
+    rm "$WORK/profile.sb"
+    export SSH_ORIGINAL_COMMAND='echo should-not-run'
+    run bash -c '"$SESSION" </dev/null'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"sandbox profile $WORK/profile.sb is missing"* ]]
+    [[ "$output" != *"should-not-run"* ]]
+    [ ! -e "$STUB_LOG" ]
+}
+
+@test "ssh session refuses to serve any user but its own" {
+    session_fixture qs-someone-else
+    export SSH_ORIGINAL_COMMAND='echo should-not-run'
+    run bash -c '"$SESSION" </dev/null'
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"only serves qs-someone-else"* ]]
+    [[ "$output" != *"should-not-run"* ]]
+}

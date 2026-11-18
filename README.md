@@ -106,10 +106,11 @@ qs gcp-auth  NAME TARGET_PROJECT         provision a scoped GCP service account
 qs gcp-token NAME                        refresh the GCP access token (~1h)
 qs op-auth   NAME [--write]              provision a 1Password vault for secrets
 qs docker    NAME [off]                  let the sandbox run containers via a broker
+qs ssh-auth  NAME [KEY.pub | off]        allow SSH into the sandbox (sandboxed sessions)
 qs uninstall NAME                        remove the sandbox completely
 qs list                                  list sandboxes, their clones and memory repo
 
-Short aliases: b, s, cl, c, g, gp, gt, o, d, u, l.
+Short aliases: b, s, cl, c, g, gp, gt, o, d, sa, u, l.
 ```
 
 PATH is where the session starts, *inside* the sandbox: relative paths and
@@ -356,6 +357,73 @@ LaunchAgent at install time. Containers themselves are confined by your
 engine's VM, not by `sandbox-exec`; container network egress is unrestricted,
 matching quicksand's "files, not egress" model.
 
+## SSH into a sandbox (`qs ssh-auth`)
+
+`qs shell` and `qs claude` enter a sandbox from a terminal on the Mac that
+hosts it. `qs ssh-auth` adds a second way in — `ssh qs-NAME@your-mac` — so a
+sandbox can serve as a **remote environment**: for Claude Code Desktop's SSH
+connections, an editor's remote mode, or simply a shell from another machine.
+
+```bash
+qs ssh-auth work                      # enable; authorizes your ~/.ssh/id_*.pub
+qs ssh-auth work ~/laptop.pub         # authorize another key (each run adds one)
+qs ssh-auth work 'ssh-ed25519 AAAA… me@laptop'   # …or a pasted key line
+qs ssh-auth work off                  # revoke every key, remove the sshd config
+
+ssh qs-work@your-mac.local            # interactive shell, like `qs shell work`
+ssh qs-work@your-mac.local 'cd project && git status'   # one command; scp and sftp work too
+```
+
+Remote Login must be on (System Settings › General › Sharing › Remote Login).
+qs never switches it on — that exposes sshd for the whole Mac and is your
+call — but it tells you when it is off, and if Remote Login is limited to
+"only these users" it adds the sandbox user to that list.
+
+A sandbox user is an ordinary macOS account, so sshd would happily give it a
+plain login shell — one that skips `sandbox-exec`, the curated environment and
+the `profile.d/` hooks, i.e. most of what makes it a sandbox. `qs ssh-auth`
+closes that gap in sshd itself, with a `Match User qs-NAME` block
+(`/etc/ssh/sshd_config.d/010-quicksand-qs-NAME.conf`):
+
+- **Every session is forced through a wrapper.** `ForceCommand` runs
+  `config/qs-ssh-session`, which builds the same scrubbed environment as
+  `qs shell`, enters the sandbox's `sandbox-exec` profile, runs the
+  `profile.d/` hooks, then starts your shell or the command you asked for
+  (`logout.d/` hooks run when it ends). That covers logins, `ssh host cmd`,
+  scp and the sftp subsystem alike. Without a readable sandbox profile the
+  wrapper refuses the session rather than run it unsandboxed.
+- **The sandbox can't authorize itself.** Keys are read from
+  `/var/quicksand/ssh-qs-NAME/authorized_keys`, root-owned like the wrapper —
+  not from `~/.ssh/authorized_keys`, which the sandbox can write. Only bare
+  public keys are accepted, and login is key-only.
+- **Nothing sandbox-writable runs before the sandbox starts.** `~/.ssh/rc` is
+  disabled, and `ZDOTDIR` is pinned to an empty root-owned directory so the
+  shell sshd uses to start the wrapper can't pick up the sandbox's
+  `~/.zshenv`.
+- **Agent and X11 forwarding are off**, so your own SSH keys can't follow you
+  in. TCP port forwarding is left on (the sandbox's network is unrestricted
+  anyway).
+
+The drop-in is validated before it is trusted: `sshd -t` must accept the full
+configuration, and `sshd -T` must report these settings as the ones in effect
+for the sandbox user (an earlier `Match` block of your own could shadow them).
+If either check fails the drop-in is removed again, so a mistake can't break
+SSH for the rest of the Mac. Rebuilds re-render and re-verify it; your
+authorized keys are kept.
+
+Things that differ from a local session:
+
+- **Host-staged credentials aren't refreshed.** `qs shell`/`qs claude` run the
+  auth providers on the host before entering; sshd doesn't. The `gh` token is
+  a file and keeps working, but a GCP token expires (`qs gcp-token NAME` on
+  the host) and the 1Password token is only present while it has been staged
+  by a local launch.
+- **Hook output goes to stderr** for anything but a plain interactive login,
+  and hooks get no stdin, so they can't corrupt or swallow a protocol stream.
+  The hooks add roughly a second to each connection.
+- **`-x`/`--no-sandbox` has no SSH equivalent** — SSH sessions are always
+  sandboxed.
+
 ## Speech from the sandbox (`qs-say`)
 
 `say` doesn't work inside a sandbox, and not for the reason you'd guess.
@@ -439,7 +507,7 @@ Hooks are not part of the template — the merge is top-level only, and the
 
 The install marker stores a fingerprint of everything a build bakes into a
 sandbox: the qs version, the `sandbox-exec` profile template, `profile.d/`,
-`logout.d/`, the `quicksand.md` and `claude-settings.json` assets, the speech broker assets, and your personal overlay — contents, names, and file modes. When any of it
+`logout.d/`, the `quicksand.md` and `claude-settings.json` assets, the speech broker assets, the SSH session wrapper and sshd template, and your personal overlay — contents, names, and file modes. When any of it
 changes (a `git pull` of this repo, an edit to your overlay), the next
 `qs shell`/`qs claude` rebuilds the sandbox automatically and tells you why.
 
@@ -517,6 +585,8 @@ existing sandboxes automatically on next entry.
 | GCP access token & SA ref | `/Users/Shared/qs-NAME/_quicksand/gcp-token`, `gcp-sa` |
 | Sudoers | `/etc/sudoers.d/50-nopasswd-for-qs-NAME` |
 | Sandbox profile | `/var/quicksand/sandbox-qs-NAME.sb` |
+| SSH wrapper & authorized keys (`qs ssh-auth`) | `/var/quicksand/ssh-qs-NAME/` |
+| sshd `Match` block (`qs ssh-auth`) | `/etc/ssh/sshd_config.d/010-quicksand-qs-NAME.conf` |
 | Install marker, clone & GCP manifests | `~/.config/quicksand/` |
 
 Sandbox names: up to 16 characters, `[A-Za-z0-9_-]+`.

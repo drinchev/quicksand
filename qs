@@ -56,6 +56,9 @@ readonly QS_SAY_PLIST_TEMPLATE="$QS_REPO_DIR/config/com.quicksand.say-broker.pli
 # Both are templates, rendered and installed root-owned.
 readonly QS_SSH_SESSION_TEMPLATE="$QS_REPO_DIR/config/qs-ssh-session"
 readonly QS_SSHD_DROPIN_TEMPLATE="$QS_REPO_DIR/config/sshd-quicksand.conf.tmpl"
+# The rule for every sandbox user that has NOT been given SSH access: no
+# login at all. One static file for all sandboxes, installed by every build.
+readonly QS_SSHD_DEFAULT_SOURCE="$QS_REPO_DIR/config/sshd-quicksand-default.conf"
 
 QS_VERBOSE="${QS_VERBOSE:-0}"
 abort() { echo >&2 "ERROR: $*"; exit 1; }
@@ -118,6 +121,7 @@ config_fingerprint() {
         /usr/bin/shasum -a 256 < "$QS_DOCKER_PLIST_TEMPLATE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_SSH_SESSION_TEMPLATE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_SSHD_DROPIN_TEMPLATE" 2>/dev/null || true
+        /usr/bin/shasum -a 256 < "$QS_SSHD_DEFAULT_SOURCE" 2>/dev/null || true
         local dir
         for dir in "$QS_PROFILE_SOURCE_DIR" "$QS_LOGOUT_SOURCE_DIR" "$QS_CUSTOM_DIR"; do
             [[ -d "$dir" ]] || continue
@@ -219,7 +223,9 @@ so nothing inside the sandbox can grant itself access or shed the sandbox.
 Requires Remote Login to be on (System Settings > General > Sharing); qs does
 not switch it on for you. Credentials the host stages at launch (1Password
 token, GCP token) are not refreshed by SSH logins. 'qs ssh-auth NAME off'
-revokes all keys and removes the sshd configuration.
+revokes all keys and removes the sshd configuration. A sandbox without
+'ssh-auth' accepts no SSH login at all: every build installs one sshd rule
+for all qs-* users that ignores their own ~/.ssh/authorized_keys.
 
 'op-auth' sets up per-sandbox app-secret access via 1Password. Using your own
 host 1Password (so it must be signed in), it creates a vault 'qs-NAME', a
@@ -425,6 +431,9 @@ derive_constants() {
     # 010- sorts ahead of macOS's own 100-macos.conf: when several Match
     # blocks apply, sshd keeps the first value it sees for each keyword.
     readonly QS_SSHD_DROPIN="/etc/ssh/sshd_config.d/010-quicksand-$QUICKSAND_USER.conf"
+    # Shared by all sandboxes, and sorted after every per-sandbox 010- file
+    # so those win where they set a keyword (see ssh_default_deny_install).
+    readonly QS_SSHD_DEFAULT_DROPIN="/etc/ssh/sshd_config.d/020-quicksand-default.conf"
     readonly HOST_USER="$USER"
     QS_SESSION_ID="$(/usr/bin/uuidgen)"
     readonly QS_SESSION_ID
@@ -816,6 +825,59 @@ ssh_access_install() {
         dscl . -read "/Groups/$group" &>/dev/null || continue
         sudo dseditgroup -o edit -a "$QUICKSAND_USER" -t user "$group"
     done
+}
+
+# Install the rule that keeps sandbox users WITHOUT `qs ssh-auth` from
+# logging in over SSH at all (config/sshd-quicksand-default.conf explains
+# the hole it closes). One `Match User qs-*` file shared by every sandbox,
+# so the first build after an upgrade covers all of them at once, whether
+# or not they are ever launched again. Verified like the per-sandbox
+# drop-in — against a user name no sandbox can have ('.' is not allowed in
+# sandbox names), so the answer is the default and not some sandbox's own
+# block. Unlike `qs ssh-auth` this is hardening nobody asked for by name,
+# so a host whose sshd can't take it gets a warning, not a failed build.
+ssh_default_deny_install() {
+    local dropin_dir
+    dropin_dir="$(dirname "$QS_SSHD_DEFAULT_DROPIN")"
+    if ! grep -E '^[[:space:]]*Include[[:space:]]' "$QS_SSHD_CONFIG" 2>/dev/null \
+            | grep -qF "$dropin_dir/"; then
+        warn "$QS_SSHD_CONFIG doesn't include $dropin_dir/, so quicksand can't block SSH logins for sandbox users. If Remote Login is on, limit it to 'only these users'."
+        return 0
+    fi
+
+    sudo /usr/bin/install -m 0644 "$QS_SSHD_DEFAULT_SOURCE" "$QS_SSHD_DEFAULT_DROPIN"
+
+    local err
+    if ! err="$(sudo "$QS_SSHD_BIN" -t -f "$QS_SSHD_CONFIG" 2>&1)"; then
+        sudo rm -f "$QS_SSHD_DEFAULT_DROPIN"
+        warn "sshd rejected its configuration with quicksand's default SSH rule in place ($err), so the rule was removed again. Sandbox users without 'qs ssh-auth' are not blocked from SSH; if Remote Login is on, limit it to 'only these users'."
+        return 0
+    fi
+
+    local effective want
+    effective="$(sudo "$QS_SSHD_BIN" -T -f "$QS_SSHD_CONFIG" \
+        -C "user=qs-.probe,host=localhost,addr=127.0.0.1" 2>/dev/null || true)"
+    for want in \
+        "authorizedkeysfile none" \
+        "authorizedkeyscommand none" \
+        "authenticationmethods publickey" \
+        "passwordauthentication no" \
+        "kbdinteractiveauthentication no"; do
+        grep -qixF -- "$want" <<< "$effective" && continue
+        sudo rm -f "$QS_SSHD_DEFAULT_DROPIN"
+        warn "sshd would not apply '$want' to sandbox users — another setting in $QS_SSHD_CONFIG or $dropin_dir/ takes precedence — so quicksand's default SSH rule was removed again. Sandbox users without 'qs ssh-auth' are not blocked from SSH; if Remote Login is on, limit it to 'only these users'."
+        return 0
+    done
+}
+
+# Remove the shared default rule once no sandbox is left to protect —
+# judged by the rendered sandbox profiles, of which every sandbox has one.
+ssh_default_deny_cleanup() {
+    local profile
+    for profile in "$(dirname "$SANDBOX_PROFILE")"/sandbox-qs-*.sb; do
+        [[ -e "$profile" ]] && return 0
+    done
+    sudo rm -f "$QS_SSHD_DEFAULT_DROPIN"
 }
 
 # Undo `qs ssh-auth`: drop the sshd Match block first (which alone ends
@@ -1281,6 +1343,12 @@ EOF
         fi
     fi
 
+    # SSH: sandbox users get no login unless `qs ssh-auth` grants one. The
+    # rule is shared by all sandboxes, so this build also covers the ones
+    # that haven't been rebuilt yet.
+    debug "Installing default SSH rule"
+    ssh_default_deny_install
+
     # Likewise an enabled `qs ssh-auth`: re-render the session wrapper and the
     # sshd Match block (both fingerprinted) and re-verify them. Authorized
     # keys are left as they are. No-op for sandboxes without SSH access.
@@ -1375,6 +1443,7 @@ cmd_uninstall() {
     rm -f  "$INSTALL_MARKER"
     rmdir  "$INSTALL_DIR" 2>/dev/null || true
     sudo rm -f "$SUDOERS_FILE" "$SANDBOX_PROFILE"
+    ssh_default_deny_cleanup
     sudo rmdir "$(dirname "$SANDBOX_PROFILE")" 2>/dev/null || true
 
     if [[ -d "$SHARED_WORKSPACE" ]]; then

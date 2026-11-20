@@ -16,9 +16,11 @@
 #   qs-docker stop CONTAINER
 set -euo pipefail
 
-SOCK="${QS_DOCKER_SOCK:-${SHARED_WORKSPACE:?SHARED_WORKSPACE not set}/_quicksand/docker-broker.sock}"
+# Quicksand.app on the host listens here for every sandbox and works out
+# which one is calling from the connection itself.
+SOCK="${QS_DOCKER_SOCK:-/Users/Shared/quicksand/docker.sock}"
 [[ -S "$SOCK" ]] || {
-    echo "qs-docker: broker socket not found at $SOCK — enable with 'qs docker <name>' on the host" >&2
+    echo "qs-docker: Quicksand.app isn't running on the host (no socket at $SOCK) — open it there and try again" >&2
     exit 125
 }
 command -v jq >/dev/null 2>&1 || {
@@ -99,14 +101,17 @@ esac
 
 # Send the request (plus stdin, for run), stream the reply as it arrives,
 # and turn the trailing @@qs-docker-exit:N@@ sentinel into our exit code.
-STATUS=125
+STATUS=125 ANSWERED=false
 while IFS= read -r line; do
     if [[ "$line" =~ ^@@qs-docker-exit:([0-9]+)@@$ ]]; then
-        STATUS="${BASH_REMATCH[1]}"
+        STATUS="${BASH_REMATCH[1]}" ANSWERED=true
     else
         printf '%s\n' "$line"
     fi
 done < <(
-    { printf '%s\n' "$REQ"; if $STREAM_STDIN; then cat; fi; } | nc -U "$SOCK"
+    { printf '%s\n' "$REQ"; if $STREAM_STDIN; then cat; fi; } | nc -U "$SOCK" 2>/dev/null
 )
+# No sentinel: nothing answered — typically a socket left behind by an app
+# that has since quit.
+$ANSWERED || echo "qs-docker: no answer from Quicksand.app — is it running on the host?" >&2
 exit "$STATUS"

@@ -4,7 +4,26 @@
 # directly with controlled globals; external commands are stubbed via
 # PATH where needed. Nothing here touches sudo or real sandboxes.
 
+# qs-event (app/Sources/qs-event) writes the broker event log; Quicksand.app
+# passes its path to every broker as QS_EVENT_BIN. Build it once so the
+# brokers log here as they do under the app. Without swift, the event-log
+# tests skip.
+setup_file() {
+    local app="$BATS_TEST_DIRNAME/../app" bin
+    QS_EVENT_BIN_BUILT=""
+    if command -v swift >/dev/null 2>&1 \
+        && swift build --package-path "$app" --product qs-event --disable-sandbox \
+            > "$BATS_FILE_TMPDIR/qs-event-build.log" 2>&1 \
+        && bin="$(swift build --package-path "$app" --disable-sandbox --show-bin-path)"; then
+        QS_EVENT_BIN_BUILT="$bin/qs-event"
+    fi
+    export QS_EVENT_BIN_BUILT
+}
+
 setup() {
+    if [[ -x "${QS_EVENT_BIN_BUILT:-}" ]]; then
+        export QS_EVENT_BIN="$QS_EVENT_BIN_BUILT"
+    fi
     # qs refuses to load inside a quicksand session (its nested-sandbox
     # guard); drop the marker so the suite runs in a sandbox too — where
     # agents develop quicksand itself.
@@ -1395,26 +1414,73 @@ broker() {
     [[ "$output" == *"docker CLI not found on host"* ]]
 }
 
-@test "docker_broker_install stages, renders, and loads the agent" {
+@test "docker_broker_install stages and renders the app's spec" {
     command -v jq >/dev/null 2>&1 || skip "jq not available"
     make_stub launchctl 'echo "launchctl $*" >> "$STUB_LOG"'
     export WORK="$BATS_TEST_TMPDIR/work"
     mkdir -p "$WORK"
-    qs_run 'PATH="$STUBS:$PATH"; SANDBOX_NAME=work
+    qs_run 'PATH="$STUBS:$PATH"; SANDBOX_NAME=work; umask 0002
             SHARED_WORKSPACE="$WORK/ws"; QS_PRIVATE_DIR="$WORK/ws/_quicksand"
             INSTALL_DIR="$WORK/install"
             QS_DOCKER_LABEL=com.quicksand.docker-broker.work
-            QS_DOCKER_PLIST="$WORK/agent.plist"
+            QS_DOCKER_PLIST="$WORK/install/brokers/spec.plist"
+            QS_DOCKER_LEGACY_PLIST="$WORK/LaunchAgents/agent.plist"
             QS_DOCKER_BROKER_STAGED="$WORK/install/docker-broker-work.sh"
             HOME="$WORK"
             docker_broker_install /host/bin/docker /host/bin/jq'
     [ "$status" -eq 0 ]
+    spec="$WORK/install/brokers/spec.plist"
     [ -x "$WORK/install/docker-broker-work.sh" ]
     [ -x "$WORK/ws/_quicksand/bin/qs-docker" ]
-    grep -q "<string>/host/bin/docker</string>" "$WORK/agent.plist"
-    grep -q "<string>$WORK/install/docker-broker-work.sh</string>" "$WORK/agent.plist"
-    grep -q "$WORK/ws/_quicksand/docker-broker.sock" "$WORK/agent.plist"
-    grep -q "launchctl bootstrap" "$STUB_LOG"
+    grep -q "<string>/host/bin/docker</string>" "$spec"
+    grep -q "<string>$WORK/install/docker-broker-work.sh</string>" "$spec"
+    plutil -lint "$spec"
+    # The app refuses a spec others could edit, whatever the umask.
+    [ "$(stat -f %Lp "$spec")" = 644 ]
+    # The app owns the socket now; launchd isn't involved.
+    run grep -E "Sockets|inetd|_quicksand/docker-broker.sock" "$spec"
+    [ "$status" -ne 0 ]
+    run grep -q launchctl "$STUB_LOG"
+    [ "$status" -ne 0 ]
+}
+
+@test "broker installs retire the LaunchAgent a pre-app build loaded" {
+    command -v jq >/dev/null 2>&1 || skip "jq not available"
+    make_stub launchctl 'echo "launchctl $*" >> "$STUB_LOG"'
+    export WORK="$BATS_TEST_TMPDIR/work"
+    mkdir -p "$WORK/LaunchAgents" "$WORK/ws/_quicksand"
+    for kind in docker say auth; do touch "$WORK/LaunchAgents/$kind.plist"; done
+    touch "$WORK/ws/_quicksand/docker-broker.sock" "$WORK/ws/_quicksand/say.sock" \
+          "$WORK/ws/_quicksand/auth.sock"
+    qs_run 'PATH="$STUBS:$PATH"; SANDBOX_NAME=work
+            SHARED_WORKSPACE="$WORK/ws"; QS_PRIVATE_DIR="$WORK/ws/_quicksand"
+            INSTALL_DIR="$WORK/install"; HOME="$WORK"
+            QS_DOCKER_LABEL=com.quicksand.docker-broker.work
+            QS_DOCKER_PLIST="$WORK/install/brokers/docker.plist"
+            QS_DOCKER_LEGACY_PLIST="$WORK/LaunchAgents/docker.plist"
+            QS_DOCKER_BROKER_STAGED="$WORK/install/docker-broker-work.sh"
+            QS_SAY_LABEL=com.quicksand.say-broker.work
+            QS_SAY_PLIST="$WORK/install/brokers/say.plist"
+            QS_SAY_LEGACY_PLIST="$WORK/LaunchAgents/say.plist"
+            QS_SAY_BROKER_STAGED="$WORK/install/say-broker-work.sh"
+            QS_AUTH_LABEL=com.quicksand.auth-broker.work
+            QS_AUTH_PLIST="$WORK/install/brokers/auth.plist"
+            QS_AUTH_LEGACY_PLIST="$WORK/LaunchAgents/auth.plist"
+            QS_AUTH_BROKER_STAGED="$WORK/install/auth-broker-work.sh"
+            docker_broker_install /host/bin/docker /host/bin/jq
+            say_broker_install
+            auth_broker_install'
+    [ "$status" -eq 0 ]
+    for kind in docker say auth; do
+        grep -q "launchctl bootout gui/$(id -u)/com.quicksand.$kind-broker.work" "$STUB_LOG"
+        [ ! -e "$WORK/LaunchAgents/$kind.plist" ]
+        [ -f "$WORK/install/brokers/$kind.plist" ]
+    done
+    [ -z "$(ls -A "$WORK/LaunchAgents")" ]
+    run find "$WORK/ws/_quicksand" -name '*.sock'
+    [ -z "$output" ]
+    run grep -q "launchctl bootstrap" "$STUB_LOG"
+    [ "$status" -ne 0 ]
 }
 
 @test "cleanup_docker reaps labeled containers and images" {
@@ -1426,17 +1492,21 @@ broker() {
         esac'
     export WORK="$BATS_TEST_TMPDIR/work"
     mkdir -p "$WORK/install" "$WORK/ws/_quicksand/bin"
-    touch "$WORK/agent.plist" "$WORK/install/docker-broker-work.sh" \
-          "$WORK/ws/_quicksand/bin/qs-docker"
+    touch "$WORK/spec.plist" "$WORK/agent.plist" "$WORK/install/docker-broker-work.sh" \
+          "$WORK/ws/_quicksand/bin/qs-docker" "$WORK/ws/_quicksand/docker-broker.sock"
     qs_run 'PATH="$STUBS:/usr/bin:/bin"; SANDBOX_NAME=work
             QS_PRIVATE_DIR="$WORK/ws/_quicksand"
             INSTALL_DIR="$WORK/install"
             QS_DOCKER_LABEL=com.quicksand.docker-broker.work
-            QS_DOCKER_PLIST="$WORK/agent.plist"
+            QS_DOCKER_PLIST="$WORK/spec.plist"
+            QS_DOCKER_LEGACY_PLIST="$WORK/agent.plist"
             QS_DOCKER_BROKER_STAGED="$WORK/install/docker-broker-work.sh"
             cleanup_docker'
     [ "$status" -eq 0 ]
+    grep -q "launchctl bootout gui/$(id -u)/com.quicksand.docker-broker.work" "$STUB_LOG"
+    [ ! -f "$WORK/spec.plist" ]
     [ ! -f "$WORK/agent.plist" ]
+    [ ! -e "$WORK/ws/_quicksand/docker-broker.sock" ]
     [ ! -f "$WORK/install/docker-broker-work.sh" ]
     [ ! -f "$WORK/ws/_quicksand/bin/qs-docker" ]
     grep -q "docker ps -aq --filter label=quicksand.sandbox=work" "$STUB_LOG"
@@ -1663,12 +1733,25 @@ say_broker() {
     grep -qx "ARGS:0" "$STUB_LOG"
 }
 
-@test "qs-say fails cleanly without a broker socket" {
-    run env SHARED_WORKSPACE="$BATS_TEST_TMPDIR/ws" QS_SANDBOX_NAME=work \
-        "$REPO_COPY/config/qs-say" hello
+@test "qs-say says the app isn't running when there is no socket" {
+    run env QS_SAY_SOCK="$BATS_TEST_TMPDIR/none.sock" "$REPO_COPY/config/qs-say" hello
     [ "$status" -eq 1 ]
-    [[ "$output" == *"broker socket not found"* ]]
-    [[ "$output" == *"qs build work --rebuild"* ]]
+    [[ "$output" == *"Quicksand.app isn't running on the host"* ]]
+}
+
+@test "the sandbox clients default to the app's shared sockets" {
+    grep -q 'QS_DOCKER_SOCK:-/Users/Shared/quicksand/docker.sock' "$REPO_COPY/config/qs-docker"
+    grep -q 'QS_SAY_SOCK:-/Users/Shared/quicksand/say.sock' "$REPO_COPY/config/qs-say"
+    grep -q 'QS_AUTH_SOCK:-/Users/Shared/quicksand/auth.sock' "$REPO_COPY/config/qs-auth-refresh"
+}
+
+@test "the sandbox profile lets sandboxes reach the app's sockets and nothing else new" {
+    grep -A1 '^(allow file-read\*$' "$REPO_COPY/config/sandbox.sb" \
+        | grep -q '(subpath "/Users/Shared/quicksand"))'
+    run grep -n 'Users/Shared/quicksand' "$REPO_COPY/config/sandbox.sb"
+    [ "${#lines[@]}" -eq 1 ]
+    run grep -E 'file-write.*quicksand"|subpath "/Users/Shared"\)' "$REPO_COPY/config/sandbox.sb"
+    [ "$status" -ne 0 ]
 }
 
 @test "qs-say requires a message" {
@@ -1934,7 +2017,7 @@ JSON
     [ -x "$FAKE_HOME/.local/bin/qs-say" ]
 }
 
-@test "say_broker_install stages, renders, and loads the agent" {
+@test "say_broker_install stages and renders the app's spec" {
     make_stub launchctl 'echo "launchctl $*" >> "$STUB_LOG"'
     export WORK="$BATS_TEST_TMPDIR/work"
     mkdir -p "$WORK"
@@ -1942,53 +2025,43 @@ JSON
             SHARED_WORKSPACE="$WORK/ws"; QS_PRIVATE_DIR="$WORK/ws/_quicksand"
             INSTALL_DIR="$WORK/install"
             QS_SAY_LABEL=com.quicksand.say-broker.work
-            QS_SAY_PLIST="$WORK/agent.plist"
+            QS_SAY_PLIST="$WORK/install/brokers/spec.plist"
+            QS_SAY_LEGACY_PLIST="$WORK/LaunchAgents/agent.plist"
             QS_SAY_BROKER_STAGED="$WORK/install/say-broker-work.sh"
             HOME="$WORK"
             say_broker_install'
     [ "$status" -eq 0 ]
+    spec="$WORK/install/brokers/spec.plist"
     [ -x "$WORK/install/say-broker-work.sh" ]
     cmp "$REPO_COPY/config/qs-say-broker" "$WORK/install/say-broker-work.sh"
     [ -x "$WORK/ws/_quicksand/bin/qs-say" ]
-    grep -q "<string>com.quicksand.say-broker.work</string>" "$WORK/agent.plist"
-    grep -q "<string>$WORK/install/say-broker-work.sh</string>" "$WORK/agent.plist"
-    grep -q "<string>work</string>" "$WORK/agent.plist"
-    grep -q "$WORK/ws/_quicksand/say.sock" "$WORK/agent.plist"
-    grep -q "launchctl bootstrap gui/$(id -u) $WORK/agent.plist" "$STUB_LOG"
+    grep -q "<string>com.quicksand.say-broker.work</string>" "$spec"
+    grep -q "<string>$WORK/install/say-broker-work.sh</string>" "$spec"
+    grep -q "<string>work</string>" "$spec"
+    plutil -lint "$spec"
+    run grep -E "Sockets|inetd" "$spec"
+    [ "$status" -ne 0 ]
+    run grep -q launchctl "$STUB_LOG"
+    [ "$status" -ne 0 ]
 }
 
-@test "say_broker_install warns but succeeds when the agent can't be loaded" {
-    make_stub launchctl 'case "$1" in bootstrap) exit 1 ;; esac'
-    export WORK="$BATS_TEST_TMPDIR/work"
-    mkdir -p "$WORK"
-    qs_run 'PATH="$STUBS:$PATH"; SANDBOX_NAME=work
-            SHARED_WORKSPACE="$WORK/ws"; QS_PRIVATE_DIR="$WORK/ws/_quicksand"
-            INSTALL_DIR="$WORK/install"
-            QS_SAY_LABEL=com.quicksand.say-broker.work
-            QS_SAY_PLIST="$WORK/agent.plist"
-            QS_SAY_BROKER_STAGED="$WORK/install/say-broker-work.sh"
-            HOME="$WORK"
-            say_broker_install'
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"WARNING: Failed to load the speech broker"* ]]
-    [ -x "$WORK/ws/_quicksand/bin/qs-say" ]
-}
-
-@test "cleanup_say unloads the agent and removes everything it staged" {
+@test "cleanup_say removes the spec, any old agent, and everything it staged" {
     make_stub launchctl 'echo "launchctl $*" >> "$STUB_LOG"'
     export WORK="$BATS_TEST_TMPDIR/work"
     mkdir -p "$WORK/install" "$WORK/ws/_quicksand/bin"
-    touch "$WORK/agent.plist" "$WORK/install/say-broker-work.sh" \
+    touch "$WORK/spec.plist" "$WORK/agent.plist" "$WORK/install/say-broker-work.sh" \
           "$WORK/install/say-broker-work.log" "$WORK/ws/_quicksand/bin/qs-say"
     qs_run 'PATH="$STUBS:/usr/bin:/bin"; SANDBOX_NAME=work
             QS_PRIVATE_DIR="$WORK/ws/_quicksand"
             INSTALL_DIR="$WORK/install"
             QS_SAY_LABEL=com.quicksand.say-broker.work
-            QS_SAY_PLIST="$WORK/agent.plist"
+            QS_SAY_PLIST="$WORK/spec.plist"
+            QS_SAY_LEGACY_PLIST="$WORK/agent.plist"
             QS_SAY_BROKER_STAGED="$WORK/install/say-broker-work.sh"
             cleanup_say'
     [ "$status" -eq 0 ]
     grep -q "launchctl bootout gui/$(id -u)/com.quicksand.say-broker.work" "$STUB_LOG"
+    [ ! -f "$WORK/spec.plist" ]
     [ ! -f "$WORK/agent.plist" ]
     [ ! -f "$WORK/install/say-broker-work.sh" ]
     [ ! -f "$WORK/install/say-broker-work.log" ]
@@ -2557,10 +2630,10 @@ run_auth_broker() {
 @test "qs-auth-refresh fails clearly when there is no broker socket" {
     QS_AUTH_SOCK="$BATS_TEST_TMPDIR/nope.sock" QS_SANDBOX_NAME=work run "$REPO_COPY/config/qs-auth-refresh"
     [ "$status" -eq 1 ]
-    [[ "$output" == *"broker socket not found"*"qs build work --rebuild"* ]]
+    [[ "$output" == *"Quicksand.app isn't running on the host"* ]]
 }
 
-@test "auth_broker_install stages, renders, and loads the agent" {
+@test "auth_broker_install stages and renders the app's spec" {
     make_stub launchctl 'echo "launchctl $*" >> "$STUB_LOG"'
     export WORK="$BATS_TEST_TMPDIR/work"
     mkdir -p "$WORK"
@@ -2569,6 +2642,7 @@ run_auth_broker() {
             INSTALL_DIR="$WORK/install"
             QS_AUTH_LABEL=com.quicksand.auth-broker.work
             QS_AUTH_PLIST="$WORK/agent.plist"
+            QS_AUTH_LEGACY_PLIST="$WORK/LaunchAgents/agent.plist"
             QS_AUTH_BROKER_STAGED="$WORK/install/auth-broker-work.sh"
             HOME="$WORK"
             auth_broker_install'
@@ -2579,46 +2653,34 @@ run_auth_broker() {
     grep -q "<string>$WORK/install/auth-broker-work.sh</string>" "$WORK/agent.plist"
     # qs resolves its own location through symlinks (pwd -P).
     grep -q "<string>$(cd "$REPO_COPY" && pwd -P)/libexec</string>" "$WORK/agent.plist"
-    grep -q "<string>$WORK/ws/_quicksand/auth.sock</string>" "$WORK/agent.plist"
+    grep -q "<string>$WORK/ws/_quicksand</string>" "$WORK/agent.plist"
     # The build shell's PATH is pinned, XML-escaped.
     grep -qF "<string>$STUBS:/opt/a&amp;b/bin:/usr/bin:/bin</string>" "$WORK/agent.plist"
     ! grep -qE '@[A-Z_]+@' "$WORK/agent.plist"
     plutil -lint "$WORK/agent.plist"
-    grep -q "launchctl bootstrap gui/$(id -u) $WORK/agent.plist" "$STUB_LOG"
+    run grep -E "Sockets|inetd" "$WORK/agent.plist"
+    [ "$status" -ne 0 ]
+    run grep -q launchctl "$STUB_LOG"
+    [ "$status" -ne 0 ]
 }
 
-@test "auth_broker_install warns but succeeds when the agent can't be loaded" {
-    make_stub launchctl 'case "$1" in bootstrap) exit 1 ;; esac'
-    export WORK="$BATS_TEST_TMPDIR/work"
-    mkdir -p "$WORK"
-    qs_run 'PATH="$STUBS:$PATH"; SANDBOX_NAME=work
-            SHARED_WORKSPACE="$WORK/ws"; QS_PRIVATE_DIR="$WORK/ws/_quicksand"
-            INSTALL_DIR="$WORK/install"
-            QS_AUTH_LABEL=com.quicksand.auth-broker.work
-            QS_AUTH_PLIST="$WORK/agent.plist"
-            QS_AUTH_BROKER_STAGED="$WORK/install/auth-broker-work.sh"
-            HOME="$WORK"
-            auth_broker_install'
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"WARNING: Failed to load the credential broker"* ]]
-    [ -x "$WORK/ws/_quicksand/bin/qs-auth-refresh" ]
-}
-
-@test "cleanup_auth_broker unloads the agent and removes everything it staged" {
+@test "cleanup_auth_broker removes the spec, any old agent, and everything it staged" {
     make_stub launchctl 'echo "launchctl $*" >> "$STUB_LOG"'
     export WORK="$BATS_TEST_TMPDIR/work"
     mkdir -p "$WORK/install" "$WORK/ws/_quicksand/bin"
-    touch "$WORK/agent.plist" "$WORK/install/auth-broker-work.sh" \
+    touch "$WORK/spec.plist" "$WORK/agent.plist" "$WORK/install/auth-broker-work.sh" \
           "$WORK/install/auth-broker-work.log" "$WORK/ws/_quicksand/bin/qs-auth-refresh"
     qs_run 'PATH="$STUBS:/usr/bin:/bin"; SANDBOX_NAME=work
             QS_PRIVATE_DIR="$WORK/ws/_quicksand"
             INSTALL_DIR="$WORK/install"
             QS_AUTH_LABEL=com.quicksand.auth-broker.work
-            QS_AUTH_PLIST="$WORK/agent.plist"
+            QS_AUTH_PLIST="$WORK/spec.plist"
+            QS_AUTH_LEGACY_PLIST="$WORK/agent.plist"
             QS_AUTH_BROKER_STAGED="$WORK/install/auth-broker-work.sh"
             cleanup_auth_broker'
     [ "$status" -eq 0 ]
     grep -q "launchctl bootout gui/$(id -u)/com.quicksand.auth-broker.work" "$STUB_LOG"
+    [ ! -f "$WORK/spec.plist" ]
     [ ! -f "$WORK/agent.plist" ]
     [ ! -f "$WORK/install/auth-broker-work.sh" ]
     [ ! -f "$WORK/install/auth-broker-work.log" ]
@@ -2710,4 +2772,174 @@ hooks_fixture() {
     [ "$status" -eq 0 ]
     [ ! -e "$WORK/ws/_quicksand/op-token" ]
     [ -z "$(ls -A "$WORK/ws/_quicksand/sessions")" ]
+}
+
+###############################################################################
+# broker event log — one JSON line per request in events.jsonl
+# (docs/quicksand-app.md). The docker and say harnesses set HOME to
+# $BATS_TEST_TMPDIR; the auth broker writes next to its install dir.
+###############################################################################
+
+# last_event FIELD [FILE] — that field of the newest event, via jq (which
+# also proves the line is valid JSON).
+last_event() {
+    local file="${2:-$BATS_TEST_TMPDIR/.config/quicksand/events.jsonl}"
+    tail -n 1 "$file" | jq -er ".$1"
+}
+
+# need_qs_event — skip when qs-event couldn't be built (no swift).
+need_qs_event() {
+    [[ -n "${QS_EVENT_BIN:-}" ]] || skip "qs-event not built (needs swift)"
+}
+
+@test "brokers work and log nothing without qs-event" {
+    unset QS_EVENT_BIN
+    broker '{"v":1,"verb":"ps"}'
+    [[ "$output" == *"@@qs-docker-exit:0@@"* ]]
+    [ ! -e "$BATS_TEST_TMPDIR/.config/quicksand/events.jsonl" ]
+}
+
+@test "qs-event refuses field names a broker shouldn't use" {
+    need_qs_event
+    run "$QS_EVENT_BIN" --log "$BATS_TEST_TMPDIR/e.jsonl" --broker docker --sandbox work \
+        -- run ok sandbox other
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"field name"* ]]
+    [ ! -e "$BATS_TEST_TMPDIR/e.jsonl" ]
+}
+
+@test "event log block is identical in all three brokers" {
+    local b first=""
+    for b in docker auth say; do
+        sed -n '/^# --- event log:/,/^# --- end event log/p' \
+            "$REPO_COPY/config/qs-$b-broker" > "$BATS_TEST_TMPDIR/block-$b"
+        [ -s "$BATS_TEST_TMPDIR/block-$b" ]
+        [ -z "$first" ] && first="$BATS_TEST_TMPDIR/block-$b"
+        cmp "$first" "$BATS_TEST_TMPDIR/block-$b"
+    done
+}
+
+@test "docker broker logs a finished run without its cmd or env" {
+    need_qs_event
+    broker '{"v":1,"verb":"run","image":"node:20","cmd":["node","-e","secret-arg"],"env":{"FOO":"bar baz"}}'
+    [ "$(last_event sandbox)" == "work" ]
+    [ "$(last_event broker)" == "docker" ]
+    [ "$(last_event verb)" == "run" ]
+    [ "$(last_event result)" == "ok" ]
+    [ "$(last_event exit)" == "0" ]
+    [ "$(last_event target)" == "node:20" ]
+    [[ "$(last_event ts)" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$ ]]
+    ! grep -qE 'secret-arg|bar baz|FOO' "$BATS_TEST_TMPDIR/.config/quicksand/events.jsonl"
+}
+
+@test "docker broker logs a policy rejection with what was attempted" {
+    need_qs_event
+    broker '{"v":1,"verb":"run","image":"--privileged"}'
+    [ "$(last_event result)" == "rejected" ]
+    [ "$(last_event exit)" == "125" ]
+    [ "$(last_event target)" == "--privileged" ]
+    [ "$(last_event reason)" == "run: bad image ref" ]
+}
+
+@test "docker broker logs a failing docker command as an error" {
+    need_qs_event
+    make_stub docker 'exit 3'
+    broker '{"v":1,"verb":"pull","image":"nope:1"}'
+    [[ "$output" == *"@@qs-docker-exit:3@@"* ]]
+    [ "$(last_event result)" == "error" ]
+    [ "$(last_event exit)" == "3" ]
+}
+
+@test "docker broker logs a misconfigured host as an error, not a rejection" {
+    need_qs_event
+    command -v jq >/dev/null 2>&1 || skip "jq not available"
+    mkdir -p "$BATS_TEST_TMPDIR/ws"
+    run bash -c "HOME=\"$BATS_TEST_TMPDIR\" bash \"$REPO_COPY/config/qs-docker-broker\" \
+        work \"$BATS_TEST_TMPDIR/ws\" /nonexistent/docker \"\$(command -v jq)\" <<< '{}'"
+    [ "$(last_event result)" == "error" ]
+    [[ "$(last_event reason)" == "docker CLI not executable"* ]]
+}
+
+@test "docker broker keeps hostile verbs as escaped, valid JSON" {
+    need_qs_event
+    command -v jq >/dev/null 2>&1 || skip "jq not available"
+    # Piped directly: broker()'s double-quoted bash -c would eat the
+    # backslashes this request is about.
+    mkdir -p "$BATS_TEST_TMPDIR/ws"
+    printf '%s\n' '{"v":1,"verb":"ex\"ec\\x\u0007y"}' > "$BATS_TEST_TMPDIR/req"
+    HOME="$BATS_TEST_TMPDIR" bash "$REPO_COPY/config/qs-docker-broker" work \
+        "$BATS_TEST_TMPDIR/ws" /usr/bin/true "$(command -v jq)" \
+        < "$BATS_TEST_TMPDIR/req" > /dev/null
+    [ "$(last_event result)" == "rejected" ]
+    [ "$(last_event verb)" == 'ex"ec\xy' ]
+}
+
+@test "docker broker rotates the event log past its size cap" {
+    need_qs_event
+    mkdir -p "$BATS_TEST_TMPDIR/.config/quicksand"
+    printf 'old\n' > "$BATS_TEST_TMPDIR/.config/quicksand/events.jsonl"
+    QS_EVENTS_MAX_BYTES=1 broker '{"v":1,"verb":"ps"}'
+    [ "$(cat "$BATS_TEST_TMPDIR/.config/quicksand/events.jsonl.1")" == "old" ]
+    [ "$(wc -l < "$BATS_TEST_TMPDIR/.config/quicksand/events.jsonl")" -eq 1 ]
+    [ "$(last_event verb)" == "ps" ]
+}
+
+@test "auth broker logs each provider's outcome" {
+    need_qs_event
+    command -v jq >/dev/null 2>&1 || skip "jq not available"
+    auth_fixture
+    auth_provider one 'exit 0'
+    auth_provider two 'exit 3'
+    run_auth_broker refresh
+    [ "$(last_event broker "$WORK/install/events.jsonl")" == "auth" ]
+    [ "$(last_event verb "$WORK/install/events.jsonl")" == "refresh" ]
+    [ "$(last_event result "$WORK/install/events.jsonl")" == "error" ]
+    [ "$(last_event providers "$WORK/install/events.jsonl")" == "one=ok,two=exit 3" ]
+}
+
+@test "auth broker logs a clean refresh as ok" {
+    need_qs_event
+    command -v jq >/dev/null 2>&1 || skip "jq not available"
+    auth_fixture
+    auth_provider one 'exit 0'
+    run_auth_broker refresh
+    [ "$(last_event result "$WORK/install/events.jsonl")" == "ok" ]
+}
+
+@test "auth broker logs rejected and shared requests" {
+    need_qs_event
+    command -v jq >/dev/null 2>&1 || skip "jq not available"
+    auth_fixture
+    auth_provider one 'exit 0'
+    run_auth_broker 'provision'
+    [ "$(last_event result "$WORK/install/events.jsonl")" == "rejected" ]
+    [ "$(last_event verb "$WORK/install/events.jsonl")" == "provision" ]
+    mkdir "$WORK/lock"
+    ( sleep 1; rmdir "$WORK/lock" ) &
+    run_auth_broker refresh
+    wait
+    [ "$(last_event result "$WORK/install/events.jsonl")" == "shared" ]
+}
+
+@test "say broker logs what it spoke, stripped of bytes that aren't valid JSON text" {
+    need_qs_event
+    command -v jq >/dev/null 2>&1 || skip "jq not available"
+    say_broker $'hi \xff "there" \\ \x07done'
+    [ "$(last_event broker)" == "say" ]
+    [ "$(last_event result)" == "ok" ]
+    [ "$(last_event target)" == 'hi  "there" \ done' ]
+}
+
+@test "qs-docker says so when nothing answers on the socket" {
+    command -v jq >/dev/null 2>&1 || skip "jq not available"
+    # A socket file nobody listens on: what an app that crashed leaves.
+    dir="$(mktemp -d /tmp/qs-dk.XXXXXX)"
+    nc -lU "$dir/docker.sock" &
+    listener=$!
+    for _ in $(seq 1 50); do [ -S "$dir/docker.sock" ] && break; sleep 0.1; done
+    kill -9 "$listener" 2>/dev/null; wait "$listener" 2>/dev/null || true
+    run env QS_DOCKER_SOCK="$dir/docker.sock" "$REPO_COPY/config/qs-docker" ps
+    rm -rf "$dir"
+    [ "$status" -eq 125 ]
+    [[ "$output" == *"no answer from Quicksand.app"* ]]
 }

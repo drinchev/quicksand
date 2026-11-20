@@ -73,6 +73,24 @@ import Testing
         #expect(!reply.contains("done"))
     }
 
+    @Test func writingAfterARefusalIsAnErrorNotASignal() throws {
+        let fx = try Fixture()
+        let l = listener(.say, fx, users: FakeUsers(byUID: [me: "drinchev"]), updates: Updates())
+        try l.start()
+        defer { l.stop() }
+
+        // Read the whole refusal first: by then the app has closed its end,
+        // which is the race CI hit (SIGPIPE killed the test process).
+        let fd = try #require(connectUnix(path: l.socketPath))
+        defer { close(fd) }
+        var buf = [UInt8](repeating: 0, count: 4096)
+        while read(fd, &buf, buf.count) > 0 {}
+        usleep(50_000)
+        let written = [UInt8]("late\n".utf8).withUnsafeBytes { write(fd, $0.baseAddress, $0.count) }
+        #expect(written == -1)
+        #expect(errno == EPIPE)
+    }
+
     @Test func brokerSeesNoneOfTheAppsOtherDescriptors() throws {
         let fx = try Fixture()
         // An fd the app holds that is not marked close-on-exec.

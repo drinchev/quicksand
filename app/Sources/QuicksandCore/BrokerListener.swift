@@ -243,6 +243,10 @@ func bindUnix(_ fd: Int32, path: String) throws {
 public func connectUnix(path: String) -> Int32? {
     let fd = socket(AF_UNIX, SOCK_STREAM, 0)
     guard fd >= 0 else { return nil }
+    // A server that refuses us closes at once; writing after that must be
+    // an EPIPE error, not a SIGPIPE that kills the caller.
+    var on: Int32 = 1
+    setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &on, socklen_t(MemoryLayout<Int32>.size))
     var addr = sockaddr_un()
     addr.sun_family = sa_family_t(AF_UNIX)
     let bytes = Array(path.utf8)

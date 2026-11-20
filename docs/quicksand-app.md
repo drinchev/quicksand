@@ -102,6 +102,12 @@ Broker processes already running finish their requests if the app dies.
 
 ### What the app shows
 
+- Notifications (setting: every request / problems / off, default every
+  request): "trading → Docker" when a connection arrives, "Refused uid 501
+  (not a sandbox) → Docker" for a refusal, "trading → Docker failed" for a
+  non-zero exit. They name the caller and the broker only: the app doesn't
+  read requests, so the verb and target are in the event log, not the banner.
+
 - Status-bar icon with a badge: active sandboxes, requests in the last hour;
   red when a broker is failing (refresh timeouts, Docker engine down).
 - Menu: each sandbox, active or idle (processes per `qs-*` user), session

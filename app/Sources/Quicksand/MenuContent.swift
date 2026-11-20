@@ -108,6 +108,24 @@ struct MenuContent: View {
                 Spacer()
                 Button("Quit") { model.quit() }
             }
+            HStack {
+                Text("Notify")
+                Picker("Notify", selection: Binding(get: { model.noticeMode },
+                                                    set: { model.noticeMode = $0 })) {
+                    Text("Every request").tag(NoticeMode.all)
+                    Text("Problems").tag(NoticeMode.problems)
+                    Text("Off").tag(NoticeMode.off)
+                }
+                .labelsHidden()
+                .pickerStyle(.segmented)
+                .help("Every request: a banner whenever a sandbox (or anyone) connects to a broker. Problems: only refused or failed requests.")
+            }
+            .controlSize(.small)
+            .disabled(!model.notificationsAvailable)
+            if model.notificationsDenied && model.noticeMode != .off {
+                Text("Notifications are off for Quicksand in System Settings → Notifications.")
+                    .font(.caption).foregroundStyle(.orange)
+            }
             Toggle("Open at login", isOn: Binding(get: { model.opensAtLogin },
                                                   set: { model.opensAtLogin = $0 }))
                 .controlSize(.small)

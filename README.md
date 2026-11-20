@@ -518,7 +518,9 @@ sandboxes apart by the uid of the connecting process, and starts the
 sandbox's bash broker for each request from the spec qs renders under
 `~/.config/quicksand/brokers/`. It also shows every sandbox (active or idle,
 sessions, Docker, token ages) and every broker request from
-`~/.config/quicksand/events.jsonl`.
+`~/.config/quicksand/events.jsonl`. It posts a notification whenever anyone
+connects to a broker (who, and which broker; the app never reads the request
+itself), or with "Notify: Problems" only for refused and failed requests.
 
 **Keep it running.** Without it, `qs-docker`, `qs-auth-refresh` and `qs-say`
 fail with "Quicksand.app isn't running on the host". Turn on "Open at login"

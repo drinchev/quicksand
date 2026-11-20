@@ -21,14 +21,18 @@ final class AppModel: ObservableObject {
     private let reader: EventLogReader
     private var listeners: [BrokerListener] = []
     private var timer: Timer?
+    private let notifier = Notifier()
 
     private static let listenKey = "runBrokers"
+    private static let noticeKey = "notify"
 
     init(paths: QuicksandPaths = .host()) {
         self.paths = paths
         scanner = SandboxScanner(paths: paths)
         reader = EventLogReader(url: paths.eventsLog)
-        UserDefaults.standard.register(defaults: [Self.listenKey: true])
+        UserDefaults.standard.register(defaults: [Self.listenKey: true,
+                                                  Self.noticeKey: NoticeMode.all.rawValue])
+        if noticeMode != .off { notifier.requestPermission() }
         refresh()
         if UserDefaults.standard.bool(forKey: Self.listenKey) { startBrokers() }
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
@@ -101,6 +105,10 @@ final class AppModel: ObservableObject {
     }
 
     private func record(_ conn: BrokerConnection) {
+        let isNew = !connections.contains { $0.id == conn.id }
+        if let notice = BrokerNotice.make(for: conn, isNew: isNew, mode: noticeMode) {
+            notifier.post(notice, id: conn.id)
+        }
         if let i = connections.lastIndex(where: { $0.id == conn.id }) {
             connections[i] = conn
         } else {
@@ -108,6 +116,19 @@ final class AppModel: ObservableObject {
             if connections.count > 500 { connections.removeFirst(connections.count - 500) }
         }
     }
+
+    // MARK: - Notifications
+
+    var noticeMode: NoticeMode {
+        get { NoticeMode(rawValue: UserDefaults.standard.string(forKey: Self.noticeKey) ?? "") ?? .all }
+        set {
+            UserDefaults.standard.set(newValue.rawValue, forKey: Self.noticeKey)
+            if newValue != .off { notifier.requestPermission() }
+            objectWillChange.send()
+        }
+    }
+    var notificationsAvailable: Bool { notifier.isAvailable }
+    var notificationsDenied: Bool { notifier.denied }
 
     // MARK: - Login item
 

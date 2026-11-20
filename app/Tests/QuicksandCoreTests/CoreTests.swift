@@ -231,3 +231,36 @@ import Testing
         #expect(ProcessTable.isActivity("/usr/bin/ssh"))
     }
 }
+
+// MARK: - Notifications
+
+@Suite struct NoticeTests {
+    func conn(_ outcome: BrokerConnection.Outcome, sandbox: String? = "trading") -> BrokerConnection {
+        BrokerConnection(id: UUID(), kind: .docker, sandbox: sandbox, uid: 610,
+                         started: Date(), ended: nil, outcome: outcome)
+    }
+
+    @Test func everyRequestAnnouncesTheStartOnce() {
+        let started = conn(.running(pid: 42))
+        #expect(BrokerNotice.make(for: started, isNew: true, mode: .all)?.title == "trading → Docker")
+        #expect(BrokerNotice.make(for: started, isNew: false, mode: .all) == nil)
+        #expect(BrokerNotice.make(for: started, isNew: true, mode: .problems) == nil)
+        // A clean finish adds nothing.
+        #expect(BrokerNotice.make(for: conn(.finished(pid: 42, status: 0)), isNew: false, mode: .all) == nil)
+    }
+
+    @Test func problemsAreAnnouncedUnlessOff() {
+        let refused = conn(.rejected("this socket only serves quicksand sandboxes"), sandbox: nil)
+        let notice = BrokerNotice.make(for: refused, isNew: true, mode: .problems)
+        #expect(notice?.title == "Refused uid 610 (not a sandbox) → Docker")
+        #expect(notice?.body == "this socket only serves quicksand sandboxes")
+
+        let failed = conn(.finished(pid: 42, status: 125 << 8))
+        #expect(BrokerNotice.make(for: failed, isNew: false, mode: .problems)?.body
+                == "The broker exited with status 125.")
+        #expect(BrokerNotice.make(for: conn(.finished(pid: 42, status: 9)), isNew: false, mode: .all)?.body
+                == "The broker was killed by a signal.")
+        #expect(BrokerNotice.make(for: refused, isNew: true, mode: .off) == nil)
+        #expect(BrokerNotice.make(for: failed, isNew: false, mode: .off) == nil)
+    }
+}

@@ -9,6 +9,7 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [
         .executable(name: "Quicksand", targets: ["Quicksand"]),
+        .executable(name: "qs-event", targets: ["qs-event"]),
         .library(name: "QuicksandCore", targets: ["QuicksandCore"]),
     ],
     targets: [
@@ -21,6 +22,12 @@ let package = Package(
         // The status-bar app: SwiftUI views over QuicksandCore.
         .executableTarget(
             name: "Quicksand",
+            dependencies: ["QuicksandCore"],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        // What the bash brokers call to log a request; ships inside the app.
+        .executableTarget(
+            name: "qs-event",
             dependencies: ["QuicksandCore"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),

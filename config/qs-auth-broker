@@ -47,41 +47,20 @@ EVENTS_LOG="${QS_EVENTS_LOG:-$INSTALL_DIR/events.jsonl}"
 
 # --- event log: keep this block identical in all three brokers -------------
 # One JSON line per finished request, appended to $EVENTS_LOG for
-# Quicksand.app (see docs/quicksand-app.md). Values a sandbox sent are
-# untrusted: control characters and invalid UTF-8 are dropped and \ and "
-# escaped, so every line is valid JSON whatever the client sent. Logging
-# must never break a broker: its errors go to stderr (the broker log).
-EVENTS_MAX_BYTES="${QS_EVENTS_MAX_BYTES:-5000000}"
+# Quicksand.app (see docs/quicksand-app.md). qs-event (app/Sources/qs-event)
+# writes it: it cleans what the sandbox sent, rotates the log and locks it
+# against concurrent brokers. The app passes its path as QS_EVENT_BIN;
+# without it (a broker run by hand) nothing is logged. Logging never breaks
+# a broker: qs-event's complaints go to stderr (the broker log).
 EVENT_START="$(date +%s)"
-
-json_str() {
-    printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177' \
-        | iconv -c -f UTF-8 -t UTF-8 2>/dev/null \
-        | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
-}
 
 # emit_event VERB RESULT [FIELD VALUE]... — FIELD names are literals from
 # this script, never client input. Empty values are left out; "exit" is
 # written as a number.
 emit_event() {
-    local line size
-    line="{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"sandbox\":\"$(json_str "$SANDBOX_NAME")\""
-    line+=",\"broker\":\"$BROKER_KIND\",\"verb\":\"$(json_str "$1")\",\"result\":\"$2\""
-    line+=",\"secs\":$(( $(date +%s) - EVENT_START ))"
-    shift 2
-    while (( $# >= 2 )); do
-        if [[ "$1" == exit ]]; then
-            [[ "$2" =~ ^[0-9]+$ ]] && line+=",\"exit\":$2"
-        elif [[ -n "$2" ]]; then
-            line+=",\"$1\":\"$(json_str "$2")\""
-        fi
-        shift 2
-    done
-    line+="}"
-    mkdir -p "$(dirname "$EVENTS_LOG")" || return 0
-    size="$(stat -f %z "$EVENTS_LOG" 2>/dev/null || echo 0)"
-    (( size < EVENTS_MAX_BYTES )) || mv -f "$EVENTS_LOG" "$EVENTS_LOG.1" || true
-    printf '%s\n' "$line" >> "$EVENTS_LOG" || true
+    [[ -n "${QS_EVENT_BIN:-}" && -x "$QS_EVENT_BIN" ]] || return 0
+    "$QS_EVENT_BIN" --log "$EVENTS_LOG" --broker "$BROKER_KIND" \
+        --sandbox "$SANDBOX_NAME" --since "$EVENT_START" -- "$@" || true
 }
 # --- end event log ---------------------------------------------------------
 

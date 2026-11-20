@@ -1,6 +1,6 @@
 #!/bin/bash
-# Build Quicksand.app from this package: a release build of the executable,
-# wrapped in a minimal bundle (status-bar only, no Dock icon) and signed
+# Build Quicksand.app from this package: a release build of the app and of
+# qs-event (the brokers' event-log writer, shipped next to it), wrapped in a minimal bundle (status-bar only, no Dock icon) and signed
 # ad hoc for this Mac. Output: app/build/Quicksand.app
 #
 #   app/scripts/bundle.sh            # build
@@ -15,11 +15,12 @@ APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$APP_DIR/build/Quicksand.app"
 
 swift build -c release --package-path "$APP_DIR" "$@"
-BIN="$(swift build -c release --package-path "$APP_DIR" --show-bin-path "$@")/Quicksand"
+BIN_DIR="$(swift build -c release --package-path "$APP_DIR" --show-bin-path "$@")"
 
 rm -rf "$OUT"
 mkdir -p "$OUT/Contents/MacOS"
-cp "$BIN" "$OUT/Contents/MacOS/Quicksand"
+cp "$BIN_DIR/Quicksand" "$OUT/Contents/MacOS/Quicksand"
+cp "$BIN_DIR/qs-event" "$OUT/Contents/MacOS/qs-event"
 cat > "$OUT/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -37,5 +38,6 @@ cat > "$OUT/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
+codesign --force --sign - "$OUT/Contents/MacOS/qs-event"
 codesign --force --sign - "$OUT"
 echo "Built $OUT"

@@ -114,8 +114,8 @@ Broker processes already running finish their requests if the app dies.
   count, Docker on/off, GCP token age, 1Password token staged or not.
 - Feed window: live events, filterable by sandbox and broker.
 
-Request details (verb, image, result) come from the event log the bash brokers
-write (step 1), since the app doesn't parse requests itself. Connection timing
+Request details (verb, image, result) come from the event log the brokers
+write through `qs-event`, since the app doesn't parse requests itself. Connection timing
 and exit status the app sees directly.
 
 ### Approvals (later)
@@ -128,8 +128,17 @@ no answer within a deadline, the broker applies a configured default.
 ## Event log format (step 1)
 
 `~/.config/quicksand/events.jsonl` (override: `QS_EVENTS_LOG`), one JSON object
-per line, appended by each broker when a request ends. Rotated to
-`events.jsonl.1` past about 5 MB.
+per line, appended when a request ends. The brokers don't write it
+themselves: each calls `qs-event` (`app/Sources/qs-event`, one Swift command
+for all three), which Quicksand.app ships next to its own binary and passes
+to every broker as `QS_EVENT_BIN`. A broker run without it (by hand, or by a
+pre-app LaunchAgent) works but logs nothing. `qs-event` locks the log, so
+concurrent brokers never interleave lines or rotate twice, and rotates it to
+`events.jsonl.1` past about 5 MB (`QS_EVENTS_MAX_BYTES`).
+
+```bash
+qs-event --log FILE --broker docker|auth|say --sandbox NAME [--since EPOCH] -- VERB RESULT [FIELD VALUE]...
+```
 
 ```json
 {"ts":"2026-11-20T09:14:03Z","sandbox":"trading","broker":"docker","verb":"run","result":"ok","secs":12,"exit":0,"target":"node:20"}
@@ -153,9 +162,10 @@ per line, appended by each broker when a request ends. Rotated to
 Never logged: Docker `cmd` arguments, environment variables (names or values),
 credential values, provider output.
 
-Every value a sandbox sent is untrusted: control characters are dropped,
-invalid UTF-8 is removed, and quotes and backslashes are escaped, so each line
-is valid JSON whatever the client sent. Readers must still treat the content as
+Every value a sandbox sent is untrusted: `qs-event` drops control characters
+and invalid UTF-8 and JSON-escapes the rest, so each line is valid JSON
+whatever the client sent. Field names must be lowercase words and can't
+override the fixed ones (`sandbox`, `broker`, …). Readers must still treat the content as
 data.
 
 The per-sandbox free-text logs (`*-broker-NAME.log`) stay as they are.

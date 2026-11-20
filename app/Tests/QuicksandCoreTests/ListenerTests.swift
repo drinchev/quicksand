@@ -135,6 +135,8 @@ struct RealBrokerTests {
 
     @Test func dockerRequestFlowsThroughTheRealBrokerIntoTheEventLog() throws {
         let jq = try #require(jqPath)
+        let qsEvent = Self.repo.appendingPathComponent("app/.build/debug/qs-event")
+        try #require(FileManager.default.isExecutableFile(atPath: qsEvent.path), "swift test builds qs-event")
         let fx = try Fixture()
         let fm = FileManager.default
 
@@ -151,8 +153,10 @@ struct RealBrokerTests {
         let plist: [String: Any] = [
             "Label": BrokerKind.docker.label(for: "work"),
             "ProgramArguments": ["/bin/bash", staged.path, "work", workspace.path, docker.path, jq],
-            // The broker logs under $HOME/.config/quicksand; keep it in the fixture.
-            "EnvironmentVariables": ["HOME": fx.root.path],
+            // The broker logs under $HOME/.config/quicksand; keep it in the
+            // fixture. The app passes qs-event from its bundle; here it's
+            // the one `swift test` built.
+            "EnvironmentVariables": ["HOME": fx.root.path, "QS_EVENT_BIN": qsEvent.path],
         ]
         let specURL = fx.paths.spec(.docker, sandbox: "work")
         try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0).write(to: specURL)

@@ -706,7 +706,7 @@ existing sandboxes automatically on next entry.
 | Broker sockets (Quicksand.app, all sandboxes) | `/Users/Shared/quicksand/docker.sock`, `auth.sock`, `say.sock` |
 | Broker specs | `~/.config/quicksand/brokers/com.quicksand.{docker,auth,say}-broker.NAME.plist` |
 | Install marker, clone & GCP manifests, staged brokers & their logs | `~/.config/quicksand/` |
-| Broker event log (one JSON line per request, all sandboxes) | `~/.config/quicksand/events.jsonl` |
+| Broker event log (one JSON line per request, all sandboxes; written by `qs-event` inside Quicksand.app) | `~/.config/quicksand/events.jsonl` |
 
 Sandbox names: up to 16 characters, `[A-Za-z0-9_-]+`.
 

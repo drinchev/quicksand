@@ -1,18 +1,28 @@
 import Darwin
 import Foundation
 
-/// Starts a bash broker with a client connection as its stdin and stdout —
-/// what launchd's inetd mode does today.
+/// Starts a bash broker with a client connection as its stdin and stdout,
+/// as launchd's inetd mode did before the app.
 public enum BrokerLauncher {
-    /// The environment launchd gives a LaunchAgent, which the brokers were
-    /// written against. A spec's own variables are layered on top.
-    public static func baseEnvironment() -> [String: String] {
+    /// The environment launchd gave a LaunchAgent, which the brokers were
+    /// written against, plus `QS_EVENT_BIN`: the `qs-event` command the
+    /// brokers log requests with. A spec's own variables are layered on top.
+    public static func baseEnvironment(eventTool: URL? = eventTool()) -> [String: String] {
         let env = ProcessInfo.processInfo.environment
         var base: [String: String] = ["PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "SHELL": "/bin/zsh"]
         for key in ["HOME", "USER", "LOGNAME", "TMPDIR"] {
             if let value = env[key] { base[key] = value }
         }
+        if let eventTool { base["QS_EVENT_BIN"] = eventTool.path }
         return base
+    }
+
+    /// `qs-event` ships next to the app's executable (Contents/MacOS in the
+    /// bundle, the build directory under `swift build`).
+    public static func eventTool(nextTo executable: URL? = Bundle.main.executableURL) -> URL? {
+        guard let dir = executable?.resolvingSymlinksInPath().deletingLastPathComponent() else { return nil }
+        let tool = dir.appendingPathComponent("qs-event")
+        return FileManager.default.isExecutableFile(atPath: tool.path) ? tool : nil
     }
 
     public struct SpawnError: Error, Equatable {

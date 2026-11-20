@@ -4,7 +4,26 @@
 # directly with controlled globals; external commands are stubbed via
 # PATH where needed. Nothing here touches sudo or real sandboxes.
 
+# qs-event (app/Sources/qs-event) writes the broker event log; Quicksand.app
+# passes its path to every broker as QS_EVENT_BIN. Build it once so the
+# brokers log here as they do under the app. Without swift, the event-log
+# tests skip.
+setup_file() {
+    local app="$BATS_TEST_DIRNAME/../app" bin
+    QS_EVENT_BIN_BUILT=""
+    if command -v swift >/dev/null 2>&1 \
+        && swift build --package-path "$app" --product qs-event --disable-sandbox \
+            > "$BATS_FILE_TMPDIR/qs-event-build.log" 2>&1 \
+        && bin="$(swift build --package-path "$app" --disable-sandbox --show-bin-path)"; then
+        QS_EVENT_BIN_BUILT="$bin/qs-event"
+    fi
+    export QS_EVENT_BIN_BUILT
+}
+
 setup() {
+    if [[ -x "${QS_EVENT_BIN_BUILT:-}" ]]; then
+        export QS_EVENT_BIN="$QS_EVENT_BIN_BUILT"
+    fi
     # qs refuses to load inside a quicksand session (its nested-sandbox
     # guard); drop the marker so the suite runs in a sandbox too — where
     # agents develop quicksand itself.
@@ -2768,6 +2787,27 @@ last_event() {
     tail -n 1 "$file" | jq -er ".$1"
 }
 
+# need_qs_event — skip when qs-event couldn't be built (no swift).
+need_qs_event() {
+    [[ -n "${QS_EVENT_BIN:-}" ]] || skip "qs-event not built (needs swift)"
+}
+
+@test "brokers work and log nothing without qs-event" {
+    unset QS_EVENT_BIN
+    broker '{"v":1,"verb":"ps"}'
+    [[ "$output" == *"@@qs-docker-exit:0@@"* ]]
+    [ ! -e "$BATS_TEST_TMPDIR/.config/quicksand/events.jsonl" ]
+}
+
+@test "qs-event refuses field names a broker shouldn't use" {
+    need_qs_event
+    run "$QS_EVENT_BIN" --log "$BATS_TEST_TMPDIR/e.jsonl" --broker docker --sandbox work \
+        -- run ok sandbox other
+    [ "$status" -eq 2 ]
+    [[ "$output" == *"field name"* ]]
+    [ ! -e "$BATS_TEST_TMPDIR/e.jsonl" ]
+}
+
 @test "event log block is identical in all three brokers" {
     local b first=""
     for b in docker auth say; do
@@ -2780,6 +2820,7 @@ last_event() {
 }
 
 @test "docker broker logs a finished run without its cmd or env" {
+    need_qs_event
     broker '{"v":1,"verb":"run","image":"node:20","cmd":["node","-e","secret-arg"],"env":{"FOO":"bar baz"}}'
     [ "$(last_event sandbox)" == "work" ]
     [ "$(last_event broker)" == "docker" ]
@@ -2792,6 +2833,7 @@ last_event() {
 }
 
 @test "docker broker logs a policy rejection with what was attempted" {
+    need_qs_event
     broker '{"v":1,"verb":"run","image":"--privileged"}'
     [ "$(last_event result)" == "rejected" ]
     [ "$(last_event exit)" == "125" ]
@@ -2800,6 +2842,7 @@ last_event() {
 }
 
 @test "docker broker logs a failing docker command as an error" {
+    need_qs_event
     make_stub docker 'exit 3'
     broker '{"v":1,"verb":"pull","image":"nope:1"}'
     [[ "$output" == *"@@qs-docker-exit:3@@"* ]]
@@ -2808,6 +2851,7 @@ last_event() {
 }
 
 @test "docker broker logs a misconfigured host as an error, not a rejection" {
+    need_qs_event
     command -v jq >/dev/null 2>&1 || skip "jq not available"
     mkdir -p "$BATS_TEST_TMPDIR/ws"
     run bash -c "HOME=\"$BATS_TEST_TMPDIR\" bash \"$REPO_COPY/config/qs-docker-broker\" \
@@ -2817,6 +2861,7 @@ last_event() {
 }
 
 @test "docker broker keeps hostile verbs as escaped, valid JSON" {
+    need_qs_event
     command -v jq >/dev/null 2>&1 || skip "jq not available"
     # Piped directly: broker()'s double-quoted bash -c would eat the
     # backslashes this request is about.
@@ -2830,6 +2875,7 @@ last_event() {
 }
 
 @test "docker broker rotates the event log past its size cap" {
+    need_qs_event
     mkdir -p "$BATS_TEST_TMPDIR/.config/quicksand"
     printf 'old\n' > "$BATS_TEST_TMPDIR/.config/quicksand/events.jsonl"
     QS_EVENTS_MAX_BYTES=1 broker '{"v":1,"verb":"ps"}'
@@ -2839,6 +2885,7 @@ last_event() {
 }
 
 @test "auth broker logs each provider's outcome" {
+    need_qs_event
     command -v jq >/dev/null 2>&1 || skip "jq not available"
     auth_fixture
     auth_provider one 'exit 0'
@@ -2851,6 +2898,7 @@ last_event() {
 }
 
 @test "auth broker logs a clean refresh as ok" {
+    need_qs_event
     command -v jq >/dev/null 2>&1 || skip "jq not available"
     auth_fixture
     auth_provider one 'exit 0'
@@ -2859,6 +2907,7 @@ last_event() {
 }
 
 @test "auth broker logs rejected and shared requests" {
+    need_qs_event
     command -v jq >/dev/null 2>&1 || skip "jq not available"
     auth_fixture
     auth_provider one 'exit 0'
@@ -2873,6 +2922,7 @@ last_event() {
 }
 
 @test "say broker logs what it spoke, stripped of bytes that aren't valid JSON text" {
+    need_qs_event
     command -v jq >/dev/null 2>&1 || skip "jq not available"
     say_broker $'hi \xff "there" \\ \x07done'
     [ "$(last_event broker)" == "say" ]

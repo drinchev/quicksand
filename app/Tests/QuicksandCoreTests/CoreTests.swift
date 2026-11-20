@@ -264,3 +264,77 @@ import Testing
         #expect(BrokerNotice.make(for: failed, isNew: false, mode: .off) == nil)
     }
 }
+
+// MARK: - Event writer (qs-event)
+
+@Suite struct EventWriterTests {
+    func line(verb: String = "run", fields: [(String, Data)] = [], sandbox: String = "work") throws -> [String: Any] {
+        let text = try EventWriter.line(broker: "docker", sandbox: Data(sandbox.utf8), verb: Data(verb.utf8),
+                                        result: "ok", fields: fields,
+                                        started: Date(timeIntervalSince1970: 100),
+                                        now: Date(timeIntervalSince1970: 112))
+        return try #require(JSONSerialization.jsonObject(with: Data(text.utf8)) as? [String: Any])
+    }
+
+    @Test func writesWhatTheAppReads() throws {
+        let text = try EventWriter.line(broker: "docker", sandbox: Data("work".utf8), verb: Data("pull".utf8),
+                                        result: "ok", fields: [("exit", Data("0".utf8)), ("target", Data("node:20".utf8))],
+                                        started: nil)
+        let e = try #require(BrokerEvent.decode(line: Data(text.utf8)))
+        #expect(e.sandbox == "work" && e.broker == "docker" && e.verb == "pull" && e.result == "ok")
+        #expect(e.exit == 0 && e.target == "node:20")
+        #expect(e.date != nil)
+    }
+
+    @Test func cleansWhatTheSandboxSent() throws {
+        var raw = Data("hi ".utf8); raw.append(0xff); raw.append(Data(" \"there\" \\ \u{07}\u{1b}[31mdone".utf8))
+        let e = try line(fields: [("target", raw)])
+        #expect(e["target"] as? String == #"hi  "there" \ [31mdone"#)
+        #expect(e["secs"] as? Int == 12)
+    }
+
+    @Test func leavesOutEmptyValuesAndNonNumericExits() throws {
+        let e = try line(fields: [("reason", Data()), ("exit", Data("12; rm".utf8))])
+        #expect(e["reason"] == nil && e["exit"] == nil)
+        #expect(try line(fields: [("exit", Data("125".utf8))])["exit"] as? Int == 125)
+    }
+
+    @Test func refusesWhatOnlyABrokerBugWouldSend() {
+        #expect(throws: EventWriter.UsageError.badBroker("ssh")) {
+            try EventWriter.line(broker: "ssh", sandbox: Data(), verb: Data(), result: "ok", fields: [], started: nil)
+        }
+        #expect(throws: EventWriter.UsageError.badField("sandbox")) {
+            try EventWriter.line(broker: "say", sandbox: Data(), verb: Data(), result: "ok",
+                                 fields: [("sandbox", Data("x".utf8))], started: nil)
+        }
+        #expect(throws: EventWriter.UsageError.badResult("OK!")) {
+            try EventWriter.line(broker: "say", sandbox: Data(), verb: Data(), result: "OK!", fields: [], started: nil)
+        }
+    }
+
+    @Test func rotatesOnceAndKeepsEveryLineUnderConcurrency() throws {
+        let fx = try Fixture()
+        let log = fx.paths.eventsLog
+        let old = String(repeating: "x", count: 999) + "\n"
+        try old.write(to: log, atomically: false, encoding: .utf8)
+        // 40 writers at once; the old log is over the cap, the 40 new lines
+        // (under 400 bytes) aren't: exactly one rotation, no line lost.
+        DispatchQueue.concurrentPerform(iterations: 40) { i in
+            try? EventWriter.append("{\"n\":\(i)}", to: log, maxBytes: 500)
+        }
+        let rotated = try String(contentsOf: log.appendingPathExtension("1"), encoding: .utf8)
+        let current = try String(contentsOf: log, encoding: .utf8)
+        #expect(rotated == old)
+        #expect(Set(current.split(separator: "\n")).count == 40)
+    }
+
+    @Test func findsTheToolNextToTheExecutable() throws {
+        let fx = try Fixture()
+        let exe = fx.root.appendingPathComponent("Quicksand")
+        #expect(BrokerLauncher.eventTool(nextTo: exe) == nil)
+        FileManager.default.createFile(atPath: fx.root.appendingPathComponent("qs-event").path,
+                                       contents: Data(), attributes: [.posixPermissions: 0o755])
+        #expect(BrokerLauncher.eventTool(nextTo: exe)?.lastPathComponent == "qs-event")
+        #expect(BrokerLauncher.baseEnvironment(eventTool: nil)["QS_EVENT_BIN"] == nil)
+    }
+}

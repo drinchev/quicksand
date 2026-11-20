@@ -8,8 +8,8 @@
 # when root asks. Audio *output* works fine from here; it's the speech
 # engine that is out of reach, so `say` exits 0 having synthesized nothing.
 #
-# So the text goes to a host-side broker (config/qs-say-broker) over a Unix
-# socket in _quicksand/, and that runs `say` as the host user inside their
+# So the text goes to a host-side broker (config/qs-say-broker) through
+# Quicksand.app's socket in /Users/Shared/quicksand/, and that runs `say` as the host user inside their
 # GUI session. The broker treats the text as untrusted: it strips control
 # characters, caps the length and feeds it to `say` on stdin, never as an
 # argument.
@@ -18,10 +18,10 @@
 # PATH by profile.d/31-claude-say.sh, which also hooks Claude Code up to it.
 set -euo pipefail
 
-SOCK="${QS_SAY_SOCK:-${SHARED_WORKSPACE:?SHARED_WORKSPACE not set}/_quicksand/say.sock}"
+SOCK="${QS_SAY_SOCK:-/Users/Shared/quicksand/say.sock}"
 [[ $# -ge 1 ]] || { echo "usage: qs-say MESSAGE..." >&2; exit 2; }
 [[ -S "$SOCK" ]] || {
-    echo "qs-say: broker socket not found at $SOCK — rebuild the sandbox on the host: qs build ${QS_SANDBOX_NAME:-NAME} --rebuild" >&2
+    echo "qs-say: Quicksand.app isn't running on the host (no socket at $SOCK)" >&2
     exit 1
 }
 

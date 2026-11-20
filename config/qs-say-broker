@@ -25,6 +25,49 @@ MAX_BYTES=300
 mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
 exec 2>>"$LOG_FILE"
 
+BROKER_KIND=say
+EVENTS_LOG="${QS_EVENTS_LOG:-$HOME/.config/quicksand/events.jsonl}"
+
+# --- event log: keep this block identical in all three brokers -------------
+# One JSON line per finished request, appended to $EVENTS_LOG for
+# Quicksand.app (see docs/quicksand-app.md). Values a sandbox sent are
+# untrusted: control characters and invalid UTF-8 are dropped and \ and "
+# escaped, so every line is valid JSON whatever the client sent. Logging
+# must never break a broker: its errors go to stderr (the broker log).
+EVENTS_MAX_BYTES="${QS_EVENTS_MAX_BYTES:-5000000}"
+EVENT_START="$(date +%s)"
+
+json_str() {
+    printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177' \
+        | iconv -c -f UTF-8 -t UTF-8 2>/dev/null \
+        | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+# emit_event VERB RESULT [FIELD VALUE]... — FIELD names are literals from
+# this script, never client input. Empty values are left out; "exit" is
+# written as a number.
+emit_event() {
+    local line size
+    line="{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"sandbox\":\"$(json_str "$SANDBOX_NAME")\""
+    line+=",\"broker\":\"$BROKER_KIND\",\"verb\":\"$(json_str "$1")\",\"result\":\"$2\""
+    line+=",\"secs\":$(( $(date +%s) - EVENT_START ))"
+    shift 2
+    while (( $# >= 2 )); do
+        if [[ "$1" == exit ]]; then
+            [[ "$2" =~ ^[0-9]+$ ]] && line+=",\"exit\":$2"
+        elif [[ -n "$2" ]]; then
+            line+=",\"$1\":\"$(json_str "$2")\""
+        fi
+        shift 2
+    done
+    line+="}"
+    mkdir -p "$(dirname "$EVENTS_LOG")" || return 0
+    size="$(stat -f %z "$EVENTS_LOG" 2>/dev/null || echo 0)"
+    (( size < EVENTS_MAX_BYTES )) || mv -f "$EVENTS_LOG" "$EVENTS_LOG.1" || true
+    printf '%s\n' "$line" >> "$EVENTS_LOG" || true
+}
+# --- end event log ---------------------------------------------------------
+
 # Read one line, bounded in both time and size so a client that never
 # sends a newline can't hold a broker process open. Then hang up: closing
 # the socket fds ends the client's wait before any speech starts.
@@ -45,4 +88,8 @@ for _ in $(seq 1 100); do
 done
 $have_lock && trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
 
-printf '%s\n' "$MSG" | say >/dev/null
+if printf '%s\n' "$MSG" | say >/dev/null; then
+    emit_event say ok target "$MSG"
+else
+    emit_event say error target "$MSG" reason "say failed"
+fi

@@ -11,7 +11,8 @@
 #   qs-auth-refresh
 #
 # It sends the single word "refresh" to a host-side broker
-# (config/qs-auth-broker) over a Unix socket in _quicksand/. The broker runs
+# (config/qs-auth-broker) through Quicksand.app's socket in
+# /Users/Shared/quicksand/. The broker runs
 # the same providers a launch runs, as the host user, and reports anything
 # that needs you — e.g. 1Password being locked on the host. Nothing else can
 # be asked of it.
@@ -28,18 +29,18 @@
 # Staged into _quicksand/bin/ by the build and installed onto the sandbox
 # PATH by profile.d/11-auth-refresh.sh.
 
-sock="${QS_AUTH_SOCK:-${SHARED_WORKSPACE:?SHARED_WORKSPACE not set}/_quicksand/auth.sock}"
+sock="${QS_AUTH_SOCK:-/Users/Shared/quicksand/auth.sock}"
 # Longer than the broker's own worst case, so its answer wins the race.
 timeout="${QS_AUTH_REFRESH_TIMEOUT:-100}"
 
 if [[ ! -S $sock ]]; then
-    print -u2 -r -- "qs-auth-refresh: broker socket not found at $sock — rebuild the sandbox on the host: qs build ${QS_SANDBOX_NAME:-NAME} --rebuild"
+    print -u2 -r -- "qs-auth-refresh: Quicksand.app isn't running on the host (no socket at $sock) — open it there and try again."
     exit 1
 fi
 
 zmodload zsh/net/socket || exit 1
 if ! zsocket $sock 2>/dev/null; then
-    print -u2 -r -- "qs-auth-refresh: the host's credential broker is not answering — it only runs while the host user is logged in to the Mac's desktop."
+    print -u2 -r -- "qs-auth-refresh: Quicksand.app is not answering — it only runs while the host user is logged in to the Mac's desktop."
     exit 1
 fi
 fd=$REPLY

@@ -54,11 +54,72 @@ mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
 exec 2>>"$LOG_FILE"
 echo "$(date '+%F %T') connection" >&2
 
-finish() { printf '\n@@qs-docker-exit:%d@@\n' "$1"; exit 0; }
-fail()   { printf 'qs-docker: %s\n' "$1"; finish 125; }
+BROKER_KIND=docker
+EVENTS_LOG="${QS_EVENTS_LOG:-$HOME/.config/quicksand/events.jsonl}"
 
-[[ -x "$DOCKER" ]] || fail "docker CLI not executable at $DOCKER — re-run 'qs docker $SANDBOX_NAME' on the host"
-[[ -x "$JQ" ]] || fail "jq not executable at $JQ — re-run 'qs docker $SANDBOX_NAME' on the host"
+# --- event log: keep this block identical in all three brokers -------------
+# One JSON line per finished request, appended to $EVENTS_LOG for
+# Quicksand.app (see docs/quicksand-app.md). Values a sandbox sent are
+# untrusted: control characters and invalid UTF-8 are dropped and \ and "
+# escaped, so every line is valid JSON whatever the client sent. Logging
+# must never break a broker: its errors go to stderr (the broker log).
+EVENTS_MAX_BYTES="${QS_EVENTS_MAX_BYTES:-5000000}"
+EVENT_START="$(date +%s)"
+
+json_str() {
+    printf '%s' "$1" | LC_ALL=C tr -d '\000-\037\177' \
+        | iconv -c -f UTF-8 -t UTF-8 2>/dev/null \
+        | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+# emit_event VERB RESULT [FIELD VALUE]... — FIELD names are literals from
+# this script, never client input. Empty values are left out; "exit" is
+# written as a number.
+emit_event() {
+    local line size
+    line="{\"ts\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"sandbox\":\"$(json_str "$SANDBOX_NAME")\""
+    line+=",\"broker\":\"$BROKER_KIND\",\"verb\":\"$(json_str "$1")\",\"result\":\"$2\""
+    line+=",\"secs\":$(( $(date +%s) - EVENT_START ))"
+    shift 2
+    while (( $# >= 2 )); do
+        if [[ "$1" == exit ]]; then
+            [[ "$2" =~ ^[0-9]+$ ]] && line+=",\"exit\":$2"
+        elif [[ -n "$2" ]]; then
+            line+=",\"$1\":\"$(json_str "$2")\""
+        fi
+        shift 2
+    done
+    line+="}"
+    mkdir -p "$(dirname "$EVENTS_LOG")" || return 0
+    size="$(stat -f %z "$EVENTS_LOG" 2>/dev/null || echo 0)"
+    (( size < EVENTS_MAX_BYTES )) || mv -f "$EVENTS_LOG" "$EVENTS_LOG.1" || true
+    printf '%s\n' "$line" >> "$EVENTS_LOG" || true
+}
+# --- end event log ---------------------------------------------------------
+
+# What the event for this request records; the verb branches fill these in.
+VERB="" TARGET="" RESULT="" REASON=""
+
+# Every request ends here. The exit sentinel goes out first so the client
+# isn't kept waiting on the event log.
+finish() {
+    printf '\n@@qs-docker-exit:%d@@\n' "$1"
+    if [[ -z "$RESULT" ]]; then
+        if (( $1 == 0 )); then RESULT=ok; else RESULT=error; fi
+    fi
+    emit_event "${VERB:-?}" "$RESULT" exit "$1" target "$TARGET" reason "$REASON"
+    exit 0
+}
+# fail MESSAGE [RESULT] — RESULT is "rejected" (policy said no, the default)
+# or "error" (the host side is misconfigured).
+fail() {
+    RESULT="${2:-rejected}" REASON="$1"
+    printf 'qs-docker: %s\n' "$1"
+    finish 125
+}
+
+[[ -x "$DOCKER" ]] || fail "docker CLI not executable at $DOCKER — re-run 'qs docker $SANDBOX_NAME' on the host" error
+[[ -x "$JQ" ]] || fail "jq not executable at $JQ — re-run 'qs docker $SANDBOX_NAME' on the host" error
 
 # docker execs the credential helper named in the host's ~/.docker/config.json
 # (docker-credential-osxkeychain, ...) via $PATH, but launchd spawns this
@@ -106,6 +167,7 @@ run_docker() {
 case "$VERB" in
 run)
     IMAGE="$(json '.image')" || fail "run: missing image"
+    TARGET="$IMAGE"
     [[ "$IMAGE" =~ $IMAGE_RE ]] || fail "run: bad image ref"
 
     WORKDIR="$(json '.workdir // empty')"
@@ -145,6 +207,7 @@ run)
     ;;
 build)
     TAG="$(json '.tag')" || fail "build: missing tag"
+    TARGET="$TAG"
     [[ "$TAG" == "$TAG_NS"* && "$TAG" =~ $IMAGE_RE ]] \
         || fail "build: tag must live under $TAG_NS (can't clobber host images)"
     CONTEXT="$(json '.context')" || fail "build: missing context"
@@ -168,6 +231,7 @@ build)
     ;;
 pull)
     IMAGE="$(json '.image')" || fail "pull: missing image"
+    TARGET="$IMAGE"
     [[ "$IMAGE" =~ $IMAGE_RE ]] || fail "pull: bad image ref"
     exec 0</dev/null
     run_docker pull "$IMAGE"
@@ -178,6 +242,7 @@ ps)
     ;;
 logs|stop)
     ID="$(json '.id')" || fail "$VERB: missing id"
+    TARGET="$ID"
     [[ "$ID" =~ $ID_RE ]] || fail "$VERB: bad container id"
     exec 0</dev/null
     # Never touch a container this sandbox didn't create.

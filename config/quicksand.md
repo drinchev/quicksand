@@ -132,9 +132,12 @@ sandboxes, indexed as the qmd collection `shared-memory`.
   `qs-<sandbox>/`, and you can only see or stop containers this sandbox
   created. Piped stdin reaches the container; there is no TTY, no `exec`,
   no volume flags.
-- If `qs-docker` is absent or reports the broker socket missing, the
-  feature is off — hand the user the command `qs docker <name>` to run on
-  the host instead of trying to reach Docker another way.
+- If `qs-docker` is absent or says Docker isn't enabled, the feature is
+  off — hand the user the command `qs docker <name>` to run on the host
+  instead of trying to reach Docker another way.
+- `qs-docker`, `qs-auth-refresh` and `qs-say` all go through Quicksand.app
+  on the host. If one says "Quicksand.app isn't running on the host", ask
+  the user to open it; there is no other way around it.
 
 ## App secrets (1Password)
 - If `qs op-auth` has been run, app secrets (API keys, passwords, etc.) live in

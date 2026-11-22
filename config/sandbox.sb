@@ -35,6 +35,13 @@
     (subpath "@SHARED_WORKSPACE@")
     (subpath "@QUICKSAND_USER_HOME@"))
 
+;; The broker sockets Quicksand.app listens on (docker.sock, auth.sock,
+;; say.sock). Every sandbox shares them: the app tells callers apart by
+;; their uid, not by which socket they used. Read is all that's needed to
+;; reach them: connecting to a Unix socket isn't a file write here.
+(allow file-read*
+    (subpath "/Users/Shared/quicksand"))
+
 ;; System.keychain is world-readable on stock macOS; deny is load-bearing.
 (deny file-read*
     (subpath "/Library/Keychains"))

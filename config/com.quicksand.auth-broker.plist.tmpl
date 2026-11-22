@@ -1,15 +1,16 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<!-- LaunchAgent for the qs credential broker (config/qs-auth-broker).
-     Rendered per sandbox by every build (@SANDBOX_NAME@ etc. substituted)
-     into ~/Library/LaunchAgents/ and loaded into the host user's GUI
-     session, where 1Password's app integration and the host's gcloud login
-     are available. launchd owns the socket and spawns one broker process
-     per connection (inetd nowait): nothing runs while idle, and the broker
-     script lives host-side where the sandbox can't rewrite it.
+<!-- Spec for the qs credential broker (config/qs-auth-broker). Rendered
+     per sandbox by every build (@SANDBOX_NAME@ etc. substituted) into
+     ~/.config/quicksand/brokers/. Quicksand.app, running in the host
+     user's GUI session where 1Password's app integration and the host's
+     gcloud login are available, runs ProgramArguments with
+     EnvironmentVariables for each connection from this sandbox: nothing
+     runs while idle, and the broker script lives host-side where the
+     sandbox can't rewrite it.
 
-     launchd gives agents a bare PATH, so the PATH of the shell that built
+     The app gives brokers a bare PATH, so the PATH of the shell that built
      the sandbox is pinned here — that is where `op` and `gcloud` are found.
      QS_AUTH_LIBEXEC is the quicksand checkout's libexec/, from which the
      providers run, exactly as they do for `qs shell`. -->
@@ -33,27 +34,6 @@
         <string>@SHARED_WORKSPACE@/_quicksand</string>
         <key>QS_AUTH_INSTALL_DIR</key>
         <string>@INSTALL_DIR@</string>
-    </dict>
-    <key>inetdCompatibility</key>
-    <dict>
-        <key>Wait</key>
-        <false/>
-    </dict>
-    <key>Sockets</key>
-    <dict>
-        <key>Listener</key>
-        <dict>
-            <key>SockFamily</key>
-            <string>Unix</string>
-            <key>SockPathName</key>
-            <string>@SHARED_WORKSPACE@/_quicksand/auth.sock</string>
-            <!-- 0666 (438): connecting needs write on the socket file, and
-                 reaching it at all needs traversal through the 0770
-                 workspace — only the host user and this sandbox's user
-                 get that far. -->
-            <key>SockPathMode</key>
-            <integer>438</integer>
-        </dict>
     </dict>
 </dict>
 </plist>

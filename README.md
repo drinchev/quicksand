@@ -350,12 +350,14 @@ The policy, enforced entirely host-side:
   updated. Build-time resource use (CPU, disk) is also uncapped; a hostile
   build can waste resources, not read files.
 
-The broker script is staged under `~/.config/quicksand/` and loaded as a
-socket-activated LaunchAgent (`com.quicksand.docker-broker.NAME`): launchd
-owns the socket and spawns one short-lived broker per connection, so nothing
-runs while idle — and the code executing as your user lives host-side where
-the sandbox can't edit it. The `docker`/`jq` binary paths are pinned into the
-LaunchAgent at install time. Containers themselves are confined by your
+The broker script is staged under `~/.config/quicksand/`, and
+[Quicksand.app](#quicksandapp) runs it: the app owns the socket
+(`/Users/Shared/quicksand/docker.sock`) and starts one short-lived broker per
+connection, so nothing runs while idle — and the code executing as your user
+lives host-side where the sandbox can't edit it. The `docker`/`jq` binary
+paths are pinned into the broker's spec
+(`~/.config/quicksand/brokers/com.quicksand.docker-broker.NAME.plist`) at
+install time. Containers themselves are confined by your
 engine's VM, not by `sandbox-exec`; container network egress is unrestricted,
 matching quicksand's "files, not egress" model.
 
@@ -451,9 +453,9 @@ that doesn't start from `qs` — an SSH login — never gets them, and a session
 that runs longer than an hour outlives its GCP token.
 
 A host-side broker closes both. Every build stages `config/qs-auth-broker`
-under `~/.config/quicksand/` and loads it as a socket-activated LaunchAgent
-(`com.quicksand.auth-broker.NAME`) in your GUI session, with its socket in the
-workspace. Inside the sandbox:
+under `~/.config/quicksand/` and [Quicksand.app](#quicksandapp), running in
+your GUI session, starts it for each request on
+`/Users/Shared/quicksand/auth.sock`. Inside the sandbox:
 
 ```bash
 qs-auth-refresh     # ask the host to re-stage this sandbox's credentials
@@ -471,7 +473,7 @@ The broker runs the same providers (`libexec/qs-auth-*`) with the same
 
 - **The sandbox can ask for exactly one thing.** The request is the single
   word `refresh`; nothing the sandbox sends reaches a command line, and which
-  sandbox is refreshed is fixed by the LaunchAgent, not the request. The worst
+  sandbox is refreshed is fixed by the caller's uid, not the request. The worst
   a hostile sandbox can do is make the host re-stage that sandbox's own
   credentials — and, if 1Password is locked, make it ask you to unlock.
 - **It reports what needs you.** Provider messages ("unlock 1Password", a
@@ -482,10 +484,11 @@ The broker runs the same providers (`libexec/qs-auth-*`) with the same
   had to wait for another reuses its result. The GCP provider additionally
   skips a token younger than 50 minutes.
 - **It needs your desktop session.** 1Password's app integration and your
-  `gcloud` login live there; with nobody logged in to the Mac the socket has
-  no listener, and SSH sessions say so and carry on.
+  `gcloud` login live there; with nobody logged in to the Mac (or the app
+  not running) the socket has no listener, and SSH sessions say so and carry
+  on.
 
-On macOS 27, `op` started by a LaunchAgent reports "No accounts configured":
+On macOS 27, `op` started in the background reports "No accounts configured":
 it learns that the desktop-app integration is on from a settings file inside
 1Password's Group Container, and macOS only lets a process read that when the
 app behind it has the "data from other apps" permission — your terminal does,
@@ -494,8 +497,8 @@ read with `OP_BIOMETRIC_UNLOCK_ENABLED=true`, which states the same thing
 through the environment. If a read still fails, the warning carries `op`'s own
 error text.
 
-launchd gives agents a bare `PATH`, so the `PATH` of the shell that built the
-sandbox is pinned into the agent — that is where `op` and `gcloud` are looked
+The app gives brokers a bare `PATH`, so the `PATH` of the shell that built the
+sandbox is pinned into the broker's spec — that is where `op` and `gcloud` are looked
 up. If you install either later, rebuild (`qs build NAME -r`). Other
 environment from your shell (a custom `CLOUDSDK_CONFIG`, an `op` session
 variable) is not carried over. Requests are logged to
@@ -505,6 +508,34 @@ Because sessions now overlap in ways that matter — a local `qs claude` beside
 an SSH login, or the several short logins an SSH client makes — sessions
 record themselves in `_quicksand/sessions/`, and the 1Password token is removed
 only when the last one exits.
+
+## Quicksand.app
+
+`app/` holds a status-bar app that runs the host-side brokers — Docker,
+credential refresh and speech — for every sandbox, like Docker Desktop runs
+its engine. It listens on three sockets in `/Users/Shared/quicksand/`, tells
+sandboxes apart by the uid of the connecting process, and starts the
+sandbox's bash broker for each request from the spec qs renders under
+`~/.config/quicksand/brokers/`. It also shows every sandbox (active or idle,
+sessions, Docker, token ages) and every broker request from
+`~/.config/quicksand/events.jsonl`. It posts a notification whenever anyone
+connects to a broker (who, and which broker; the app never reads the request
+itself), or with "Notify: Problems" only for refused and failed requests.
+
+**Keep it running.** Without it, `qs-docker`, `qs-auth-refresh` and `qs-say`
+fail with "Quicksand.app isn't running on the host". Turn on "Open at login"
+in its menu.
+
+```bash
+app/scripts/bundle.sh && cp -R app/build/Quicksand.app ~/Applications/ && open ~/Applications/Quicksand.app
+```
+
+Sandboxes built before the app had their own LaunchAgents
+(`~/Library/LaunchAgents/com.quicksand.*-broker.NAME.plist`) with sockets in
+`_quicksand/`. They keep working until the next build of that sandbox, which
+removes them and moves it to the app; the menu lists the sandboxes still
+waiting for that. Design and details:
+[docs/quicksand-app.md](docs/quicksand-app.md).
 
 ## Speech from the sandbox (`qs-say`)
 
@@ -519,10 +550,10 @@ and `say` exits 0 having synthesized nothing (`say -o` writes a header with
 zero audio bytes). Notification Center has the same gap.
 
 So quicksand speaks from the host. Every build stages `config/qs-say-broker`
-under `~/.config/quicksand/` and loads it as a socket-activated LaunchAgent
-(`com.quicksand.say-broker.NAME`) in *your* GUI session, the one place speech
-works; launchd owns the socket (`_quicksand/say.sock`) and spawns one
-short-lived broker per message, so nothing runs while idle. Inside the
+under `~/.config/quicksand/`, and [Quicksand.app](#quicksandapp), running in
+*your* GUI session, the one place speech works, starts one short-lived broker
+per message on `/Users/Shared/quicksand/say.sock`, so nothing runs while
+idle. Inside the
 sandbox, `profile.d/31-claude-say.sh` installs the `qs-say` client on the
 PATH and, once per sandbox, seeds two Claude Code `Notification` hooks into
 the sandbox's `~/.claude/settings.json`:
@@ -672,8 +703,10 @@ existing sandboxes automatically on next entry.
 | SSH wrapper & authorized keys (`qs ssh-auth`) | `/var/quicksand/ssh-qs-NAME/` |
 | sshd `Match` block (`qs ssh-auth`) | `/etc/ssh/sshd_config.d/010-quicksand-qs-NAME.conf` |
 | sshd default rule for all sandboxes | `/etc/ssh/sshd_config.d/020-quicksand-default.conf` |
-| Credential & speech broker sockets | `/Users/Shared/qs-NAME/_quicksand/auth.sock`, `say.sock` |
+| Broker sockets (Quicksand.app, all sandboxes) | `/Users/Shared/quicksand/docker.sock`, `auth.sock`, `say.sock` |
+| Broker specs | `~/.config/quicksand/brokers/com.quicksand.{docker,auth,say}-broker.NAME.plist` |
 | Install marker, clone & GCP manifests, staged brokers & their logs | `~/.config/quicksand/` |
+| Broker event log (one JSON line per request, all sandboxes; written by `qs-event` inside Quicksand.app) | `~/.config/quicksand/events.jsonl` |
 
 Sandbox names: up to 16 characters, `[A-Za-z0-9_-]+`.
 

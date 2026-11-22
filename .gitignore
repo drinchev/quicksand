@@ -1,2 +1,6 @@
 # JetBrains IDE
 .idea/
+
+# Swift app build output
+app/.build/
+app/build/

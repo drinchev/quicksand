@@ -42,6 +42,28 @@ mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
 exec 2>>"$LOG_FILE"
 log() { echo "$(date '+%F %T') $*" >&2; }
 
+BROKER_KIND=auth
+EVENTS_LOG="${QS_EVENTS_LOG:-$INSTALL_DIR/events.jsonl}"
+
+# --- event log: keep this block identical in all three brokers -------------
+# One JSON line per finished request, appended to $EVENTS_LOG for
+# Quicksand.app (see docs/quicksand-app.md). qs-event (app/Sources/qs-event)
+# writes it: it cleans what the sandbox sent, rotates the log and locks it
+# against concurrent brokers. The app passes its path as QS_EVENT_BIN;
+# without it (a broker run by hand) nothing is logged. Logging never breaks
+# a broker: qs-event's complaints go to stderr (the broker log).
+EVENT_START="$(date +%s)"
+
+# emit_event VERB RESULT [FIELD VALUE]... — FIELD names are literals from
+# this script, never client input. Empty values are left out; "exit" is
+# written as a number.
+emit_event() {
+    [[ -n "${QS_EVENT_BIN:-}" && -x "$QS_EVENT_BIN" ]] || return 0
+    "$QS_EVENT_BIN" --log "$EVENTS_LOG" --broker "$BROKER_KIND" \
+        --sandbox "$SANDBOX_NAME" --since "$EVENT_START" -- "$@" || true
+}
+# --- end event log ---------------------------------------------------------
+
 # Send one line to the client, stripped of control characters and capped —
 # provider output is host-generated, but it ends up in a sandbox terminal.
 reply() { printf '%s\n' "$*" | LC_ALL=C tr -d '\000-\011\013-\037\177' | cut -c 1-500; }
@@ -53,6 +75,7 @@ IFS= read -r -t 10 -n 64 REQUEST || true
 if [[ "$REQUEST" != "refresh" ]]; then
     log "rejected request"
     reply "qs-auth-broker: unknown request"
+    emit_event "$REQUEST" rejected reason "unknown request"
     exit 0
 fi
 
@@ -77,14 +100,26 @@ trap 'rmdir "$LOCK_DIR" 2>/dev/null' EXIT
 if $waited; then
     log "refresh shared with a concurrent request"
     reply "done"
+    emit_event refresh shared
     exit 0
 fi
 
 if [[ ! -d "$LIBEXEC_DIR" ]]; then
     log "provider directory missing: $LIBEXEC_DIR"
     reply "quicksand's auth providers were not found on the host (was its checkout moved?) — rebuild there: qs build $SANDBOX_NAME --rebuild"
+    emit_event refresh error reason "provider directory missing"
     exit 0
 fi
+
+# Each provider's outcome, for the event: "name=ok", "name=exit N",
+# "name=timeout" or "name=error" (it could not be started),
+# comma-separated. Any outcome but ok makes the refresh an error.
+PROVIDERS=""
+AUTH_RESULT=ok
+note_provider() {
+    PROVIDERS="${PROVIDERS:+$PROVIDERS,}$1=$2"
+    [[ "$2" == ok ]] || AUTH_RESULT=error
+}
 
 # Run one provider's `refresh` with the same environment contract qs gives
 # it (see run_auth_provider in qs), relaying what it prints. Its stdout and
@@ -92,7 +127,7 @@ fi
 # must not keep the client's connection open.
 run_provider() {
     local script="$1" name="${1##*/qs-auth-}" out pid watchdog rc line
-    out="$(mktemp "${TMPDIR:-/tmp}/qs-auth-out.XXXXXX")" || return 0
+    out="$(mktemp "${TMPDIR:-/tmp}/qs-auth-out.XXXXXX")" || { note_provider "$name" error; return 0; }
     env QS_SANDBOX_NAME="$SANDBOX_NAME" \
         QS_PRIVATE_DIR="$PRIVATE_DIR" \
         QS_INSTALL_DIR="$INSTALL_DIR" \
@@ -120,8 +155,10 @@ run_provider() {
     if [[ "$rc" == timeout ]]; then
         log "$name: timed out after ${PROVIDER_TIMEOUT}s"
         reply "WARNING: the host's $name credential refresh gave up after ${PROVIDER_TIMEOUT}s — it may be waiting for you to approve or unlock something on the host."
+        note_provider "$name" timeout
     else
         log "$name: refresh exit $rc"
+        if [[ "$rc" == 0 ]]; then note_provider "$name" ok; else note_provider "$name" "exit $rc"; fi
     fi
 }
 
@@ -130,3 +167,4 @@ for script in "$LIBEXEC_DIR"/qs-auth-*; do
     run_provider "$script"
 done
 reply "done"
+emit_event refresh "$AUTH_RESULT" providers "$PROVIDERS"

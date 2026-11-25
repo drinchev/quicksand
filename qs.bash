@@ -50,13 +50,10 @@ readonly QS_LIBEXEC_DIR="$QS_REPO_DIR/libexec"
 readonly QS_DOCKER_BROKER_SOURCE="$QS_REPO_DIR/config/qs-docker-broker"
 readonly QS_DOCKER_SHIM_SOURCE="$QS_REPO_DIR/config/qs-docker"
 readonly QS_DOCKER_PLIST_TEMPLATE="$QS_REPO_DIR/config/com.quicksand.docker-broker.plist.tmpl"
-# Speech broker assets (see config/qs-say): the host-side broker that runs
-# `say` as the host user, the sandbox-side client, and the LaunchAgent
-# template that ties them together. Installed by every build — a sandbox
-# user has no GUI session and therefore no speech services of its own.
-readonly QS_SAY_BROKER_SOURCE="$QS_REPO_DIR/config/qs-say-broker"
+# Speech (see config/qs-say): the sandbox-side client, staged by every
+# build. Quicksand.app serves it (app/Sources/QuicksandCore/SayBroker.swift)
+# — a sandbox user has no GUI session and therefore no speech services.
 readonly QS_SAY_CLIENT_SOURCE="$QS_REPO_DIR/config/qs-say"
-readonly QS_SAY_PLIST_TEMPLATE="$QS_REPO_DIR/config/com.quicksand.say-broker.plist.tmpl"
 # Credential broker assets (see config/qs-auth-broker): the host-side broker
 # that re-runs the auth providers' `refresh` on request, the sandbox-side
 # client, and the LaunchAgent template. Installed by every build, so
@@ -127,9 +124,7 @@ config_fingerprint() {
         /usr/bin/shasum -a 256 < "$QS_SANDBOX_PROFILE_TEMPLATE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_QUICKSAND_MD" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_CLAUDE_SETTINGS_TEMPLATE" 2>/dev/null || true
-        /usr/bin/shasum -a 256 < "$QS_SAY_BROKER_SOURCE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_SAY_CLIENT_SOURCE" 2>/dev/null || true
-        /usr/bin/shasum -a 256 < "$QS_SAY_PLIST_TEMPLATE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_DOCKER_BROKER_SOURCE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_DOCKER_SHIM_SOURCE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_DOCKER_PLIST_TEMPLATE" 2>/dev/null || true
@@ -321,12 +316,13 @@ derive_constants() {
     readonly QS_DOCKER_PLIST="$QS_BROKER_SPEC_DIR/$QS_DOCKER_LABEL.plist"
     readonly QS_DOCKER_LEGACY_PLIST="$HOME/Library/LaunchAgents/$QS_DOCKER_LABEL.plist"
     readonly QS_DOCKER_BROKER_STAGED="$INSTALL_DIR/docker-broker-$SANDBOX_NAME.sh"
-    # Speech broker (see config/qs-say): same shape as the docker broker,
-    # but installed by every build rather than opted into.
+    # Speech runs inside Quicksand.app. What earlier builds set up for the
+    # bash speech broker — a spec and a staged script (with the app), or a
+    # LaunchAgent (before it) — is removed by the next build.
     readonly QS_SAY_LABEL="com.quicksand.say-broker.$SANDBOX_NAME"
-    readonly QS_SAY_PLIST="$QS_BROKER_SPEC_DIR/$QS_SAY_LABEL.plist"
+    readonly QS_SAY_OLD_SPEC="$QS_BROKER_SPEC_DIR/$QS_SAY_LABEL.plist"
     readonly QS_SAY_LEGACY_PLIST="$HOME/Library/LaunchAgents/$QS_SAY_LABEL.plist"
-    readonly QS_SAY_BROKER_STAGED="$INSTALL_DIR/say-broker-$SANDBOX_NAME.sh"
+    readonly QS_SAY_OLD_BROKER="$INSTALL_DIR/say-broker-$SANDBOX_NAME.sh"
     # Credential broker (see config/qs-auth-broker): same shape again, also
     # installed by every build.
     readonly QS_AUTH_LABEL="com.quicksand.auth-broker.$SANDBOX_NAME"
@@ -637,33 +633,30 @@ cleanup_docker() {
     fi
 }
 
-# Install (or refresh) the speech broker for this sandbox: stage the broker
-# script host-side (it runs as the host user, so the sandbox must never be
-# able to edit it), stage the qs-say client into the workspace for
-# profile.d/31-claude-say.sh to pick up, and render the spec Quicksand.app
-# runs it from. The app runs in the host's GUI session — the only session
-# type whose launchd domain carries the speech services a `say` needs.
-say_broker_install() {
-    mkdir -p "$INSTALL_DIR"
-    /usr/bin/install -m 0755 "$QS_SAY_BROKER_SOURCE" "$QS_SAY_BROKER_STAGED"
-
+# Set up speech for this sandbox: stage the qs-say client into the workspace
+# for profile.d/31-claude-say.sh to pick up. Quicksand.app serves it for
+# every built sandbox, in the host's GUI session — the only session type
+# whose launchd domain carries the speech services a `say` needs. Also
+# removes what earlier builds set up for the bash speech broker.
+say_client_install() {
     mkdir -p "$QS_PRIVATE_DIR/bin"
     /usr/bin/install -m 0755 "$QS_SAY_CLIENT_SOURCE" "$QS_PRIVATE_DIR/bin/qs-say"
-
-    render_broker_spec "$QS_SAY_PLIST_TEMPLATE" "$QS_SAY_PLIST" \
-        -e "s|@SANDBOX_NAME@|$SANDBOX_NAME|g" \
-        -e "s|@BROKER_SCRIPT@|$QS_SAY_BROKER_STAGED|g"
-    retire_broker_agent "$QS_SAY_LABEL" "$QS_SAY_LEGACY_PLIST" say.sock
+    remove_old_say_broker
 }
 
-# Undo what the build provisioned for speech: remove the spec and the
-# staged broker, client and log (and any LaunchAgent from before
-# Quicksand.app). Best-effort.
-cleanup_say() {
+# What builds before speech moved into the app set up: a spec and staged
+# script for the bash broker, its log, and (before the app) a LaunchAgent
+# with a socket in _quicksand/. Best-effort; a no-op once removed.
+remove_old_say_broker() {
     retire_broker_agent "$QS_SAY_LABEL" "$QS_SAY_LEGACY_PLIST" say.sock
-    rm -f "$QS_SAY_PLIST" "$QS_SAY_BROKER_STAGED" \
-          "$INSTALL_DIR/say-broker-$SANDBOX_NAME.log" \
-          "${QS_PRIVATE_DIR:+$QS_PRIVATE_DIR/bin/qs-say}"
+    rm -f "$QS_SAY_OLD_SPEC" "$QS_SAY_OLD_BROKER" "$INSTALL_DIR/say-broker-$SANDBOX_NAME.log"
+}
+
+# Undo what the build provisioned for speech: the client, and anything an
+# earlier build left. Best-effort.
+cleanup_say() {
+    remove_old_say_broker
+    rm -f "${QS_PRIVATE_DIR:+$QS_PRIVATE_DIR/bin/qs-say}"
 }
 
 # Make a value safe to substitute into a plist <string> with `sed s|..|..|`:
@@ -1270,11 +1263,10 @@ EOF
         --checksum --perms --times \
         "$QS_CLAUDE_SETTINGS_TEMPLATE" "$QS_PRIVATE_DIR/claude-settings.json"
 
-    # Speech: stage the qs-say client and (re)load the host-side broker —
-    # every build, so config/qs-say* changes (fingerprinted) roll out like
-    # profile.d changes.
-    debug "Installing speech broker"
-    say_broker_install
+    # Speech: stage the qs-say client — every build, so config/qs-say
+    # changes (fingerprinted) roll out like profile.d changes.
+    debug "Installing speech client"
+    say_client_install
 
     # Credentials on demand: stage the qs-auth-refresh client and (re)load
     # the host-side broker — every build, for the same reason.

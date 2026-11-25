@@ -78,6 +78,10 @@ sandbox ──▶ /Users/Shared/quicksand/docker.sock ──▶ Quicksand.app (l
 
 ### The app spawns; the bash brokers decide
 
+(Speech no longer works this way: since the brokers started moving into the
+app, it runs inside it — see "Brokers inside the app" below. Docker and
+credentials still do.)
+
 - The app **never reads or parses** what a sandbox sends. It accepts the
   connection, works out the caller, and hands the file descriptor to a fresh
   bash broker process, exactly as launchd does today. The broker gets the same
@@ -215,6 +219,38 @@ app's UI can only run on the host (sandbox users have no GUI session).
 
 Sandboxes not rebuilt since step 3 still use their LaunchAgents: the app
 lists them, flagged, but doesn't serve their requests.
+
+## Brokers inside the app
+
+The bash brokers are moving into the app one by one: speech first, then
+credentials, then Docker, which also retires `qs-event`, `jq` and the last
+plist templates. A broker inside the app implements `InProcessBroker`: the
+listener still identifies the caller by uid and applies the 16-per-sandbox
+cap, then asks the broker whether that sandbox may use it and hands it the
+connection on a thread of its own (`BrokerClient`: bounded line reads,
+writes, close). It writes its event-log line itself with `EventWriter`. In
+the Activity window these requests show as "running in the app"; they have
+no pid.
+
+**Speech** (`SayBroker`): every built sandbox (one with
+`~/.config/quicksand/install-NAME`, which every build writes) may speak. It
+reads one line (at most 4096 bytes, within 10 s) and closes the connection
+before speaking, drops control bytes, caps the text at 300 bytes without
+splitting a character, and hands it to the app's `Speaker`. The real one,
+`SayCommandSpeaker`, pipes it to `/usr/bin/say` on stdin, one message at a
+time across all sandboxes so they never overlap. A request waits up to 90 s
+for its message (including those queued before it); a `say` still running
+then is stopped, and the request is logged as an error. `say` rather than
+`AVSpeechSynthesizer`: only `say` speaks with the Spoken Content voice when
+that is a Siri voice — apps can't use Siri voices through the synthesizer
+(tried, and heard on the host). Builds no longer stage a speech broker or render a speech spec,
+and the next build of each sandbox removes what earlier builds left
+(`say-broker-NAME.sh`, its spec and log, or a pre-app LaunchAgent).
+
+Host-side state for the next brokers (whether Docker is on for a sandbox,
+the host's `docker` path, the PATH and `libexec/` the credential providers
+need) is still to be decided between small files and a SQLite `state.db`
+written through the Swift `qs`.
 
 ## The qs command
 

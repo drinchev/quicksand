@@ -9,9 +9,9 @@ public enum NoticeMode: String, CaseIterable, Sendable {
     case off
 }
 
-/// The notification for one update of a broker connection. The app never
-/// reads requests, so it can say who called which broker and how that
-/// ended, not what was asked.
+/// The notification for one update of a broker connection: who called which
+/// broker and how that ended, never what was asked (requests can hold
+/// anything a sandbox chose to send).
 public struct BrokerNotice: Equatable, Sendable {
     public let title: String
     public let body: String
@@ -37,13 +37,12 @@ public struct BrokerNotice: Equatable, Sendable {
         case (.rejected(let why), _):
             let caller = conn.sandbox == nil ? "\(who) (not a sandbox)" : who
             return BrokerNotice(title: "Refused \(caller) → \(broker)", body: why, thread: thread)
-        case (.finished(_, let status), _):
+        case (.finished(let pid, let status), _):
             let code = exitCode(status)
             guard code != 0 else { return nil }
-            return BrokerNotice(title: "\(who) → \(broker) failed",
-                                body: code.map { "The broker exited with status \($0)." }
-                                    ?? "The broker was killed by a signal.",
-                                thread: thread)
+            let body = pid == nil ? "The request failed; the event log has the reason."
+                : code.map { "The broker exited with status \($0)." } ?? "The broker was killed by a signal."
+            return BrokerNotice(title: "\(who) → \(broker) failed", body: body, thread: thread)
         }
     }
 

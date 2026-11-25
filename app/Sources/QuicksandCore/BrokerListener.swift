@@ -4,9 +4,11 @@ import Foundation
 /// One request the app handled: who called which broker, and how it ended.
 public struct BrokerConnection: Identifiable, Sendable, Equatable {
     public enum Outcome: Sendable, Equatable {
-        case running(pid: pid_t)
-        /// The broker exited; `status` is the raw wait status.
-        case finished(pid: pid_t, status: Int32)
+        /// `pid` is the broker process, nil for a broker inside the app.
+        case running(pid: pid_t?)
+        /// The broker exited; `status` is the raw wait status (an in-app
+        /// broker reports one the same way).
+        case finished(pid: pid_t?, status: Int32)
         /// Turned away before any broker ran.
         case rejected(String)
     }
@@ -22,10 +24,10 @@ public struct BrokerConnection: Identifiable, Sendable, Equatable {
 }
 
 /// Owns one shared broker socket. For each connection it asks the kernel
-/// who is calling, maps that to a sandbox, loads that sandbox's spec for
-/// this broker, and hands the connection to a freshly spawned bash broker.
-/// It never reads what the client sends: all request policy stays in the
-/// brokers.
+/// who is calling and maps that to a sandbox. Then either an in-app broker
+/// (`InProcessBroker`) serves it on its own thread, or the listener loads
+/// that sandbox's spec and hands the connection to a freshly spawned bash
+/// broker. The listener itself never reads what the client sends.
 public final class BrokerListener: @unchecked Sendable {
     public let kind: BrokerKind
     public let socketPath: String
@@ -34,6 +36,8 @@ public final class BrokerListener: @unchecked Sendable {
     private let ownerUID: uid_t
     private let maxPerSandbox: Int
     private let onUpdate: @Sendable (BrokerConnection) -> Void
+    /// Serves this socket inside the app; nil: spawn the sandbox's spec.
+    private let inProcess: InProcessBroker?
 
     private let queue: DispatchQueue
     private var listenFD: Int32 = -1
@@ -44,6 +48,7 @@ public final class BrokerListener: @unchecked Sendable {
 
     public init(kind: BrokerKind, paths: QuicksandPaths, users: UserDirectory = SystemUserDirectory(),
                 ownerUID: uid_t = getuid(), maxPerSandbox: Int = 16,
+                inProcess: InProcessBroker? = nil,
                 onUpdate: @escaping @Sendable (BrokerConnection) -> Void) {
         self.kind = kind
         self.socketPath = paths.socket(kind).path
@@ -52,6 +57,7 @@ public final class BrokerListener: @unchecked Sendable {
         self.ownerUID = ownerUID
         self.maxPerSandbox = maxPerSandbox
         self.onUpdate = onUpdate
+        self.inProcess = inProcess
         self.queue = DispatchQueue(label: "quicksand.listener.\(kind.rawValue)")
     }
 
@@ -148,6 +154,12 @@ public final class BrokerListener: @unchecked Sendable {
             return reject("too many concurrent \(kind.rawValue) requests from this sandbox — try again shortly")
         }
 
+        if let broker = inProcess {
+            if let why = broker.refusal(for: name) { return reject(why) }
+            serveInProcess(broker, client: client, sandbox: name, conn: conn)
+            return
+        }
+
         let spec: BrokerSpec
         switch BrokerSpec.load(kind, sandbox: name, paths: paths, ownerUID: ownerUID) {
         case .success(let s):
@@ -183,6 +195,29 @@ public final class BrokerListener: @unchecked Sendable {
             }
         }
         thread.name = "quicksand.broker.\(pid)"
+        thread.start()
+    }
+
+    /// Run `broker` on a thread of its own; it owns the connection.
+    private func serveInProcess(_ broker: InProcessBroker, client fd: Int32, sandbox name: String,
+                                conn start: BrokerConnection) {
+        var conn = start
+        running[name, default: 0] += 1
+        conn.outcome = .running(pid: nil)
+        onUpdate(conn)
+        let client = BrokerClient(fd: fd)
+        let thread = Thread { [weak self] in
+            let status = broker.serve(client, sandbox: name)
+            client.close()
+            guard let self else { return }
+            self.queue.async {
+                self.running[name, default: 1] -= 1
+                conn.outcome = .finished(pid: nil, status: status)
+                conn.ended = Date()
+                self.onUpdate(conn)
+            }
+        }
+        thread.name = "quicksand.\(kind.rawValue).\(name)"
         thread.start()
     }
 }

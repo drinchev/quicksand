@@ -57,7 +57,7 @@ echo "$(date '+%F %T') connection" >&2
 BROKER_KIND=docker
 EVENTS_LOG="${QS_EVENTS_LOG:-$HOME/.config/quicksand/events.jsonl}"
 
-# --- event log: keep this block identical in all three brokers -------------
+# --- event log: keep this block identical in both bash brokers -------------
 # One JSON line per finished request, appended to $EVENTS_LOG for
 # Quicksand.app (see docs/quicksand-app.md). qs-event (app/Sources/qs-event)
 # writes it: it cleans what the sandbox sent, rotates the log and locks it

@@ -7,7 +7,7 @@ import Foundation
 ///
 /// The client is untrusted: it sends one line of text. Control characters
 /// are dropped, the length is capped, and what remains is spoken by the
-/// app's `Speaker` (macOS's speech synthesizer) as plain text. The worst a
+/// app's `Speaker` (`say`, on stdin) as plain text. The worst a
 /// hostile sandbox can do is make the Mac say something.
 public final class SayBroker: InProcessBroker, @unchecked Sendable {
     public static let maxRequestBytes = 4096
@@ -21,7 +21,7 @@ public final class SayBroker: InProcessBroker, @unchecked Sendable {
     private let speaker: Speaker
     private let ownerUID: uid_t
 
-    public init(paths: QuicksandPaths, speaker: Speaker = SystemSpeaker.shared, ownerUID: uid_t = getuid()) {
+    public init(paths: QuicksandPaths, speaker: Speaker = SayCommandSpeaker.shared, ownerUID: uid_t = getuid()) {
         self.paths = paths
         self.speaker = speaker
         self.ownerUID = ownerUID

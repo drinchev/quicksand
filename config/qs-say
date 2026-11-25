@@ -9,11 +9,10 @@
 # engine that is out of reach, so `say` exits 0 having synthesized nothing.
 #
 # So the text goes to Quicksand.app through its socket in
-# /Users/Shared/quicksand/, and the app speaks it with macOS's speech
-# synthesizer as the host user, inside their GUI session
-# (app/Sources/QuicksandCore/SayBroker.swift). It treats the text as
-# untrusted: it strips control characters, caps the length and speaks it as
-# plain text.
+# /Users/Shared/quicksand/, and the app runs `say` as the host user, inside
+# their GUI session (app/Sources/QuicksandCore/SayBroker.swift). It treats
+# the text as untrusted: it strips control characters, caps the length and
+# feeds it to `say` on stdin, never as an argument.
 #
 # Staged into _quicksand/bin/ by the build and installed onto the sandbox
 # PATH by profile.d/31-claude-say.sh, which also hooks Claude Code up to it.

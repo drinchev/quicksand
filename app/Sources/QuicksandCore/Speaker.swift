@@ -1,66 +1,59 @@
-import AVFoundation
+import Darwin
 import Foundation
 
 /// Something that speaks text aloud on the host.
 public protocol Speaker: Sendable {
     /// Speak `text` and return once it was spoken (true) or couldn't be
-    /// (false: cancelled, or no answer within `timeout`). Called from many
-    /// threads at once; messages are spoken one after another.
+    /// (false: failed, or not done within `timeout`, which includes waiting
+    /// for messages queued before it). Called from many threads at once;
+    /// messages are spoken one after another.
     func speak(_ text: String, timeout: TimeInterval) -> Bool
 }
 
-/// macOS's speech synthesizer, in the app's own process: no `say` process
-/// per message. One synthesizer for the whole app, so messages from all
-/// sandboxes queue in it instead of talking over each other.
+/// Speaks with `/usr/bin/say`, the one way to get the voice chosen in System
+/// Settings → Accessibility → Spoken Content, Siri voices included:
+/// AVSpeechSynthesizer can't use Siri voices from an app. The text goes to
+/// `say` on stdin, never as an argument.
 ///
-/// Speech only works in a GUI login session, which the app always runs in
-/// (and the sandbox users never do; see config/qs-say).
-public final class SystemSpeaker: NSObject, Speaker, AVSpeechSynthesizerDelegate, @unchecked Sendable {
-    public static let shared = SystemSpeaker()
+/// One message at a time across the whole app, so sandboxes queue instead of
+/// talking over each other. Speech only works in a GUI login session, which
+/// the app always runs in (and the sandbox users never do; see
+/// config/qs-say).
+public final class SayCommandSpeaker: Speaker, @unchecked Sendable {
+    public static let shared = SayCommandSpeaker()
 
-    private let synthesizer = AVSpeechSynthesizer()
-    private let lock = NSLock()
-    /// Utterances waiting to finish, with what their caller waits on.
-    private var pending: [ObjectIdentifier: Waiter] = [:]
+    private let command: String
+    private let turn = DispatchSemaphore(value: 1)
 
-    private final class Waiter {
-        let done = DispatchSemaphore(value: 0)
-        var spoke = false
-    }
-
-    override init() {
-        super.init()
-        synthesizer.delegate = self
+    public init(command: String = "/usr/bin/say") {
+        self.command = command
     }
 
     public func speak(_ text: String, timeout: TimeInterval) -> Bool {
-        let utterance = AVSpeechUtterance(string: text)
-        let waiter = Waiter()
-        let key = ObjectIdentifier(utterance)
-        lock.withLock { pending[key] = waiter }
-        // The synthesizer is driven from the main thread; it queues
-        // utterances and speaks them in order.
-        DispatchQueue.main.async { self.synthesizer.speak(utterance) }
-        let finished = waiter.done.wait(timeout: .now() + timeout) == .success
-        return lock.withLock {
-            pending[key] = nil
-            return finished && waiter.spoke
+        let deadline = DispatchTime.now() + timeout
+        guard turn.wait(timeout: deadline) == .success else { return false }
+        defer { turn.signal() }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: command)
+        let input = Pipe()
+        process.standardInput = input
+        process.standardOutput = FileHandle.nullDevice
+        process.standardError = FileHandle.nullDevice
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
+        do { try process.run() } catch { return false }
+        // A `say` that exits without reading must cost an EPIPE, not a
+        // SIGPIPE that takes the whole app down.
+        _ = fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1)
+        try? input.fileHandleForWriting.write(contentsOf: Data((text + "\n").utf8))
+        try? input.fileHandleForWriting.close()
+
+        if exited.wait(timeout: deadline) == .timedOut {
+            process.terminate()
+            exited.wait()
+            return false
         }
-    }
-
-    public func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        resolve(utterance, spoke: true)
-    }
-
-    public func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        resolve(utterance, spoke: false)
-    }
-
-    private func resolve(_ utterance: AVSpeechUtterance, spoke: Bool) {
-        lock.withLock {
-            guard let waiter = pending[ObjectIdentifier(utterance)] else { return }
-            waiter.spoke = spoke
-            waiter.done.signal()
-        }
+        return process.terminationReason == .exit && process.terminationStatus == 0
     }
 }

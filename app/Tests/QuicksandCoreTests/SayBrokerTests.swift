@@ -135,3 +135,66 @@ final class FakeSpeaker: Speaker, @unchecked Sendable {
         #expect(Date().timeIntervalSince(start) < 2)
     }
 }
+
+/// The real speaker, with a stub in place of /usr/bin/say.
+@Suite struct SayCommandSpeakerTests {
+    /// A stub `say` that logs its argument count, its stdin and when it
+    /// started and ended, then exits with `status` after `seconds`.
+    func stub(exit status: Int = 0, sleep seconds: Double = 0) throws -> (say: String, log: URL) {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("qs-say-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let log = dir.appendingPathComponent("log")
+        let say = dir.appendingPathComponent("say")
+        try """
+        #!/bin/bash
+        echo "start ARGS:$#" >> '\(log.path)'
+        echo "text:$(cat)" >> '\(log.path)'
+        sleep \(seconds)
+        echo end >> '\(log.path)'
+        exit \(status)
+        """.write(to: say, atomically: true, encoding: .utf8)
+        chmod(say.path, 0o755)
+        return (say.path, log)
+    }
+
+    func lines(_ log: URL) -> [String] {
+        ((try? String(contentsOf: log, encoding: .utf8)) ?? "").split(separator: "\n").map(String.init)
+    }
+
+    @Test func givesSayTheTextOnStdinAndNoArguments() throws {
+        let s = try stub()
+        #expect(SayCommandSpeaker(command: s.say).speak("-v Zarvox hi", timeout: 10))
+        #expect(lines(s.log) == ["start ARGS:0", "text:-v Zarvox hi", "end"])
+    }
+
+    @Test func aFailingSayIsNotSpoken() throws {
+        let s = try stub(exit: 3)
+        #expect(!SayCommandSpeaker(command: s.say).speak("hi", timeout: 10))
+    }
+
+    @Test func stopsASayThatRunsPastTheTimeout() throws {
+        let s = try stub(sleep: 30)
+        let start = Date()
+        #expect(!SayCommandSpeaker(command: s.say).speak("hi", timeout: 0.5))
+        #expect(Date().timeIntervalSince(start) < 5)
+        #expect(!lines(s.log).contains("end"))
+    }
+
+    @Test func speaksOneMessageAtATime() throws {
+        let s = try stub(sleep: 0.3)
+        let speaker = SayCommandSpeaker(command: s.say)
+        let group = DispatchGroup()
+        for text in ["one", "two", "three"] {
+            DispatchQueue.global().async(group: group) { _ = speaker.speak(text, timeout: 10) }
+        }
+        group.wait()
+        let log = lines(s.log)
+        #expect(log.count == 9)
+        // Never two "start"s without an "end" between them.
+        var open = 0
+        for line in log {
+            if line.hasPrefix("start") { open += 1 } else if line == "end" { open -= 1 }
+            #expect(open <= 1)
+        }
+    }
+}

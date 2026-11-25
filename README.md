@@ -567,9 +567,10 @@ So quicksand speaks from the host. [Quicksand.app](#quicksandapp), running in
 *your* GUI session, the one place speech works, listens on
 `/Users/Shared/quicksand/say.sock` and speaks for every built sandbox itself:
 it reads one line, hangs up, drops control characters, caps the text at 300
-bytes and speaks it with macOS's speech synthesizer (`AVSpeechSynthesizer`,
-in the app's own process — no `say` per message). Messages from all
-sandboxes queue in it, so they never talk over each other. Inside the
+bytes and pipes it to `say` on stdin, so it uses the voice you chose under
+System Settings → Accessibility → Spoken Content, Siri voices included
+(`AVSpeechSynthesizer` can't use Siri voices from an app). Messages from all
+sandboxes queue, so they never talk over each other. Inside the
 sandbox, `profile.d/31-claude-say.sh` installs the `qs-say` client on the
 PATH and, once per sandbox, seeds two Claude Code `Notification` hooks into
 the sandbox's `~/.claude/settings.json`:
@@ -591,8 +592,8 @@ qs-say "build finished"        # from a sandbox shell, or from Claude
 ```
 
 The app treats the sandbox as untrusted: the text is stripped of control
-characters, capped at 300 bytes and spoken as plain text — never parsed by
-a shell, never run as a command, so a hostile sandbox can pick no voice,
+characters, capped at 300 bytes and piped to `say` on stdin — never parsed
+by a shell, never passed as an argument, so a hostile sandbox can pick no voice,
 write no file, and at worst make your Mac say something. Messages queue
 rather than talk over each other, and the app hangs up before speaking so
 hooks never wait for the speech.

@@ -10,12 +10,11 @@
 #
 #   qs-auth-refresh
 #
-# It sends the single word "refresh" to a host-side broker
-# (config/qs-auth-broker) through Quicksand.app's socket in
-# /Users/Shared/quicksand/. The broker runs
-# the same providers a launch runs, as the host user, and reports anything
-# that needs you — e.g. 1Password being locked on the host. Nothing else can
-# be asked of it.
+# It sends the single word "refresh" to Quicksand.app through its socket in
+# /Users/Shared/quicksand/. The app runs the same providers a launch runs,
+# as the host user (app/Sources/QuicksandCore/AuthBroker.swift), and reports
+# anything that needs you — e.g. 1Password being locked on the host. Nothing
+# else can be asked of it.
 #
 # gcloud picks a new GCP token up at once (it reads the staged file on every
 # call). OP_SERVICE_ACCOUNT_TOKEN is an environment variable, so shells that
@@ -57,6 +56,6 @@ done
 exec {fd}>&-
 
 if ! $completed; then
-    print -u2 -r -- "qs-auth-refresh: the host did not finish refreshing credentials — see ~/.config/quicksand/auth-broker-${QS_SANDBOX_NAME:-NAME}.log on the host."
+    print -u2 -r -- "qs-auth-refresh: the host did not finish refreshing credentials — see Quicksand.app's Activity window on the host."
     exit 1
 fi

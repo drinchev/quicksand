@@ -144,7 +144,8 @@ op_auto_inject() {
     # op learns that the desktop-app integration is on from a settings file in
     # 1Password's Group Container. macOS 27 blocks that read for processes
     # whose responsible app lacks the "data from other apps" permission — a
-    # terminal usually has it, the credential broker's LaunchAgent does not —
+    # terminal usually has it, Quicksand.app (which runs this for
+    # qs-auth-refresh) may not —
     # and op then reports "No accounts configured". Stating it through the
     # environment skips the file; op still has to be authorized by the app.
     if [[ -z "$token" && -z "${OP_BIOMETRIC_UNLOCK_ENABLED:-}" ]]; then

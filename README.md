@@ -466,9 +466,8 @@ service-account token (staged per session, never stored). `qs shell` and
 that doesn't start from `qs` — an SSH login — never gets them, and a session
 that runs longer than an hour outlives its GCP token.
 
-A host-side broker closes both. Every build stages `config/qs-auth-broker`
-under `~/.config/quicksand/` and [Quicksand.app](#quicksandapp), running in
-your GUI session, starts it for each request on
+[Quicksand.app](#quicksandapp) closes both. Running in your GUI session, it
+answers credential refreshes for every built sandbox on
 `/Users/Shared/quicksand/auth.sock`. Inside the sandbox:
 
 ```bash
@@ -482,8 +481,8 @@ session has. In a long session, run it yourself when `gcloud` starts failing;
 environment variable, so shells already running keep the old value — new
 shells get the new one.
 
-The broker runs the same providers (`libexec/qs-auth-*`) with the same
-`refresh` a launch runs, as you:
+The app runs the same providers (`libexec/qs-auth-*`, the copy it ships) with
+the same `refresh` a launch runs, as you:
 
 - **The sandbox can ask for exactly one thing.** The request is the single
   word `refresh`; nothing the sandbox sends reaches a command line, and which
@@ -493,9 +492,10 @@ The broker runs the same providers (`libexec/qs-auth-*`) with the same
 - **It reports what needs you.** Provider messages ("unlock 1Password", a
   lapsed `gcloud` login) are relayed to the session's stderr. Each provider
   has 30 seconds; one that is waiting for an approval nobody gives is abandoned
-  with a note, and the session continues without that credential.
-- **A burst of logins is one refresh.** Requests are serialized, and one that
-  had to wait for another reuses its result. The GCP provider additionally
+  with a note — together with anything it started — and the session
+  continues without that credential.
+- **A burst of logins is one refresh.** One refresh runs per sandbox at a
+  time, and a request that arrives meanwhile reuses its result. The GCP provider additionally
   skips a token younger than 50 minutes.
 - **It needs your desktop session.** 1Password's app integration and your
   `gcloud` login live there; with nobody logged in to the Mac (or the app
@@ -511,12 +511,15 @@ read with `OP_BIOMETRIC_UNLOCK_ENABLED=true`, which states the same thing
 through the environment. If a read still fails, the warning carries `op`'s own
 error text.
 
-The app gives brokers a bare `PATH`, so the `PATH` of the shell that built the
-sandbox is pinned into the broker's spec — that is where `op` and `gcloud` are looked
-up. If you install either later, rebuild (`qs build NAME -r`). Other
-environment from your shell (a custom `CLOUDSDK_CONFIG`, an `op` session
-variable) is not carried over. Requests are logged to
-`~/.config/quicksand/auth-broker-NAME.log`.
+An app started from Finder or at login gets a bare `PATH`, so the app asks
+your login shell for its `PATH` once when it starts (interactively, so
+`~/.zshrc` additions count) — that is where `op` and `gcloud` are looked up.
+If you install either later, restart the app. Other environment from your
+shell (a custom `CLOUDSDK_CONFIG`, an `op` session variable) is not carried
+over. Requests show in the app's Activity window and the event log; provider
+messages also go to the unified log (Console.app, subsystem `com.quicksand`).
+The providers are the ones inside the app, so after editing
+`libexec/qs-auth-*` in a checkout, re-run `app/scripts/install.sh`.
 
 Because sessions now overlap in ways that matter — a local `qs claude` beside
 an SSH login, or the several short logins an SSH client makes — sessions
@@ -528,10 +531,10 @@ only when the last one exits.
 `app/` holds a status-bar app that runs the host-side brokers — Docker,
 credential refresh and speech — for every sandbox, like Docker Desktop runs
 its engine. It listens on three sockets in `/Users/Shared/quicksand/`, tells
-sandboxes apart by the uid of the connecting process, and serves speech
-itself; for Docker and credentials it starts the sandbox's bash broker for
+sandboxes apart by the uid of the connecting process, and serves speech and
+credential refresh itself; for Docker it starts the sandbox's bash broker for
 each request from the spec qs renders under `~/.config/quicksand/brokers/`
-(those move into the app next). It also shows every sandbox (active or idle,
+(that moves into the app next). It also shows every sandbox (active or idle,
 sessions, Docker, token ages) and every broker request from
 `~/.config/quicksand/events.jsonl`. It posts a notification whenever anyone
 connects to a broker (who, and which broker — not what was asked), or with "Notify: Problems" only for refused and failed requests.
@@ -637,7 +640,7 @@ Hooks are not part of the template — the merge is top-level only, and the
 
 The install marker stores a fingerprint of everything a build bakes into a
 sandbox: the qs version, the `sandbox-exec` profile template, `profile.d/`,
-`logout.d/`, the `quicksand.md` and `claude-settings.json` assets, the speech and credential broker assets, the SSH session wrapper and sshd templates, and your personal overlay — contents, names, and file modes. When any of it
+`logout.d/`, the `quicksand.md` and `claude-settings.json` assets, the speech and credential refresh clients, the Docker broker assets, the SSH session wrapper and sshd templates, and your personal overlay — contents, names, and file modes. When any of it
 changes (a `git pull` of this repo, an edit to your overlay), the next
 `qs shell`/`qs claude` rebuilds the sandbox automatically and tells you why.
 
@@ -721,7 +724,7 @@ existing sandboxes automatically on next entry.
 | sshd `Match` block (`qs ssh-auth`) | `/etc/ssh/sshd_config.d/010-quicksand-qs-NAME.conf` |
 | sshd default rule for all sandboxes | `/etc/ssh/sshd_config.d/020-quicksand-default.conf` |
 | Broker sockets (Quicksand.app, all sandboxes) | `/Users/Shared/quicksand/docker.sock`, `auth.sock`, `say.sock` |
-| Broker specs | `~/.config/quicksand/brokers/com.quicksand.{docker,auth}-broker.NAME.plist` (speech needs none: it runs inside the app) |
+| Broker specs | `~/.config/quicksand/brokers/com.quicksand.docker-broker.NAME.plist` (speech and credentials need none: they run inside the app) |
 | Install marker, clone & GCP manifests, staged brokers & their logs | `~/.config/quicksand/` |
 | Broker event log (one JSON line per request, all sandboxes; written by `qs-event` inside Quicksand.app) | `~/.config/quicksand/events.jsonl` |
 

@@ -1418,21 +1418,21 @@ broker() {
             QS_SAY_LEGACY_PLIST="$WORK/LaunchAgents/say.plist"
             QS_SAY_OLD_BROKER="$WORK/install/say-broker-work.sh"
             QS_AUTH_LABEL=com.quicksand.auth-broker.work
-            QS_AUTH_PLIST="$WORK/install/brokers/auth.plist"
+            QS_AUTH_OLD_SPEC="$WORK/install/brokers/auth.plist"
             QS_AUTH_LEGACY_PLIST="$WORK/LaunchAgents/auth.plist"
-            QS_AUTH_BROKER_STAGED="$WORK/install/auth-broker-work.sh"
+            QS_AUTH_OLD_BROKER="$WORK/install/auth-broker-work.sh"
             docker_broker_install /host/bin/docker /host/bin/jq
             say_client_install
-            auth_broker_install'
+            auth_client_install'
     [ "$status" -eq 0 ]
     for kind in docker say auth; do
         grep -q "launchctl bootout gui/$(id -u)/com.quicksand.$kind-broker.work" "$STUB_LOG"
         [ ! -e "$WORK/LaunchAgents/$kind.plist" ]
     done
     [ -f "$WORK/install/brokers/docker.plist" ]
-    [ -f "$WORK/install/brokers/auth.plist" ]
-    # Speech runs inside the app: no spec.
+    # Speech and credentials run inside the app: no spec.
     [ ! -e "$WORK/install/brokers/say.plist" ]
+    [ ! -e "$WORK/install/brokers/auth.plist" ]
     [ -z "$(ls -A "$WORK/LaunchAgents")" ]
     run find "$WORK/ws/_quicksand" -name '*.sock'
     [ -z "$output" ]
@@ -2449,119 +2449,34 @@ session_hook() {
 
 
 ###############################################################################
-# credential broker — config/qs-auth-broker run directly (stdin/stdout stand
-# in for the client socket) against a directory of stub providers
+# credential refresh — config/qs-auth-refresh and what builds stage for it.
+# The broker is in the app (AuthBroker, tested in Swift).
 ###############################################################################
 
-# auth_fixture — a libexec dir of stub providers under $WORK. Each test adds
-# the providers it needs with auth_provider NAME BODY.
-auth_fixture() {
-    export WORK="$BATS_TEST_TMPDIR/work"
-    mkdir -p "$WORK/libexec" "$WORK/priv" "$WORK/install"
-}
-
-auth_provider() {
-    printf '#!/bin/bash\n%s\n' "$2" > "$WORK/libexec/qs-auth-$1"
-    chmod +x "$WORK/libexec/qs-auth-$1"
-}
-
-# run_auth_broker REQUEST — one broker invocation, as launchd would spawn it.
-run_auth_broker() {
-    run env QS_AUTH_LIBEXEC="$WORK/libexec" QS_AUTH_PRIVATE_DIR="$WORK/priv" \
-            QS_AUTH_INSTALL_DIR="$WORK/install" QS_AUTH_LOG="$WORK/broker.log" \
-            QS_AUTH_LOCK="$WORK/lock" QS_AUTH_PROVIDER_TIMEOUT="${AUTH_TIMEOUT:-10}" \
-            bash -c 'printf "%s\n" "$1" | "$REPO_COPY/config/qs-auth-broker" work' _ "$1"
-}
-
-@test "auth broker runs every provider's refresh with the qs environment contract" {
-    auth_fixture
-    auth_provider one 'echo "$1 $QS_SANDBOX_NAME $QS_PRIVATE_DIR $QS_INSTALL_DIR" > "$QS_PRIVATE_DIR/one"'
-    auth_provider two 'echo "$1" > "$QS_PRIVATE_DIR/two"'
-    run_auth_broker refresh
-    [ "$status" -eq 0 ]
-    [ "$output" == "done" ]
-    [ "$(cat "$WORK/priv/one")" == "refresh work $WORK/priv $WORK/install" ]
-    [ "$(cat "$WORK/priv/two")" == "refresh" ]
-    [ ! -d "$WORK/lock" ]
-}
-
-@test "auth broker relays provider messages and still completes when one fails" {
-    auth_fixture
-    auth_provider aaa 'echo "WARNING: unlock 1Password" >&2; exit 3'
-    auth_provider bbb 'echo "Refreshing GCP access token..."'
-    run_auth_broker refresh
-    [ "$status" -eq 0 ]
-    [ "${lines[0]}" == "WARNING: unlock 1Password" ]
-    [ "${lines[1]}" == "Refreshing GCP access token..." ]
-    [ "${lines[2]}" == "done" ]
-    grep -q "aaa: refresh exit 3" "$WORK/broker.log"
-}
-
-@test "auth broker accepts no request but 'refresh'" {
-    auth_fixture
-    auth_provider one 'touch "$QS_PRIVATE_DIR/ran"'
-    run_auth_broker 'refresh; rm -rf /'
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"unknown request"* ]]
-    [[ "$output" != *"done"* ]]
-    [ ! -e "$WORK/priv/ran" ]
-    run_auth_broker 'provision'
-    [[ "$output" != *"done"* ]]
-    [ ! -e "$WORK/priv/ran" ]
-}
-
-@test "auth broker gives up on a provider that blocks, and says so" {
-    auth_fixture
-    auth_provider slow 'sleep 30'
-    auth_provider next 'touch "$QS_PRIVATE_DIR/next-ran"'
-    AUTH_TIMEOUT=1 run_auth_broker refresh
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"slow credential refresh gave up after 1s"* ]]
-    [ "${lines[${#lines[@]}-1]}" == "done" ]
-    [ -e "$WORK/priv/next-ran" ]
-    ! pgrep -f "$WORK/libexec/qs-auth-slow"
-}
-
-@test "auth broker reuses a refresh that was already in flight" {
-    auth_fixture
-    auth_provider one 'touch "$QS_PRIVATE_DIR/ran"'
-    mkdir "$WORK/lock"
-    ( sleep 1; rmdir "$WORK/lock" ) &
-    run_auth_broker refresh
-    wait
-    [ "$status" -eq 0 ]
-    [ "$output" == "done" ]
-    [ ! -e "$WORK/priv/ran" ]
-    grep -q "shared with a concurrent request" "$WORK/broker.log"
-}
-
-@test "auth broker reports a missing provider directory instead of claiming success" {
-    auth_fixture
-    rmdir "$WORK/libexec"
-    run_auth_broker refresh
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"auth providers were not found on the host"* ]]
-    [[ "$output" != *"done"* ]]
-}
-
-@test "qs-auth-refresh talks to the broker over the socket and reports its messages" {
-    auth_fixture
-    auth_provider one 'echo "WARNING: unlock 1Password"; touch "$QS_PRIVATE_DIR/ran"'
+@test "qs-auth-refresh relays the host's messages and succeeds on done" {
     # Unix socket paths are capped at ~104 bytes; bats' temp paths are longer.
     SOCK_DIR="$(mktemp -d /tmp/qs-auth.XXXXXX)"
-    mkfifo "$SOCK_DIR/back"
-    ( nc -lU "$SOCK_DIR/s" < "$SOCK_DIR/back" \
-        | env QS_AUTH_LIBEXEC="$WORK/libexec" QS_AUTH_PRIVATE_DIR="$WORK/priv" \
-              QS_AUTH_INSTALL_DIR="$WORK/install" QS_AUTH_LOG="$WORK/broker.log" \
-              QS_AUTH_LOCK="$WORK/lock" "$REPO_COPY/config/qs-auth-broker" work \
-        > "$SOCK_DIR/back" ) &
+    # A stand-in for the app: answers one message, then done.
+    ( printf 'WARNING: unlock 1Password\ndone\n' | nc -lU "$SOCK_DIR/s" > "$SOCK_DIR/request" ) &
     for _ in $(seq 1 50); do [ -S "$SOCK_DIR/s" ] && break; sleep 0.1; done
     QS_AUTH_SOCK="$SOCK_DIR/s" QS_AUTH_REFRESH_TIMEOUT=10 run "$REPO_COPY/config/qs-auth-refresh"
     wait
+    local request; request="$(cat "$SOCK_DIR/request")"
     rm -rf "$SOCK_DIR"
     [ "$status" -eq 0 ]
     [ "$output" == "quicksand: WARNING: unlock 1Password" ]
-    [ -e "$WORK/priv/ran" ]
+    [ "$request" == "refresh" ]
+}
+
+@test "qs-auth-refresh fails when the host never says done" {
+    SOCK_DIR="$(mktemp -d /tmp/qs-auth.XXXXXX)"
+    ( printf 'qs-auth-broker: something went wrong\n' | nc -lU "$SOCK_DIR/s" > /dev/null ) &
+    for _ in $(seq 1 50); do [ -S "$SOCK_DIR/s" ] && break; sleep 0.1; done
+    QS_AUTH_SOCK="$SOCK_DIR/s" QS_AUTH_REFRESH_TIMEOUT=3 run "$REPO_COPY/config/qs-auth-refresh"
+    wait
+    rm -rf "$SOCK_DIR"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"did not finish refreshing credentials"*"Activity window"* ]]
 }
 
 @test "qs-auth-refresh fails clearly when there is no broker socket" {
@@ -2570,38 +2485,36 @@ run_auth_broker() {
     [[ "$output" == *"Quicksand.app isn't running on the host"* ]]
 }
 
-@test "auth_broker_install stages and renders the app's spec" {
+@test "auth_client_install stages the client and removes the old bash broker" {
     make_stub launchctl 'echo "launchctl $*" >> "$STUB_LOG"'
     export WORK="$BATS_TEST_TMPDIR/work"
-    mkdir -p "$WORK"
-    qs_run 'PATH="$STUBS:/opt/a&b/bin:/usr/bin:/bin"; SANDBOX_NAME=work
+    mkdir -p "$WORK/install/brokers" "$WORK/LaunchAgents" "$WORK/ws/_quicksand"
+    touch "$WORK/install/brokers/spec.plist" "$WORK/install/auth-broker-work.sh" \
+          "$WORK/install/auth-broker-work.log" "$WORK/LaunchAgents/agent.plist" \
+          "$WORK/ws/_quicksand/auth.sock"
+    qs_run 'PATH="$STUBS:$PATH"; SANDBOX_NAME=work
             SHARED_WORKSPACE="$WORK/ws"; QS_PRIVATE_DIR="$WORK/ws/_quicksand"
             INSTALL_DIR="$WORK/install"
             QS_AUTH_LABEL=com.quicksand.auth-broker.work
-            QS_AUTH_PLIST="$WORK/agent.plist"
+            QS_AUTH_OLD_SPEC="$WORK/install/brokers/spec.plist"
             QS_AUTH_LEGACY_PLIST="$WORK/LaunchAgents/agent.plist"
-            QS_AUTH_BROKER_STAGED="$WORK/install/auth-broker-work.sh"
+            QS_AUTH_OLD_BROKER="$WORK/install/auth-broker-work.sh"
             HOME="$WORK"
-            auth_broker_install'
+            auth_client_install'
     [ "$status" -eq 0 ]
-    cmp "$REPO_COPY/config/qs-auth-broker" "$WORK/install/auth-broker-work.sh"
+    cmp "$REPO_COPY/config/qs-auth-refresh" "$WORK/ws/_quicksand/bin/qs-auth-refresh"
     [ -x "$WORK/ws/_quicksand/bin/qs-auth-refresh" ]
-    grep -q "<string>com.quicksand.auth-broker.work</string>" "$WORK/agent.plist"
-    grep -q "<string>$WORK/install/auth-broker-work.sh</string>" "$WORK/agent.plist"
-    # qs resolves its own location through symlinks (pwd -P).
-    grep -q "<string>$(cd "$REPO_COPY" && pwd -P)/libexec</string>" "$WORK/agent.plist"
-    grep -q "<string>$WORK/ws/_quicksand</string>" "$WORK/agent.plist"
-    # The build shell's PATH is pinned, XML-escaped.
-    grep -qF "<string>$STUBS:/opt/a&amp;b/bin:/usr/bin:/bin</string>" "$WORK/agent.plist"
-    ! grep -qE '@[A-Z_]+@' "$WORK/agent.plist"
-    plutil -lint "$WORK/agent.plist"
-    run grep -E "Sockets|inetd" "$WORK/agent.plist"
-    [ "$status" -ne 0 ]
-    run grep -q launchctl "$STUB_LOG"
+    [ ! -e "$WORK/install/brokers/spec.plist" ]
+    [ ! -e "$WORK/install/auth-broker-work.sh" ]
+    [ ! -e "$WORK/install/auth-broker-work.log" ]
+    [ ! -e "$WORK/LaunchAgents/agent.plist" ]
+    [ ! -e "$WORK/ws/_quicksand/auth.sock" ]
+    grep -q "launchctl bootout gui/$(id -u)/com.quicksand.auth-broker.work" "$STUB_LOG"
+    run grep -q "launchctl bootstrap" "$STUB_LOG"
     [ "$status" -ne 0 ]
 }
 
-@test "cleanup_auth_broker removes the spec, any old agent, and everything it staged" {
+@test "cleanup_auth_broker removes the client and anything the old broker left" {
     make_stub launchctl 'echo "launchctl $*" >> "$STUB_LOG"'
     export WORK="$BATS_TEST_TMPDIR/work"
     mkdir -p "$WORK/install" "$WORK/ws/_quicksand/bin"
@@ -2611,9 +2524,9 @@ run_auth_broker() {
             QS_PRIVATE_DIR="$WORK/ws/_quicksand"
             INSTALL_DIR="$WORK/install"
             QS_AUTH_LABEL=com.quicksand.auth-broker.work
-            QS_AUTH_PLIST="$WORK/spec.plist"
+            QS_AUTH_OLD_SPEC="$WORK/spec.plist"
             QS_AUTH_LEGACY_PLIST="$WORK/agent.plist"
-            QS_AUTH_BROKER_STAGED="$WORK/install/auth-broker-work.sh"
+            QS_AUTH_OLD_BROKER="$WORK/install/auth-broker-work.sh"
             cleanup_auth_broker'
     [ "$status" -eq 0 ]
     grep -q "launchctl bootout gui/$(id -u)/com.quicksand.auth-broker.work" "$STUB_LOG"
@@ -2624,10 +2537,10 @@ run_auth_broker() {
     [ ! -f "$WORK/ws/_quicksand/bin/qs-auth-refresh" ]
 }
 
-@test "config_fingerprint changes when the credential broker changes" {
+@test "config_fingerprint changes when the credential refresh client changes" {
     qs_run 'QS_CUSTOM_DIR=/nonexistent; config_fingerprint'
     before="$output"
-    echo "# changed" >> "$REPO_COPY/config/qs-auth-broker"
+    echo "# changed" >> "$REPO_COPY/config/qs-auth-refresh"
     qs_run 'QS_CUSTOM_DIR=/nonexistent; config_fingerprint'
     [ "$before" != "$output" ]
 }
@@ -2844,17 +2757,6 @@ need_qs_swift() {
     [ ! -e "$BATS_TEST_TMPDIR/e.jsonl" ]
 }
 
-@test "event log block is identical in both bash brokers" {
-    local b first=""
-    for b in docker auth; do
-        sed -n '/^# --- event log:/,/^# --- end event log/p' \
-            "$REPO_COPY/config/qs-$b-broker" > "$BATS_TEST_TMPDIR/block-$b"
-        [ -s "$BATS_TEST_TMPDIR/block-$b" ]
-        [ -z "$first" ] && first="$BATS_TEST_TMPDIR/block-$b"
-        cmp "$first" "$BATS_TEST_TMPDIR/block-$b"
-    done
-}
-
 @test "docker broker logs a finished run without its cmd or env" {
     need_qs_event
     broker '{"v":1,"verb":"run","image":"node:20","cmd":["node","-e","secret-arg"],"env":{"FOO":"bar baz"}}'
@@ -2918,43 +2820,6 @@ need_qs_swift() {
     [ "$(cat "$BATS_TEST_TMPDIR/.config/quicksand/events.jsonl.1")" == "old" ]
     [ "$(wc -l < "$BATS_TEST_TMPDIR/.config/quicksand/events.jsonl")" -eq 1 ]
     [ "$(last_event verb)" == "ps" ]
-}
-
-@test "auth broker logs each provider's outcome" {
-    need_qs_event
-    command -v jq >/dev/null 2>&1 || skip "jq not available"
-    auth_fixture
-    auth_provider one 'exit 0'
-    auth_provider two 'exit 3'
-    run_auth_broker refresh
-    [ "$(last_event broker "$WORK/install/events.jsonl")" == "auth" ]
-    [ "$(last_event verb "$WORK/install/events.jsonl")" == "refresh" ]
-    [ "$(last_event result "$WORK/install/events.jsonl")" == "error" ]
-    [ "$(last_event providers "$WORK/install/events.jsonl")" == "one=ok,two=exit 3" ]
-}
-
-@test "auth broker logs a clean refresh as ok" {
-    need_qs_event
-    command -v jq >/dev/null 2>&1 || skip "jq not available"
-    auth_fixture
-    auth_provider one 'exit 0'
-    run_auth_broker refresh
-    [ "$(last_event result "$WORK/install/events.jsonl")" == "ok" ]
-}
-
-@test "auth broker logs rejected and shared requests" {
-    need_qs_event
-    command -v jq >/dev/null 2>&1 || skip "jq not available"
-    auth_fixture
-    auth_provider one 'exit 0'
-    run_auth_broker 'provision'
-    [ "$(last_event result "$WORK/install/events.jsonl")" == "rejected" ]
-    [ "$(last_event verb "$WORK/install/events.jsonl")" == "provision" ]
-    mkdir "$WORK/lock"
-    ( sleep 1; rmdir "$WORK/lock" ) &
-    run_auth_broker refresh
-    wait
-    [ "$(last_event result "$WORK/install/events.jsonl")" == "shared" ]
 }
 
 @test "qs-docker says so when nothing answers on the socket" {

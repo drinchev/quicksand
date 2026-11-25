@@ -3,8 +3,8 @@
 #
 #   1. Install the qs-auth-refresh client onto the sandbox PATH
 #      (~/.local/bin). The build stages it into _quicksand/bin/ from
-#      config/qs-auth-refresh and loads the host-side broker it talks to
-#      (config/qs-auth-broker). Anyone in the sandbox can run it when a
+#      config/qs-auth-refresh; Quicksand.app answers it on the host
+#      (app/Sources/QuicksandCore/AuthBroker.swift). Anyone in the sandbox can run it when a
 #      credential has gone stale — a GCP token lasts about an hour.
 #   2. For an SSH session, run it now. `qs shell` / `qs claude` refresh
 #      credentials on the host before entering, so local sessions skip

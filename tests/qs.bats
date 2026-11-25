@@ -3017,3 +3017,76 @@ need_qs_swift() {
     [ "$status" -eq 125 ]
     [[ "$output" == *"no answer from Quicksand.app"* ]]
 }
+
+###############################################################################
+# app/scripts/install.sh
+###############################################################################
+# A checkout with a fake built app whose qs prints a version, so the
+# installer runs without swift, sudo or a GUI.
+fake_app_checkout() {
+    FAKE="$BATS_TEST_TMPDIR/checkout"
+    mkdir -p "$FAKE/app/scripts" "$FAKE/app/build/Quicksand.app/Contents/MacOS"
+    cp "$BATS_TEST_DIRNAME/../app/scripts/install.sh" "$FAKE/app/scripts/install.sh"
+    printf '#!/bin/bash\necho "qs version test"\n' > "$FAKE/app/build/Quicksand.app/Contents/MacOS/qs"
+    chmod +x "$FAKE/app/build/Quicksand.app/Contents/MacOS/qs"
+    APPS="$BATS_TEST_TMPDIR/Applications"
+    LINK="$BATS_TEST_TMPDIR/bin/qs"
+}
+
+install_app() {
+    HOME="$BATS_TEST_TMPDIR" run "$FAKE/app/scripts/install.sh" \
+        --no-build --no-open --dest "$APPS" --link "$LINK" "$@"
+}
+
+@test "install.sh installs the app and links qs into it" {
+    fake_app_checkout
+    install_app
+    [ "$status" -eq 0 ]
+    [ -x "$APPS/Quicksand.app/Contents/MacOS/qs" ]
+    [ "$(readlink "$LINK")" = "$APPS/Quicksand.app/Contents/MacOS/qs" ]
+    [[ "$output" == *"Done: qs version test"* ]]
+    # Again: nothing to relink.
+    install_app
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"already points at"* ]]
+}
+
+@test "install.sh replaces a link to another qs but nothing else" {
+    fake_app_checkout
+    mkdir -p "$(dirname "$LINK")"
+    ln -s /Old/Quicksand.app/Contents/MacOS/qs "$LINK"
+    install_app
+    [ "$status" -eq 0 ]
+    [ "$(readlink "$LINK")" = "$APPS/Quicksand.app/Contents/MacOS/qs" ]
+
+    rm "$LINK"; ln -s /opt/homebrew/bin/something "$LINK"
+    install_app
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"not to a qs"* ]]
+    [ "$(readlink "$LINK")" = /opt/homebrew/bin/something ]
+
+    rm "$LINK"; echo mine > "$LINK"
+    install_app
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"isn't a link"* ]]
+    [ "$(cat "$LINK")" = mine ]
+}
+
+@test "install.sh warns about an alias that would hide the link" {
+    fake_app_checkout
+    echo "alias qs=/path/to/quicksand/qs" > "$BATS_TEST_TMPDIR/.zshrc"
+    install_app
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"alias qs="*"unalias qs"* ]]
+}
+
+@test "install.sh refuses to run inside a sandbox and without a built app" {
+    fake_app_checkout
+    QS_SESSION_ID=x install_app
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"on the host"* ]]
+    rm -rf "$FAKE/app/build"
+    install_app
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"build it first"* ]]
+}

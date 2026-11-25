@@ -206,7 +206,7 @@ The per-sandbox free-text logs (`*-broker-NAME.log`) stay as they are.
 ```bash
 swift test --package-path app                      # incl. the real docker broker end to end
 app/scripts/bundle.sh                               # → app/build/Quicksand.app (ad-hoc signed)
-cp -R app/build/Quicksand.app ~/Applications/ && open ~/Applications/Quicksand.app
+app/scripts/install.sh                              # build + install to ~/Applications + link qs + open
 ```
 
 Inside a quicksand sandbox, add `--disable-sandbox` to `swift build`/`swift
@@ -231,9 +231,10 @@ are the script's; arguments pass through as raw bytes). It looks for
 3. the nearest directory above the executable holding `qs.bash` and
    `profile.d/` — a checkout, for `app/.build/debug/qs`.
 
-The menu's "Install qs command" links `/usr/local/bin/qs` to the app's qs
-through an admin prompt; it replaces only a missing link or one into another
-Quicksand.app, never anything else.
+`app/scripts/install.sh` builds the app, installs it to `~/Applications` and
+links `/usr/local/bin/qs` to its qs (`--dev`: to the debug build). The menu's
+"Install qs command" makes the same link through an admin prompt. Both
+replace only a missing link or one to another qs, never anything else.
 
 Next: Swift parses arguments and owns `--help`, `--version` and `list`, then
 takes over commands one by one (`docker`, the credential commands, `clone`/

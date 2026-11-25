@@ -62,13 +62,16 @@ runs, so the app is the whole install:
 
 ```bash
 git clone https://github.com/drinchev/quicksand && cd quicksand
-app/scripts/bundle.sh && cp -R app/build/Quicksand.app ~/Applications/
-open ~/Applications/Quicksand.app    # then "Install qs command" in its menu
+app/scripts/install.sh
 ```
 
-"Install qs command" links `/usr/local/bin/qs` to
-`Quicksand.app/Contents/MacOS/qs` (macOS asks for an admin password). To do it
-by hand: `sudo ln -sfn ~/Applications/Quicksand.app/Contents/MacOS/qs /usr/local/bin/qs`.
+`install.sh` builds the app, installs it to `~/Applications` (quitting and
+reopening a running copy), links `/usr/local/bin/qs` to
+`Quicksand.app/Contents/MacOS/qs` (with `sudo` if that folder isn't yours),
+and warns about an old `alias qs=...` that would hide the link. Re-run it after
+pulling to update. `--dev` links the debug build instead, which uses the
+checkout's `qs.bash` directly; `--help` lists the rest. The app's menu also has
+"Install qs command", which makes the same link.
 
 `qs` is moving from bash to Swift one command at a time. Today the Swift `qs`
 hands every command to the bash script, `qs.bash`, unchanged; you can still
@@ -536,7 +539,7 @@ fail with "Quicksand.app isn't running on the host". Turn on "Open at login"
 in its menu.
 
 ```bash
-app/scripts/bundle.sh && cp -R app/build/Quicksand.app ~/Applications/ && open ~/Applications/Quicksand.app
+app/scripts/install.sh
 ```
 
 Sandboxes built before the app had their own LaunchAgents

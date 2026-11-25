@@ -1,6 +1,6 @@
 // swift-tools-version:6.0
 // Quicksand.app — status-bar app that runs the host-side brokers for every
-// sandbox. See docs/quicksand-app.md. Build: `swift build` (or
+// sandbox — and the qs command, which ships inside it. See docs/quicksand-app.md. Build: `swift build` (or
 // scripts/bundle.sh for a .app); test: `swift test`.
 import PackageDescription
 
@@ -10,6 +10,7 @@ let package = Package(
     products: [
         .executable(name: "Quicksand", targets: ["Quicksand"]),
         .executable(name: "qs-event", targets: ["qs-event"]),
+        .executable(name: "qs", targets: ["qs"]),
         .library(name: "QuicksandCore", targets: ["QuicksandCore"]),
     ],
     targets: [
@@ -28,6 +29,13 @@ let package = Package(
         // What the bash brokers call to log a request; ships inside the app.
         .executableTarget(
             name: "qs-event",
+            dependencies: ["QuicksandCore"],
+            swiftSettings: [.swiftLanguageMode(.v5)]
+        ),
+        // The qs command: for now hands every command to the bash qs
+        // (qs.bash); ships inside the app as Contents/MacOS/qs.
+        .executableTarget(
+            name: "qs",
             dependencies: ["QuicksandCore"],
             swiftSettings: [.swiftLanguageMode(.v5)]
         ),

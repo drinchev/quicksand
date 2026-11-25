@@ -4,6 +4,10 @@
 # under sandbox-exec with read/write restricted to its home and a shared
 # workspace.
 #
+# Users run the Swift `qs` (app/Sources/qs), which replaces itself with
+# `/bin/bash qs.bash ARGS...`; commands move from this script into Swift one
+# at a time. Running this file directly still works.
+#
 # Structure: prelude (runs at load) → helpers → parse_args →
 # derive_constants → shared helpers → cmd_* functions → main (at bottom).
 set -Eeuo pipefail

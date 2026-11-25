@@ -57,15 +57,24 @@ for your *files*, not an egress filter.
 
 ## Installation
 
+`qs` ships inside [Quicksand.app](#quicksandapp), together with the scripts it
+runs, so the app is the whole install:
+
 ```bash
-git clone https://github.com/drinchev/quicksand
-
-# Option 1: add qs to your PATH
-export PATH="$PATH:/path/to/quicksand"
-
-# Option 2: alias it
-echo 'alias qs="/path/to/quicksand/qs"' >> ~/.zshrc
+git clone https://github.com/drinchev/quicksand && cd quicksand
+app/scripts/bundle.sh && cp -R app/build/Quicksand.app ~/Applications/
+open ~/Applications/Quicksand.app    # then "Install qs command" in its menu
 ```
+
+"Install qs command" links `/usr/local/bin/qs` to
+`Quicksand.app/Contents/MacOS/qs` (macOS asks for an admin password). To do it
+by hand: `sudo ln -sfn ~/Applications/Quicksand.app/Contents/MacOS/qs /usr/local/bin/qs`.
+
+`qs` is moving from bash to Swift one command at a time. Today the Swift `qs`
+hands every command to the bash script, `qs.bash`, unchanged; you can still
+run `/path/to/quicksand/qs.bash` directly (e.g. from a checkout while
+developing). Earlier installs that put the checkout on `PATH` or aliased
+`/path/to/quicksand/qs` need to switch to one of the two.
 
 Requires macOS and admin rights (builds use `sudo` to create the sandbox
 user). `gh` is optional but recommended for automatic deploy-key handling.

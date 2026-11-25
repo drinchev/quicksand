@@ -1,7 +1,11 @@
 #!/bin/bash
-# Build Quicksand.app from this package: a release build of the app and of
-# qs-event (the brokers' event-log writer, shipped next to it), wrapped in a minimal bundle (status-bar only, no Dock icon) and signed
-# ad hoc for this Mac. Output: app/build/Quicksand.app
+# Build Quicksand.app from this package: a release build of the app, of
+# qs-event (the brokers' event-log writer) and of the qs command, wrapped in
+# a minimal bundle (status-bar only, no Dock icon) and signed ad hoc for this
+# Mac. The bash qs (qs.bash) and the directories it reads are copied into
+# Contents/Resources/quicksand/, so the app is a complete install: link
+# Contents/MacOS/qs onto your PATH (the menu's "Install qs command" does).
+# Output: app/build/Quicksand.app
 #
 #   app/scripts/bundle.sh            # build
 #   open app/build/Quicksand.app     # run
@@ -12,6 +16,7 @@
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+REPO_DIR="$(cd "$APP_DIR/.." && pwd)"
 OUT="$APP_DIR/build/Quicksand.app"
 
 swift build -c release --package-path "$APP_DIR" "$@"
@@ -21,6 +26,15 @@ rm -rf "$OUT"
 mkdir -p "$OUT/Contents/MacOS"
 cp "$BIN_DIR/Quicksand" "$OUT/Contents/MacOS/Quicksand"
 cp "$BIN_DIR/qs-event" "$OUT/Contents/MacOS/qs-event"
+cp "$BIN_DIR/qs" "$OUT/Contents/MacOS/qs"
+
+# What qs.bash reads next to itself (see its QS_REPO_DIR).
+RES="$OUT/Contents/Resources/quicksand"
+mkdir -p "$RES"
+cp "$REPO_DIR/qs.bash" "$RES/qs.bash"
+for dir in profile.d logout.d config libexec; do
+    cp -R "$REPO_DIR/$dir" "$RES/$dir"
+done
 cat > "$OUT/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -39,5 +53,6 @@ cat > "$OUT/Contents/Info.plist" <<PLIST
 </plist>
 PLIST
 codesign --force --sign - "$OUT/Contents/MacOS/qs-event"
+codesign --force --sign - "$OUT/Contents/MacOS/qs"
 codesign --force --sign - "$OUT"
 echo "Built $OUT"

@@ -4,7 +4,8 @@
 # under sandbox-exec with read/write restricted to its home and a shared
 # workspace.
 #
-# Users run the Swift `qs` (app/Sources/qs), which replaces itself with
+# Users run the Swift `qs` (app/Sources/qs), which parses the command line,
+# answers --help, --version and list, and otherwise replaces itself with
 # `/bin/bash qs.bash ARGS...`; commands move from this script into Swift one
 # at a time. Running this file directly still works.
 #
@@ -158,6 +159,9 @@ validate_sandbox_name() {
         || abort "sandbox name must be ${SANDBOX_NAME_MAX_LEN} characters or fewer (got ${#name})"
 }
 
+# show_version, show_help, parse_args and cmd_list have Swift twins that the
+# qs command uses (app/Sources/QuicksandCore: QsCLI, SandboxList); tests fail
+# when the two differ, so change both together.
 show_version() { echo "qs version $VERSION"; exit 0; }
 
 show_help() {

@@ -2856,12 +2856,52 @@ need_qs_swift() {
     [ "$output" = "$(bash "$BATS_TEST_DIRNAME/../qs.bash" --help)" ]
 }
 
+@test "the Swift qs lists sandboxes itself, exactly as qs.bash does" {
+    need_qs_swift
+    mkdir -p "$BATS_TEST_TMPDIR/homes/qs-work" "$BATS_TEST_TMPDIR/homes/qs-Toy" \
+             "$BATS_TEST_TMPDIR/homes/qs-_x" "$BATS_TEST_TMPDIR/homes/qs-1" \
+             "$BATS_TEST_TMPDIR/shared/qs-work/repos/proj" \
+             "$BATS_TEST_TMPDIR/shared/qs-work/memory/.git" \
+             "$BATS_TEST_TMPDIR/fakehome/.config/quicksand"
+    printf 'proj\tme/proj\t\n' > "$BATS_TEST_TMPDIR/fakehome/.config/quicksand/clones-work"
+    printf 'mem\tme/mem\t\n' > "$BATS_TEST_TMPDIR/fakehome/.config/quicksand/memory-work"
+    export HOME="$BATS_TEST_TMPDIR/fakehome" \
+        QS_LIST_HOMES_DIR="$BATS_TEST_TMPDIR/homes" QS_LIST_SHARED_DIR="$BATS_TEST_TMPDIR/shared"
+    # QS_BASH points nowhere: list must not need the bash script.
+    QS_BASH=/nonexistent run "$QS_SWIFT_BUILT" list
+    [ "$status" -eq 0 ]
+    [ "$output" = "$(bash "$QS" list)" ]
+    [[ "$output" == *"proj (me/proj)"* ]]
+}
+
+@test "the Swift qs rejects bad command lines with qs.bash's messages" {
+    need_qs_swift
+    local args
+    for args in "nosuch" "-q build foo" "shell" "clone foo" "docker foo maybe" "shell bad/name"; do
+        # shellcheck disable=SC2086 # word-splitting the cases is the point
+        QS_BASH=/nonexistent run "$QS_SWIFT_BUILT" $args
+        [ "$status" -eq 1 ]
+        local swift_out="$output"
+        # shellcheck disable=SC2086
+        run bash "$QS" $args
+        [ "$status" -eq 1 ]
+        [ "$swift_out" = "$(grep '^ERROR: ' <<<"$output")" ]
+    done
+}
+
+@test "the Swift qs refuses to run inside a sandbox, like qs.bash" {
+    need_qs_swift
+    QS_SESSION_ID=x QS_BASH=/nonexistent run "$QS_SWIFT_BUILT" --version
+    [ "$status" -eq 1 ]
+    [ "$output" = "ERROR: already inside a quicksand sandbox" ]
+}
+
 @test "the Swift qs reports a missing qs.bash" {
     need_qs_swift
     local lone="$BATS_TEST_TMPDIR/bin/qs"
     mkdir -p "$(dirname "$lone")"
     cp "$QS_SWIFT_BUILT" "$lone"
-    run -127 "$lone" list
+    run -127 "$lone" build foo
     [ "$status" -eq 127 ]
     [[ "$output" == *"can't find qs.bash"* ]]
 }

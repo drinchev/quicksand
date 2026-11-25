@@ -54,14 +54,12 @@ readonly QS_DOCKER_PLIST_TEMPLATE="$QS_REPO_DIR/config/com.quicksand.docker-brok
 # build. Quicksand.app serves it (app/Sources/QuicksandCore/SayBroker.swift)
 # — a sandbox user has no GUI session and therefore no speech services.
 readonly QS_SAY_CLIENT_SOURCE="$QS_REPO_DIR/config/qs-say"
-# Credential broker assets (see config/qs-auth-broker): the host-side broker
-# that re-runs the auth providers' `refresh` on request, the sandbox-side
-# client, and the LaunchAgent template. Installed by every build, so
-# sessions the host doesn't start (SSH logins) and sessions that outlive a
-# token can still get fresh credentials.
-readonly QS_AUTH_BROKER_SOURCE="$QS_REPO_DIR/config/qs-auth-broker"
+# Credentials on demand (see config/qs-auth-refresh): the sandbox-side client,
+# staged by every build, so sessions the host doesn't start (SSH logins) and
+# sessions that outlive a token can still get fresh credentials. Quicksand.app
+# serves it, re-running the auth providers' `refresh`
+# (app/Sources/QuicksandCore/AuthBroker.swift).
 readonly QS_AUTH_CLIENT_SOURCE="$QS_REPO_DIR/config/qs-auth-refresh"
-readonly QS_AUTH_PLIST_TEMPLATE="$QS_REPO_DIR/config/com.quicksand.auth-broker.plist.tmpl"
 # Inbound SSH assets (see `qs ssh-auth`): the session wrapper sshd forces
 # every login through, and the per-sandbox `Match User` block that forces it.
 # Both are templates, rendered and installed root-owned.
@@ -128,9 +126,7 @@ config_fingerprint() {
         /usr/bin/shasum -a 256 < "$QS_DOCKER_BROKER_SOURCE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_DOCKER_SHIM_SOURCE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_DOCKER_PLIST_TEMPLATE" 2>/dev/null || true
-        /usr/bin/shasum -a 256 < "$QS_AUTH_BROKER_SOURCE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_AUTH_CLIENT_SOURCE" 2>/dev/null || true
-        /usr/bin/shasum -a 256 < "$QS_AUTH_PLIST_TEMPLATE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_SSH_SESSION_TEMPLATE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_SSHD_DROPIN_TEMPLATE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_SSHD_DEFAULT_SOURCE" 2>/dev/null || true
@@ -323,12 +319,12 @@ derive_constants() {
     readonly QS_SAY_OLD_SPEC="$QS_BROKER_SPEC_DIR/$QS_SAY_LABEL.plist"
     readonly QS_SAY_LEGACY_PLIST="$HOME/Library/LaunchAgents/$QS_SAY_LABEL.plist"
     readonly QS_SAY_OLD_BROKER="$INSTALL_DIR/say-broker-$SANDBOX_NAME.sh"
-    # Credential broker (see config/qs-auth-broker): same shape again, also
-    # installed by every build.
+    # Credential refresh runs inside Quicksand.app too; the next build removes
+    # what earlier builds set up for the bash credential broker.
     readonly QS_AUTH_LABEL="com.quicksand.auth-broker.$SANDBOX_NAME"
-    readonly QS_AUTH_PLIST="$QS_BROKER_SPEC_DIR/$QS_AUTH_LABEL.plist"
+    readonly QS_AUTH_OLD_SPEC="$QS_BROKER_SPEC_DIR/$QS_AUTH_LABEL.plist"
     readonly QS_AUTH_LEGACY_PLIST="$HOME/Library/LaunchAgents/$QS_AUTH_LABEL.plist"
-    readonly QS_AUTH_BROKER_STAGED="$INSTALL_DIR/auth-broker-$SANDBOX_NAME.sh"
+    readonly QS_AUTH_OLD_BROKER="$INSTALL_DIR/auth-broker-$SANDBOX_NAME.sh"
     # Inbound SSH (see `qs ssh-auth`). Everything sshd trusts lives root-owned
     # next to the sandbox profile — never in the sandbox user's home or the
     # shared workspace, both of which the sandbox can write.
@@ -659,49 +655,31 @@ cleanup_say() {
     rm -f "${QS_PRIVATE_DIR:+$QS_PRIVATE_DIR/bin/qs-say}"
 }
 
-# Make a value safe to substitute into a plist <string> with `sed s|..|..|`:
-# XML-escape it, then escape sed's replacement metacharacters (\ & and the
-# | delimiter). For values qs doesn't control, like the host's PATH.
-plist_sed_value() {
-    printf '%s' "$1" \
-        | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' \
-        | sed -e 's/[\\&|]/\\&/g'
-}
-
-# Install (or refresh) the credential broker for this sandbox: stage the
-# broker script host-side (it runs as the host user, so the sandbox must
-# never be able to edit it), stage the qs-auth-refresh client into the
-# workspace for profile.d/11-auth-refresh.sh to pick up, and render the spec
-# Quicksand.app runs it from, in the host's GUI session — where 1Password's
-# app integration and the host's gcloud login live. The spec is pinned to
-# this checkout's libexec/ (the providers run from the repo, as they do for
-# `qs shell`) and to the PATH of the shell running this build, since the
-# app would otherwise hand the providers a PATH without `op` or `gcloud`.
-auth_broker_install() {
-    mkdir -p "$INSTALL_DIR"
-    /usr/bin/install -m 0755 "$QS_AUTH_BROKER_SOURCE" "$QS_AUTH_BROKER_STAGED"
-
+# Set up credential refresh for this sandbox: stage the qs-auth-refresh
+# client into the workspace for profile.d/11-auth-refresh.sh to pick up.
+# Quicksand.app serves it for every built sandbox, in the host's GUI session
+# — where 1Password's app integration and the host's gcloud login live —
+# running the providers it ships with the PATH of your login shell. Also
+# removes what earlier builds set up for the bash credential broker.
+auth_client_install() {
     mkdir -p "$QS_PRIVATE_DIR/bin"
     /usr/bin/install -m 0755 "$QS_AUTH_CLIENT_SOURCE" "$QS_PRIVATE_DIR/bin/qs-auth-refresh"
-
-    render_broker_spec "$QS_AUTH_PLIST_TEMPLATE" "$QS_AUTH_PLIST" \
-        -e "s|@SANDBOX_NAME@|$SANDBOX_NAME|g" \
-        -e "s|@BROKER_SCRIPT@|$(plist_sed_value "$QS_AUTH_BROKER_STAGED")|g" \
-        -e "s|@SHARED_WORKSPACE@|$SHARED_WORKSPACE|g" \
-        -e "s|@INSTALL_DIR@|$(plist_sed_value "$INSTALL_DIR")|g" \
-        -e "s|@LIBEXEC_DIR@|$(plist_sed_value "$QS_LIBEXEC_DIR")|g" \
-        -e "s|@HOST_PATH@|$(plist_sed_value "$PATH")|g"
-    retire_broker_agent "$QS_AUTH_LABEL" "$QS_AUTH_LEGACY_PLIST" auth.sock
+    remove_old_auth_broker
 }
 
-# Undo what the build provisioned for credential refresh: remove the spec
-# and the staged broker, client and log (and any LaunchAgent from before
-# Quicksand.app). Best-effort.
-cleanup_auth_broker() {
+# What builds before credential refresh moved into the app set up: a spec
+# and staged script for the bash broker, its log, and (before the app) a
+# LaunchAgent with a socket in _quicksand/. Best-effort.
+remove_old_auth_broker() {
     retire_broker_agent "$QS_AUTH_LABEL" "$QS_AUTH_LEGACY_PLIST" auth.sock
-    rm -f "$QS_AUTH_PLIST" "$QS_AUTH_BROKER_STAGED" \
-          "$INSTALL_DIR/auth-broker-$SANDBOX_NAME.log" \
-          "${QS_PRIVATE_DIR:+$QS_PRIVATE_DIR/bin/qs-auth-refresh}"
+    rm -f "$QS_AUTH_OLD_SPEC" "$QS_AUTH_OLD_BROKER" "$INSTALL_DIR/auth-broker-$SANDBOX_NAME.log"
+}
+
+# Undo what the build provisioned for credential refresh: the client, and
+# anything an earlier build left. Best-effort.
+cleanup_auth_broker() {
+    remove_old_auth_broker
+    rm -f "${QS_PRIVATE_DIR:+$QS_PRIVATE_DIR/bin/qs-auth-refresh}"
 }
 
 # Render an SSH template (the session wrapper or the sshd Match block) to
@@ -1268,10 +1246,10 @@ EOF
     debug "Installing speech client"
     say_client_install
 
-    # Credentials on demand: stage the qs-auth-refresh client and (re)load
-    # the host-side broker — every build, for the same reason.
-    debug "Installing credential broker"
-    auth_broker_install
+    # Credentials on demand: stage the qs-auth-refresh client — every build,
+    # for the same reason.
+    debug "Installing credential refresh client"
+    auth_client_install
 
     # Per-session logout scripts (logout.d/) are the exit-time counterpart of
     # profile.d/: synced the same way and run as the sandbox user when the

@@ -78,13 +78,20 @@ final class AppModel: ObservableObject {
 
     func startBrokers() {
         guard listeners.isEmpty else { return }
+        // Ask the login shell for its PATH now, not on the first credential
+        // refresh (it can take a few seconds).
+        DispatchQueue.global(qos: .utility).async { _ = HostEnvironment.cachedLoginShellPath }
         listenerError = nil
         var started: [BrokerListener] = []
         for kind in BrokerKind.allCases {
-            // Speech runs inside the app; the other brokers are still bash
-            // scripts started from each sandbox's spec.
-            let listener = BrokerListener(kind: kind, paths: paths,
-                                          inProcess: kind == .say ? SayBroker(paths: paths) : nil) { [weak self] conn in
+            // Speech and credentials run inside the app; Docker is still a
+            // bash broker started from each sandbox's spec.
+            let inProcess: InProcessBroker? = switch kind {
+            case .say: SayBroker(paths: paths)
+            case .auth: AuthBroker(paths: paths)
+            case .docker: nil
+            }
+            let listener = BrokerListener(kind: kind, paths: paths, inProcess: inProcess) { [weak self] conn in
                 Task { @MainActor in self?.record(conn) }
             }
             do {

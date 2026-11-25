@@ -78,9 +78,8 @@ sandbox ──▶ /Users/Shared/quicksand/docker.sock ──▶ Quicksand.app (l
 
 ### The app spawns; the bash brokers decide
 
-(Speech no longer works this way: since the brokers started moving into the
-app, it runs inside it — see "Brokers inside the app" below. Docker and
-credentials still do.)
+(Speech and credentials no longer work this way: they run inside the app —
+see "Brokers inside the app" below. Docker still does.)
 
 - The app **never reads or parses** what a sandbox sends. It accepts the
   connection, works out the caller, and hands the file descriptor to a fresh
@@ -247,10 +246,26 @@ that is a Siri voice — apps can't use Siri voices through the synthesizer
 and the next build of each sandbox removes what earlier builds left
 (`say-broker-NAME.sh`, its spec and log, or a pre-app LaunchAgent).
 
-Host-side state for the next brokers (whether Docker is on for a sandbox,
-the host's `docker` path, the PATH and `libexec/` the credential providers
-need) is still to be decided between small files and a SQLite `state.db`
-written through the Swift `qs`.
+**Credentials** (`AuthBroker`): every built sandbox may refresh. The request
+must be exactly `refresh` (≤ 64 bytes, 10 s); anything else gets
+`qs-auth-broker: unknown request`. One refresh runs per sandbox at a time; a
+request that arrives meanwhile waits for it (up to 95 s, less than the
+client's 100 s) and gets `done`, logged as `shared`. Each provider in the
+app's own `libexec/` (`Contents/Resources/quicksand/libexec`) runs `refresh`
+with qs's environment contract (`QS_SANDBOX_NAME`, `QS_PRIVATE_DIR`,
+`QS_INSTALL_DIR`, `QS_VERBOSE=0`) and the PATH of the host user's login shell
+(`HostEnvironment.loginShellPath`, asked once at startup: `-l -i`, then `-l`,
+then a fallback), in a process group of its own with a 30 s deadline that
+stops the whole group. Output goes to a file (≤ 4000 bytes) so a straggler
+can't hold the connection; each line goes to the client with control
+characters stripped and cut at 500 bytes, then `done`. The event records each
+provider's outcome (`gcp=ok,op=timeout`). Nothing about this is stored per
+sandbox any more: no spec, no staged script, no pinned PATH.
+
+The only per-sandbox broker state left is whether Docker is on (and the
+host's `docker`, which the login-shell PATH finds). Whether that lives in a
+marker file or a SQLite `state.db` written through the Swift `qs` is decided
+with the Docker PR.
 
 ## The qs command
 

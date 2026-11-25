@@ -45,11 +45,10 @@ readonly QS_CLAUDE_SETTINGS_TEMPLATE="$QS_REPO_DIR/config/claude-settings.json"
 # They run straight from the repo like qs itself — nothing is staged into
 # the sandbox, so provider edits don't trigger rebuilds.
 readonly QS_LIBEXEC_DIR="$QS_REPO_DIR/libexec"
-# Docker broker assets (see `qs docker`): the host-side broker script, the
-# sandbox-side client, and the LaunchAgent template that ties them together.
-readonly QS_DOCKER_BROKER_SOURCE="$QS_REPO_DIR/config/qs-docker-broker"
+# Docker (see `qs docker`): the sandbox-side client. Quicksand.app serves it
+# for sandboxes with Docker on (app/Sources/QuicksandCore/DockerBroker.swift,
+# policy in DockerPolicy.swift).
 readonly QS_DOCKER_SHIM_SOURCE="$QS_REPO_DIR/config/qs-docker"
-readonly QS_DOCKER_PLIST_TEMPLATE="$QS_REPO_DIR/config/com.quicksand.docker-broker.plist.tmpl"
 # Speech (see config/qs-say): the sandbox-side client, staged by every
 # build. Quicksand.app serves it (app/Sources/QuicksandCore/SayBroker.swift)
 # — a sandbox user has no GUI session and therefore no speech services.
@@ -123,9 +122,7 @@ config_fingerprint() {
         /usr/bin/shasum -a 256 < "$QS_QUICKSAND_MD" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_CLAUDE_SETTINGS_TEMPLATE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_SAY_CLIENT_SOURCE" 2>/dev/null || true
-        /usr/bin/shasum -a 256 < "$QS_DOCKER_BROKER_SOURCE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_DOCKER_SHIM_SOURCE" 2>/dev/null || true
-        /usr/bin/shasum -a 256 < "$QS_DOCKER_PLIST_TEMPLATE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_AUTH_CLIENT_SOURCE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_SSH_SESSION_TEMPLATE" 2>/dev/null || true
         /usr/bin/shasum -a 256 < "$QS_SSHD_DROPIN_TEMPLATE" 2>/dev/null || true
@@ -297,21 +294,19 @@ derive_constants() {
     readonly QS_MEMORY_MANIFEST="$INSTALL_DIR/memory-$SANDBOX_NAME"
     readonly QS_SSH_DIR="$QS_PRIVATE_DIR/.ssh"
     # Brokers. Quicksand.app owns the sockets (/Users/Shared/quicksand/) and
-    # starts a broker per connection from the spec qs renders here: a plist
-    # whose ProgramArguments/EnvironmentVariables say how to run it. Specs
-    # live outside ~/Library/LaunchAgents so launchd never loads them. The
-    # *_LEGACY_PLIST paths are where builds before the app put them, as
-    # LaunchAgents with a socket in _quicksand/; a build retires those.
+    # runs every broker itself. What builds before that set up — a spec per
+    # broker under $INSTALL_DIR/brokers/ and a staged bash broker, or (before
+    # the app) a LaunchAgent with a socket in _quicksand/ — the next build
+    # removes (the *_OLD_* and *_LEGACY_PLIST paths).
     readonly QS_BROKER_SPEC_DIR="$INSTALL_DIR/brokers"
     readonly QS_APP_SOCKET_DIR="/Users/Shared/quicksand"
-    # Docker broker (see `qs docker`): the spec and the host-side staged
-    # copy of the broker script. The staged copy lives under $INSTALL_DIR —
-    # never in the shared workspace — because it runs as the host user and
-    # the sandbox must not be able to edit it.
+    # Docker (see `qs docker`) is opt-in: an empty marker file says it's on.
+    # It lives under $INSTALL_DIR, where the sandbox can't create it.
+    readonly QS_DOCKER_MARKER="$INSTALL_DIR/docker-$SANDBOX_NAME"
     readonly QS_DOCKER_LABEL="com.quicksand.docker-broker.$SANDBOX_NAME"
-    readonly QS_DOCKER_PLIST="$QS_BROKER_SPEC_DIR/$QS_DOCKER_LABEL.plist"
+    readonly QS_DOCKER_OLD_SPEC="$QS_BROKER_SPEC_DIR/$QS_DOCKER_LABEL.plist"
     readonly QS_DOCKER_LEGACY_PLIST="$HOME/Library/LaunchAgents/$QS_DOCKER_LABEL.plist"
-    readonly QS_DOCKER_BROKER_STAGED="$INSTALL_DIR/docker-broker-$SANDBOX_NAME.sh"
+    readonly QS_DOCKER_OLD_BROKER="$INSTALL_DIR/docker-broker-$SANDBOX_NAME.sh"
     # Speech runs inside Quicksand.app. What earlier builds set up for the
     # bash speech broker — a spec and a staged script (with the app), or a
     # LaunchAgent (before it) — is removed by the next build.
@@ -558,16 +553,6 @@ run_all_auth_providers() {
     done
 }
 
-# Render a broker spec for Quicksand.app: TEMPLATE → DEST via the sed
-# expressions that follow. 0644 whatever the umask: the app refuses a spec
-# anyone but the host user could edit.
-render_broker_spec() {
-    local template="$1" dest="$2"; shift 2
-    mkdir -p "$(dirname "$dest")"
-    sed "$@" "$template" > "$dest"
-    chmod 0644 "$dest"
-}
-
 # Retire what builds before Quicksand.app set up for one broker: unload its
 # LaunchAgent and remove the plist and the socket launchd made in
 # _quicksand/. Best-effort; a no-op once retired.
@@ -580,39 +565,42 @@ retire_broker_agent() {
     rm -f "${QS_PRIVATE_DIR:+$QS_PRIVATE_DIR/$sock}"
 }
 
-# Install (or refresh) the docker broker for this sandbox: stage the broker
-# script host-side (it runs as the host user, so the sandbox must never be
-# able to edit it), stage the qs-docker client into the workspace for
-# profile.d/63-docker-shim.sh to pick up, and render the spec Quicksand.app
-# runs it from, with the docker/jq paths pinned at install time. The app
-# starts one broker process per connection — nothing runs while idle.
-docker_broker_install() {
-    local docker_bin="$1" jq_bin="$2"
-
+# Turn Docker on for this sandbox (or refresh it): write the marker
+# Quicksand.app checks, stage the qs-docker client into the workspace for
+# profile.d/63-docker-shim.sh to pick up, and remove what earlier builds set
+# up for the bash Docker broker. The app finds `docker` on your login
+# shell's PATH and runs every request itself; nothing runs while idle.
+docker_enable() {
     mkdir -p "$INSTALL_DIR"
-    /usr/bin/install -m 0755 "$QS_DOCKER_BROKER_SOURCE" "$QS_DOCKER_BROKER_STAGED"
+    : > "$QS_DOCKER_MARKER"
+    chmod 0644 "$QS_DOCKER_MARKER"
 
     mkdir -p "$QS_PRIVATE_DIR/bin"
     /usr/bin/install -m 0755 "$QS_DOCKER_SHIM_SOURCE" "$QS_PRIVATE_DIR/bin/qs-docker"
-
-    render_broker_spec "$QS_DOCKER_PLIST_TEMPLATE" "$QS_DOCKER_PLIST" \
-        -e "s|@SANDBOX_NAME@|$SANDBOX_NAME|g" \
-        -e "s|@BROKER_SCRIPT@|$QS_DOCKER_BROKER_STAGED|g" \
-        -e "s|@SHARED_WORKSPACE@|$SHARED_WORKSPACE|g" \
-        -e "s|@DOCKER_BIN@|$docker_bin|g" \
-        -e "s|@JQ_BIN@|$jq_bin|g"
-    retire_broker_agent "$QS_DOCKER_LABEL" "$QS_DOCKER_LEGACY_PLIST" docker-broker.sock
+    remove_old_docker_broker
 }
 
-# Undo what `qs docker` provisioned: remove the spec and the staged
-# broker/client (and any LaunchAgent from before Quicksand.app), and (when
-# the host has docker) reap the containers and images labeled for this
-# sandbox. Best-effort throughout so uninstall always completes.
-cleanup_docker() {
+# What builds before Docker moved into the app set up: a spec and staged
+# script for the bash broker, its log, and (before the app) a LaunchAgent
+# with a socket in _quicksand/. Best-effort; a no-op once removed.
+remove_old_docker_broker() {
     retire_broker_agent "$QS_DOCKER_LABEL" "$QS_DOCKER_LEGACY_PLIST" docker-broker.sock
-    rm -f "$QS_DOCKER_PLIST" "$QS_DOCKER_BROKER_STAGED" \
-          "$INSTALL_DIR/docker-broker-$SANDBOX_NAME.log" \
-          "${QS_PRIVATE_DIR:+$QS_PRIVATE_DIR/bin/qs-docker}"
+    rm -f "$QS_DOCKER_OLD_SPEC" "$QS_DOCKER_OLD_BROKER" "$INSTALL_DIR/docker-broker-$SANDBOX_NAME.log"
+}
+
+# Turn Docker off: remove the marker and the client (and anything an earlier
+# build left). The in-sandbox client then fails cleanly with a pointer back
+# to `qs docker NAME`.
+docker_disable() {
+    remove_old_docker_broker
+    rm -f "$QS_DOCKER_MARKER" "${QS_PRIVATE_DIR:+$QS_PRIVATE_DIR/bin/qs-docker}"
+}
+
+# Undo what `qs docker` provisioned (docker_disable), and (when the host has
+# docker) reap the containers and images labeled for this sandbox.
+# Best-effort throughout so uninstall always completes.
+cleanup_docker() {
+    docker_disable
     command -v docker >/dev/null 2>&1 || return 0
     local ids
     ids="$(docker ps -aq --filter "label=quicksand.sandbox=$SANDBOX_NAME" 2>/dev/null || true)"
@@ -1271,21 +1259,14 @@ EOF
             "$QS_CUSTOM_DIR/" "$QS_CUSTOM_SANDBOX_DIR/"
     fi
 
-    # Keep an enabled docker broker in step with the repo: a rebuild
-    # re-stages the broker and client and re-renders the spec, so changes
-    # to config/qs-docker* (which are fingerprinted) roll out like
-    # profile.d changes — and moves a pre-app LaunchAgent over to the app.
-    # No-op for sandboxes without the broker.
-    if [[ -f "$QS_DOCKER_PLIST" || -f "$QS_DOCKER_LEGACY_PLIST" ]]; then
-        local docker_bin jq_bin
-        docker_bin="$(command -v docker 2>/dev/null || true)"
-        jq_bin="$(command -v jq 2>/dev/null || true)"
-        if [[ -n "$docker_bin" && -n "$jq_bin" ]]; then
-            debug "Refreshing docker broker"
-            docker_broker_install "$docker_bin" "$jq_bin"
-        else
-            warn "Docker broker is enabled for '$SANDBOX_NAME' but docker/jq are missing on the host — broker refresh skipped."
-        fi
+    # Keep Docker in step with the repo for sandboxes that have it on: a
+    # rebuild re-stages the client, so changes to config/qs-docker (which is
+    # fingerprinted) roll out like profile.d changes — and moves Docker set
+    # up by an earlier build (a spec, or a pre-app LaunchAgent) to the
+    # marker. No-op for sandboxes without Docker.
+    if [[ -f "$QS_DOCKER_MARKER" || -f "$QS_DOCKER_OLD_SPEC" || -f "$QS_DOCKER_LEGACY_PLIST" ]]; then
+        debug "Refreshing Docker"
+        docker_enable
     fi
 
     # SSH: sandbox users get no login unless `qs ssh-auth` grants one. The
@@ -1470,32 +1451,28 @@ cmd_op_auth() {
     run_auth_provider op provision "${args[@]+"${args[@]}"}" || exit $?
 }
 
-# Enable (or refresh) the host docker broker for a sandbox, letting agents
-# run containers on the host engine without ever seeing the Docker socket
-# (raw socket access could bind-mount any host path — see the broker script
-# for the full security model). 'qs docker NAME off' disables it again; the
+# Turn Docker on (or refresh it) for a sandbox, letting agents run
+# containers on the host engine without ever seeing the Docker socket (raw
+# socket access could bind-mount any host path — see DockerPolicy.swift for
+# the full security model). 'qs docker NAME off' disables it again; the
 # in-sandbox client then fails cleanly with a pointer back to this command.
 cmd_docker() {
     (( ${#COMMAND_ARGS[@]} == 0 )) \
         || abort "qs docker doesn't accept '--' args"
     if [[ "$DOCKER_ACTION" == "off" ]]; then
-        retire_broker_agent "$QS_DOCKER_LABEL" "$QS_DOCKER_LEGACY_PLIST" docker-broker.sock
-        rm -f "$QS_DOCKER_PLIST" "$QS_DOCKER_BROKER_STAGED" "$QS_PRIVATE_DIR/bin/qs-docker"
-        info "Docker broker disabled for '$SANDBOX_NAME'."
+        docker_disable
+        info "Docker disabled for '$SANDBOX_NAME'."
         return 0
     fi
 
-    local docker_bin jq_bin
+    local docker_bin
     docker_bin="$(command -v docker 2>/dev/null || true)"
     [[ -n "$docker_bin" ]] \
         || abort "docker CLI not found on host — install OrbStack or Docker Desktop first."
-    jq_bin="$(command -v jq 2>/dev/null || true)"
-    [[ -n "$jq_bin" ]] \
-        || abort "jq not found on host — the broker needs it (brew install jq)."
-    docker_broker_install "$docker_bin" "$jq_bin"
+    docker_enable
 
     info ""
-    info "Docker broker enabled for '$SANDBOX_NAME':"
+    info "Docker enabled for '$SANDBOX_NAME':"
     info "  Engine:  $docker_bin (runs as $HOST_USER; policy enforced host-side)"
     info "  Socket:  $QS_APP_SOCKET_DIR/docker.sock (served by Quicksand.app, which must be running)"
     info "  Client:  qs-docker inside the sandbox — run / build / pull / ps / logs / stop"

@@ -45,7 +45,7 @@ import Testing
         -> (reply: String?, done: BrokerConnection?) {
         let updates = Updates()
         let l = BrokerListener(kind: .auth, paths: s.fx.paths, users: FakeUsers(byUID: [me: user]),
-                               inProcess: broker) { updates.add($0) }
+                               broker: broker) { updates.add($0) }
         try l.start()
         defer { l.stop() }
         let reply = exchange(l.socketPath, request)
@@ -126,7 +126,7 @@ import Testing
         let broker = s.broker()
         let updates = Updates()
         let l = BrokerListener(kind: .auth, paths: s.fx.paths, users: FakeUsers(byUID: [me: "qs-work"]),
-                               inProcess: broker) { updates.add($0) }
+                               broker: broker) { updates.add($0) }
         try l.start()
         defer { l.stop() }
 

@@ -9,35 +9,30 @@ public struct QuicksandPaths: Sendable {
     public var sharedDir: URL
     /// The host-side config directory qs writes (`~/.config/quicksand`).
     public var installDir: URL
-    /// Where qs renders each sandbox's broker specs
-    /// (`~/.config/quicksand/brokers`).
-    public var specDir: URL
-    /// Where builds before the app put them, as LaunchAgents
-    /// (`~/Library/LaunchAgents`). Read until the sandbox is rebuilt.
-    public var legacySpecDir: URL?
+    /// `~/Library/LaunchAgents`, where builds before the app put each
+    /// sandbox's brokers. Only looked at to spot leftovers.
+    public var launchAgentsDir: URL?
     /// Where the app creates the shared broker sockets
     /// (`/Users/Shared/quicksand`).
     public var socketDir: URL
 
-    public init(usersDir: URL, sharedDir: URL, installDir: URL, specDir: URL,
-                legacySpecDir: URL? = nil, socketDir: URL) {
+    public init(usersDir: URL, sharedDir: URL, installDir: URL,
+                launchAgentsDir: URL? = nil, socketDir: URL) {
         self.usersDir = usersDir
         self.sharedDir = sharedDir
         self.installDir = installDir
-        self.specDir = specDir
-        self.legacySpecDir = legacySpecDir
+        self.launchAgentsDir = launchAgentsDir
         self.socketDir = socketDir
     }
 
-    /// The real layout on this Mac, for the user running the app.
+    /// The real locations for the current user.
     public static func host(home: URL = FileManager.default.homeDirectoryForCurrentUser) -> QuicksandPaths {
         let installDir = home.appendingPathComponent(".config/quicksand")
         return QuicksandPaths(
             usersDir: URL(fileURLWithPath: "/Users"),
             sharedDir: URL(fileURLWithPath: "/Users/Shared"),
             installDir: installDir,
-            specDir: installDir.appendingPathComponent("brokers"),
-            legacySpecDir: home.appendingPathComponent("Library/LaunchAgents"),
+            launchAgentsDir: home.appendingPathComponent("Library/LaunchAgents"),
             socketDir: URL(fileURLWithPath: "/Users/Shared/quicksand")
         )
     }
@@ -48,6 +43,12 @@ public struct QuicksandPaths: Sendable {
     /// Written by every `qs build NAME`: the sandbox is set up.
     public func installMarker(_ sandbox: String) -> URL {
         installDir.appendingPathComponent("install-\(sandbox)")
+    }
+
+    /// Created by `qs docker NAME`, removed by `qs docker NAME off`: the
+    /// sandbox may use Docker.
+    public func dockerMarker(_ sandbox: String) -> URL {
+        installDir.appendingPathComponent("docker-\(sandbox)")
     }
 
     public func workspace(_ sandbox: String) -> URL {
@@ -63,30 +64,16 @@ public struct QuicksandPaths: Sendable {
         socketDir.appendingPathComponent(kind.socketName)
     }
 
-    /// The spec to use: qs's current one, else a LaunchAgent plist from a
-    /// build before the app (same keys; the app ignores launchd's socket).
-    public func spec(_ kind: BrokerKind, sandbox: String) -> URL {
-        let current = specDir.appendingPathComponent(specName(kind, sandbox))
-        if let legacy = legacySpec(kind, sandbox: sandbox),
-           !FileManager.default.fileExists(atPath: current.path),
-           FileManager.default.fileExists(atPath: legacy.path) {
-            return legacy
+    /// What builds before the brokers moved into the app set up for this
+    /// sandbox: a spec and a staged bash broker per broker, or (before the
+    /// app) a LaunchAgent. The next build removes them; until then Docker
+    /// from an old spec isn't served.
+    public func oldBrokerFiles(_ sandbox: String) -> [URL] {
+        BrokerKind.allCases.flatMap { kind -> [URL] in
+            let plist = "\(kind.label(for: sandbox)).plist"
+            return [installDir.appendingPathComponent("brokers/\(plist)"),
+                    installDir.appendingPathComponent("\(kind.rawValue)-broker-\(sandbox).sh")]
+                + (launchAgentsDir.map { [$0.appendingPathComponent(plist)] } ?? [])
         }
-        return current
-    }
-
-    /// True when the sandbox's broker still runs from a LaunchAgent, i.e. it
-    /// wasn't rebuilt since the app took over (`qs build NAME` moves it).
-    public func usesLaunchAgent(_ kind: BrokerKind, sandbox: String) -> Bool {
-        guard let legacy = legacySpec(kind, sandbox: sandbox) else { return false }
-        return spec(kind, sandbox: sandbox) == legacy
-    }
-
-    private func specName(_ kind: BrokerKind, _ sandbox: String) -> String {
-        "\(kind.label(for: sandbox)).plist"
-    }
-
-    private func legacySpec(_ kind: BrokerKind, sandbox: String) -> URL? {
-        legacySpecDir?.appendingPathComponent(specName(kind, sandbox))
     }
 }

@@ -40,81 +40,41 @@ import Testing
     }
 }
 
-// MARK: - Broker specs
+// MARK: - Marker files
 
-@Suite struct BrokerSpecTests {
-    @Test func loadsArgumentsAndEnvironment() throws {
+@Suite struct MarkerTests {
+    @Test func trustsOnlyAMarkerTheHostUserWrote() throws {
         let fx = try Fixture()
-        try fx.installBroker(.auth, sandbox: "work", script: "echo hi", env: ["QS_AUTH_LIBEXEC": "/x"])
-        let spec = try BrokerSpec.load(.auth, sandbox: "work", paths: fx.paths).get()
-        #expect(spec.arguments.count == 3)
-        #expect(spec.arguments[2] == "work")
-        #expect(spec.environment["QS_AUTH_LIBEXEC"] == "/x")
-    }
-
-    @Test func missingSpecMeansNotEnabled() throws {
-        let fx = try Fixture()
-        #expect(BrokerSpec.load(.docker, sandbox: "work", paths: fx.paths) == .failure(.missing))
-    }
-
-    @Test func refusesASpecForAnotherSandbox() throws {
-        let fx = try Fixture()
-        try fx.installBroker(.say, sandbox: "work", script: "true", label: "com.quicksand.say-broker.other")
-        guard case .failure(.malformed) = BrokerSpec.load(.say, sandbox: "work", paths: fx.paths) else {
-            Issue.record("label mismatch accepted"); return
+        let marker = fx.paths.dockerMarker("work").path
+        #expect(checkOwnedFile(marker, ownerUID: getuid()) == .missing)
+        FileManager.default.createFile(atPath: marker, contents: Data())
+        chmod(marker, 0o644)
+        #expect(checkOwnedFile(marker, ownerUID: getuid()) == .ok)
+        chmod(marker, 0o664)
+        guard case .unsafe = checkOwnedFile(marker, ownerUID: getuid()) else {
+            Issue.record("group-writable marker accepted"); return
         }
-        try fx.installBroker(.say, sandbox: "work", script: "true",
-                             args: ["/bin/bash", fx.paths.installDir.appendingPathComponent("say-broker-work.sh").path, "other"])
-        guard case .failure(.malformed) = BrokerSpec.load(.say, sandbox: "work", paths: fx.paths) else {
-            Issue.record("argument mismatch accepted"); return
+        chmod(marker, 0o644)
+        guard case .unsafe = checkOwnedFile(marker, ownerUID: getuid() + 1) else {
+            Issue.record("marker owned by someone else accepted"); return
+        }
+        try FileManager.default.removeItem(atPath: marker)
+        try FileManager.default.createSymbolicLink(atPath: marker, withDestinationPath: "/etc/hosts")
+        guard case .unsafe = checkOwnedFile(marker, ownerUID: getuid()) else {
+            Issue.record("symlinked marker accepted"); return
         }
     }
 
-    @Test func refusesFilesOthersCouldEdit() throws {
-        let fx = try Fixture()
-        let plist = try fx.installBroker(.say, sandbox: "work", script: "true")
-        chmod(plist.path, 0o664)
-        guard case .failure(.unsafe) = BrokerSpec.load(.say, sandbox: "work", paths: fx.paths) else {
-            Issue.record("group-writable plist accepted"); return
-        }
-        chmod(plist.path, 0o644)
-        chmod(fx.paths.installDir.appendingPathComponent("say-broker-work.sh").path, 0o775)
-        guard case .failure(.unsafe) = BrokerSpec.load(.say, sandbox: "work", paths: fx.paths) else {
-            Issue.record("group-writable broker script accepted"); return
-        }
-    }
-
-    @Test func fallsBackToALaunchAgentUntilTheSandboxIsRebuilt() throws {
+    @Test func spotsFilesFromTheOldBashBrokers() throws {
         let fx = try Fixture()
         var paths = fx.paths
-        let agents = fx.root.appendingPathComponent("LaunchAgents")
-        paths.legacySpecDir = agents
-        try FileManager.default.createDirectory(at: agents, withIntermediateDirectories: true)
-
-        // Only a pre-app LaunchAgent: served from it, and flagged.
-        let rendered = try fx.installBroker(.say, sandbox: "work", script: "true")
-        let legacy = agents.appendingPathComponent(rendered.lastPathComponent)
-        try FileManager.default.moveItem(at: rendered, to: legacy)
-        #expect(paths.spec(.say, sandbox: "work") == legacy)
-        #expect(paths.usesLaunchAgent(.say, sandbox: "work"))
-        #expect((try? BrokerSpec.load(.say, sandbox: "work", paths: paths).get()) != nil)
-
-        // After a rebuild both exist until qs removes the old one; the new wins.
-        try fx.installBroker(.say, sandbox: "work", script: "true")
-        #expect(paths.spec(.say, sandbox: "work") == rendered)
-        #expect(!paths.usesLaunchAgent(.say, sandbox: "work"))
-        #expect(!paths.usesLaunchAgent(.docker, sandbox: "work"))
-    }
-
-    @Test func refusesASymlinkedSpec() throws {
-        let fx = try Fixture()
-        let real = try fx.installBroker(.say, sandbox: "work", script: "true")
-        let moved = fx.root.appendingPathComponent("elsewhere.plist")
-        try FileManager.default.moveItem(at: real, to: moved)
-        try FileManager.default.createSymbolicLink(at: real, withDestinationURL: moved)
-        guard case .failure(.unsafe) = BrokerSpec.load(.say, sandbox: "work", paths: fx.paths) else {
-            Issue.record("symlinked plist accepted"); return
-        }
+        paths.launchAgentsDir = fx.root.appendingPathComponent("LaunchAgents")
+        let names = paths.oldBrokerFiles("work").map(\.lastPathComponent)
+        #expect(names.contains("com.quicksand.docker-broker.work.plist"))
+        #expect(names.contains("auth-broker-work.sh"))
+        #expect(paths.oldBrokerFiles("work").contains {
+            $0.path.hasSuffix("LaunchAgents/com.quicksand.say-broker.work.plist")
+        })
     }
 }
 
@@ -187,8 +147,11 @@ import Testing
         fm.createFile(atPath: sessions.appendingPathComponent("\(getpid())").path, contents: nil)
         fm.createFile(atPath: sessions.appendingPathComponent("99999").path, contents: nil)
         fm.createFile(atPath: fx.paths.privateDir("alpha").appendingPathComponent("gcp-token").path, contents: nil)
-        try fx.installBroker(.docker, sandbox: "alpha", script: "true")  // staged before the event log
-        try fx.installBroker(.say, sandbox: "alpha", script: "# --- event log: keep this block identical\ntrue")
+        // Docker on via the marker, plus a spec an old build left behind.
+        fm.createFile(atPath: fx.paths.dockerMarker("alpha").path, contents: Data())
+        try fm.createDirectory(at: fx.paths.installDir.appendingPathComponent("brokers"), withIntermediateDirectories: true)
+        fm.createFile(atPath: fx.paths.installDir.appendingPathComponent("brokers/com.quicksand.docker-broker.alpha.plist").path,
+                      contents: Data())
 
         let scanner = SandboxScanner(
             paths: fx.paths, users: FakeUsers(byUID: [700: "qs-alpha", 701: "qs-beta"]),
@@ -206,8 +169,8 @@ import Testing
         #expect(alpha.isActive)
         #expect(alpha.processes == ["claude", "zsh"])
         #expect(alpha.sessionCount == 1)  // our own pid is alive; 99999 isn't
-        #expect(alpha.brokers == [.docker, .say])
-        #expect(alpha.brokersWithoutEventLog == [.docker])
+        #expect(alpha.dockerEnabled && !boxes[1].dockerEnabled)
+        #expect(alpha.needsRebuild && !boxes[1].needsRebuild)
         #expect((alpha.gcpTokenAge ?? 999) < 60)
         #expect(!alpha.opTokenStaged)
         // Lingering system daemons alone don't make a sandbox active.
@@ -326,15 +289,5 @@ import Testing
         let current = try String(contentsOf: log, encoding: .utf8)
         #expect(rotated == old)
         #expect(Set(current.split(separator: "\n")).count == 40)
-    }
-
-    @Test func findsTheToolNextToTheExecutable() throws {
-        let fx = try Fixture()
-        let exe = fx.root.appendingPathComponent("Quicksand")
-        #expect(BrokerLauncher.eventTool(nextTo: exe) == nil)
-        FileManager.default.createFile(atPath: fx.root.appendingPathComponent("qs-event").path,
-                                       contents: Data(), attributes: [.posixPermissions: 0o755])
-        #expect(BrokerLauncher.eventTool(nextTo: exe)?.lastPathComponent == "qs-event")
-        #expect(BrokerLauncher.baseEnvironment(eventTool: nil)["QS_EVENT_BIN"] == nil)
     }
 }

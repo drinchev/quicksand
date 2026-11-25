@@ -35,7 +35,7 @@ final class FakeSpeaker: Speaker, @unchecked Sendable {
         let updates = Updates()
         let broker = SayBroker(paths: fx.paths, speaker: speaker)
         let l = BrokerListener(kind: .say, paths: fx.paths, users: FakeUsers(byUID: [me: user]),
-                               inProcess: broker) { updates.add($0) }
+                               broker: broker) { updates.add($0) }
         try l.start()
         defer { l.stop() }
         let reply = exchange(l.socketPath, request)

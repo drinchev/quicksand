@@ -37,7 +37,7 @@ struct MenuContent: View {
                 let recent = model.events.suffix(6).reversed()
                 let stale = model.sandboxesNeedingRebuild
                 if !stale.isEmpty {
-                    Text("\(stale.count) of \(model.sandboxes.count) sandboxes still use their old per-sandbox brokers, which this app doesn't serve or log. Any qs command for a sandbox rebuilds it and moves it over, e.g. qs build \(stale[0]).")
+                    Text("\(stale.count) of \(model.sandboxes.count) sandboxes still have files from the old bash brokers; Docker set up that way doesn't work until the sandbox is rebuilt. Any qs command for a sandbox rebuilds it, e.g. qs build \(stale[0]).")
                         .font(.caption)
                         .foregroundStyle(.orange)
                         .fixedSize(horizontal: false, vertical: true)
@@ -199,7 +199,7 @@ struct SandboxRow: View {
                 Chip(text: box.sessionCount == 1 ? "1 session" : "\(box.sessionCount) sessions")
                     .help("Shells or agents started with qs that are still open")
             }
-            if box.brokers.contains(.docker) {
+            if box.dockerEnabled {
                 Chip(text: "Docker").help("Docker is enabled for this sandbox (qs docker)")
             }
             if let age = box.gcpTokenAge {

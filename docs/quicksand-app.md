@@ -1,9 +1,9 @@
 # Quicksand.app: a status-bar app that runs the host brokers
 
-Status (2026-11-25): steps 1–3 are built: the brokers write an event log,
-`app/` holds Quicksand.app, and a sandbox moves to the app's sockets on its
-next build. The app also ships the `qs` command (see "The qs command").
-Step 4 (approvals) is next.
+Status (2026-11-25): steps 1–4 are built: the brokers write an event log,
+`app/` holds Quicksand.app, sandboxes use the app's sockets, and all three
+brokers run inside the app. The app also ships the `qs` command (see "The qs
+command"). Step 5 (approvals) is next.
 
 ## Goal
 
@@ -38,13 +38,13 @@ sandboxes, and logs that are free text (the Docker broker logs only
 sandbox ──▶ /Users/Shared/quicksand/docker.sock ──▶ Quicksand.app (listens on all broker sockets)
                                                      │ 1. accept
                                                      │ 2. getpeereid(fd) → uid → "qs-trading" → "trading"
-                                                     │ 3. host-side policy: a quicksand sandbox? broker enabled for it?
-                                                     │ 4. spawn: bash qs-docker-broker trading /Users/Shared/qs-trading …
-                                                     │    with the connection as stdin/stdout
+                                                     │ 3. a quicksand sandbox? under its 16 concurrent requests?
+                                                     │ 4. the broker (DockerBroker): Docker on for it? (docker-trading)
+                                                     │ 5. DockerPolicy: request → the one docker command it allows
                                                      ▼
-                                       bash broker (unchanged policy code) ──▶ streams to the sandbox
+                                       docker (connection as its stdout/stderr, stdin for run) ──▶ streams to the sandbox
                                                      │
-                                                     └──▶ appends one line to ~/.config/quicksand/events.jsonl
+                                                     └──▶ the broker appends one line to ~/.config/quicksand/events.jsonl
 ```
 
 ### One socket per broker type, identity from the kernel
@@ -63,39 +63,25 @@ sandbox ──▶ /Users/Shared/quicksand/docker.sock ──▶ Quicksand.app (l
 - **Identity:** `getpeereid()` on the accepted socket gives the caller's uid;
   `getpwuid()` maps it to `qs-NAME`. Both come from the kernel and the system
   user directory, which only an admin can change.
-- **Policy = the broker specs qs renders.** For each connection the app loads
-  `~/.config/quicksand/brokers/com.quicksand.<kind>-broker.<NAME>.plist` (the
-  LaunchAgent plist minus launchd's socket keys, kept out of
-  `~/Library/LaunchAgents` so launchd never loads it) and runs its
-  `ProgramArguments` with its `EnvironmentVariables`, exactly as launchd did.
-  For a sandbox not rebuilt since, it falls back to the old LaunchAgent plist
-  in `~/Library/LaunchAgents`. No plist means that broker isn't enabled for the sandbox (so
-  `qs docker NAME` / `qs docker NAME off` keep working unchanged). The plist
-  and the broker script it names must be regular files owned by the host user
-  and writable by no one else, its `Label` must match, and its arguments must
-  name this sandbox. Nothing is read from the workspace, the sandbox's home, or
-  the request.
+- **Which sandboxes may use what = files qs writes.** Every built sandbox
+  (`~/.config/quicksand/install-NAME`) gets speech and credential refresh;
+  Docker only those with `~/.config/quicksand/docker-NAME`, which
+  `qs docker NAME` creates and `qs docker NAME off` removes. Each must be a
+  regular file owned by the host user and writable by no one else. Nothing is
+  read from the workspace, the sandbox's home, or the request.
 
-### The app spawns; the bash brokers decide
+### The brokers run inside the app
 
-(Speech and credentials no longer work this way: they run inside the app —
-see "Brokers inside the app" below. Docker still does.)
-
-- The app **never reads or parses** what a sandbox sends. It accepts the
-  connection, works out the caller, and hands the file descriptor to a fresh
-  bash broker process, exactly as launchd does today. The broker gets the same
-  arguments it gets from its LaunchAgent now.
-- All request policy stays in the existing, tested bash: flag-free Docker
-  command composition, symlink-resolved workspace checks, `_quicksand/`
-  masking, label scoping, build-tag namespacing, the auth refresh lock, output
-  sanitizing.
-- One process per request is kept: a broker that crashes or hangs affects one
-  request, not the app or other sandboxes. Brokers are started with
-  `posix_spawn` and `POSIX_SPAWN_CLOEXEC_DEFAULT`, so they inherit only the
-  connection (fd 0 and 1) and `/dev/null` (fd 2), with default signal handling
-  and the environment launchd would give them.
-- A sandbox can have at most 16 broker processes running at once; more
-  connections are turned away with a message in that broker's protocol.
+They were bash scripts the app spawned per connection, from a spec qs
+rendered per sandbox; they now run in the app as Swift (see "Brokers inside
+the app" below). The app reads each request now, so every value from a
+sandbox is treated as hostile: bounded reads, no shell, no argument a client
+chose that could become an option. The programs the brokers run (`docker`,
+the auth providers, `say`) start with `posix_spawn` and
+`POSIX_SPAWN_CLOEXEC_DEFAULT`, so they inherit only what each needs, with
+default signal handling. A sandbox can have at most 16 requests in progress
+at once; more connections are turned away with a message in that broker's
+protocol.
 
 ### When the app isn't running
 
@@ -118,9 +104,9 @@ Broker processes already running finish their requests if the app dies.
   count, Docker on/off, GCP token age, 1Password token staged or not.
 - Feed window: live events, filterable by sandbox and broker.
 
-Request details (verb, image, result) come from the event log the brokers
-write through `qs-event`, since the app doesn't parse requests itself. Connection timing
-and exit status the app sees directly.
+Request details (verb, image, result) come from the event log each broker
+writes when a request ends; connection timing and exit status the listener
+sees directly.
 
 ### Approvals (later)
 
@@ -132,17 +118,11 @@ no answer within a deadline, the broker applies a configured default.
 ## Event log format (step 1)
 
 `~/.config/quicksand/events.jsonl` (override: `QS_EVENTS_LOG`), one JSON object
-per line, appended when a request ends. The brokers don't write it
-themselves: each calls `qs-event` (`app/Sources/qs-event`, one Swift command
-for all three), which Quicksand.app ships next to its own binary and passes
-to every broker as `QS_EVENT_BIN`. A broker run without it (by hand, or by a
-pre-app LaunchAgent) works but logs nothing. `qs-event` locks the log, so
-concurrent brokers never interleave lines or rotate twice, and rotates it to
-`events.jsonl.1` past about 5 MB (`QS_EVENTS_MAX_BYTES`).
-
-```bash
-qs-event --log FILE --broker docker|auth|say --sandbox NAME [--since EPOCH] -- VERB RESULT [FIELD VALUE]...
-```
+per line, appended when a request ends, by the broker that served it
+(`EventWriter`). Writes lock the log, so concurrent requests never interleave
+lines or rotate twice, and it rotates to `events.jsonl.1` past about 5 MB.
+(Until the brokers moved into the app, the bash brokers wrote it through a
+small Swift command, `qs-event`.)
 
 ```json
 {"ts":"2026-11-20T09:14:03Z","sandbox":"trading","broker":"docker","verb":"run","result":"ok","secs":12,"exit":0,"target":"node:20"}
@@ -166,7 +146,7 @@ qs-event --log FILE --broker docker|auth|say --sandbox NAME [--since EPOCH] -- V
 Never logged: Docker `cmd` arguments, environment variables (names or values),
 credential values, provider output.
 
-Every value a sandbox sent is untrusted: `qs-event` drops control characters
+Every value a sandbox sent is untrusted: `EventWriter` drops control characters
 and invalid UTF-8 and JSON-escapes the rest, so each line is valid JSON
 whatever the client sent. Field names must be lowercase words and can't
 override the fixed ones (`sandbox`, `broker`, …). Readers must still treat the content as
@@ -188,15 +168,18 @@ The per-sandbox free-text logs (`*-broker-NAME.log`) stay as they are.
    build unloads and deletes that sandbox's old LaunchAgents and their
    `_quicksand/*.sock`. Sandboxes migrate one by one as they are rebuilt; the
    menu lists those still on LaunchAgents.
-4. **Approvals.**
+4. **Brokers inside the app** (done): speech, then credentials, then Docker
+   moved from bash into Swift; no specs, staged scripts, `qs-event` or `jq`
+   remain. See "Brokers inside the app".
+5. **Approvals.**
 
 ## The app
 
 `app/` is a SwiftPM package (no Xcode project), macOS 14+:
 
 - `QuicksandCore`: caller identity (`getpeereid` → `getpwuid_r` → `qs-NAME`,
-  round-tripped), broker specs from the plists, spawning, the per-socket
-  listener, sandbox status (processes per user via `proc_listpids`, live
+  round-tripped), the per-socket listener, the three brokers and the Docker
+  policy, the qs command line, sandbox status (processes per user via `proc_listpids`, live
   session records, staged tokens), the event-log reader (follows appends and
   rotation, skips bad lines) and stats.
 - `Quicksand`: the status-bar app. The icon shows active sandboxes and turns
@@ -207,7 +190,7 @@ The per-sandbox free-text logs (`*-broker-NAME.log`) stay as they are.
   connection the app served, with filters.
 
 ```bash
-swift test --package-path app                      # incl. the real docker broker end to end
+swift test --package-path app                      # incl. each broker end to end through a real socket
 app/scripts/bundle.sh                               # → app/build/Quicksand.app (ad-hoc signed)
 app/scripts/install.sh                              # build + install to ~/Applications + link qs + open
 ```
@@ -216,14 +199,15 @@ Inside a quicksand sandbox, add `--disable-sandbox` to `swift build`/`swift
 test`/`bundle.sh`: SwiftPM's own sandbox can't nest inside sandbox-exec. The
 app's UI can only run on the host (sandbox users have no GUI session).
 
-Sandboxes not rebuilt since step 3 still use their LaunchAgents: the app
-lists them, flagged, but doesn't serve their requests.
+Sandboxes not rebuilt since the brokers moved into the app still have their
+old files (specs, staged bash brokers, or LaunchAgents): the app flags them,
+and Docker set up that way isn't served until the rebuild, which any `qs`
+command for the sandbox does.
 
 ## Brokers inside the app
 
-The bash brokers are moving into the app one by one: speech first, then
-credentials, then Docker, which also retires `qs-event`, `jq` and the last
-plist templates. A broker inside the app implements `InProcessBroker`: the
+All three brokers run inside the app (they moved one by one: speech, then
+credentials, then Docker). A broker implements `InProcessBroker`: the
 listener still identifies the caller by uid and applies the 16-per-sandbox
 cap, then asks the broker whether that sandbox may use it and hands it the
 connection on a thread of its own (`BrokerClient`: bounded line reads,
@@ -262,10 +246,27 @@ characters stripped and cut at 500 bytes, then `done`. The event records each
 provider's outcome (`gcp=ok,op=timeout`). Nothing about this is stored per
 sandbox any more: no spec, no staged script, no pinned PATH.
 
-The only per-sandbox broker state left is whether Docker is on (and the
-host's `docker`, which the login-shell PATH finds). Whether that lives in a
-marker file or a SQLite `state.db` written through the Swift `qs` is decided
-with the Docker PR.
+**Docker** (`DockerBroker`, policy in `DockerPolicy`): sandboxes with
+`~/.config/quicksand/docker-NAME`. It reads one JSON line (≤ 64 KB, 30 s);
+`DockerPolicy.plan` — pure, unit-tested — turns it into the one `docker`
+argv it allows or a refusal: six verbs; image, id and env-name patterns that
+forbid a leading `-`; workdir, build context and Dockerfile resolved through
+symlinks and `..` and required inside the workspace; no build context at the
+workspace root or under `_quicksand/`; build tags under `qs-NAME/`; `ps`
+filtered and `logs`/`stop` checked (`docker inspect`) against the
+`quicksand.sandbox=NAME` label; `run` with the fixed hardened flags and
+`_quicksand/` masked by an empty volume. The broker finds `docker` on the
+login-shell PATH, puts the CLI's own and resolved directories and
+`/usr/local/bin` first (credential helpers), and spawns it with the
+connection as stdout/stderr — and stdin for `run`, so the rest of the
+connection is the container's input — then writes
+`@@qs-docker-exit:N@@`. A refusal is `qs-docker: …` with exit 125. The event
+records verb, result, exit and target (the image, tag or id — never the
+command or its environment).
+
+Per-sandbox broker state is two empty marker files (`install-NAME`,
+`docker-NAME`); moving all of qs's host-side records into one SQLite
+`state.db` is left for when the Swift `qs` writes them all.
 
 ## The qs command
 

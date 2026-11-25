@@ -73,7 +73,9 @@ public final class BrokerClient: @unchecked Sendable {
         }
     }
 
-    private func currentFD() -> Int32? {
+    /// The connection's descriptor while it's open, for handing to a child
+    /// process (it is dup'd; this object still owns and closes it).
+    func currentFD() -> Int32? {
         lock.lock()
         defer { lock.unlock() }
         return fd >= 0 ? fd : nil

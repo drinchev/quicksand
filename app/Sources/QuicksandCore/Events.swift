@@ -1,7 +1,7 @@
 import Darwin
 import Foundation
 
-/// One line of `events.jsonl`, as the bash brokers write it (see
+/// One line of `events.jsonl`, as the brokers write it (see
 /// docs/quicksand-app.md). Every string a sandbox sent arrives escaped but
 /// is still untrusted: show it, never act on it.
 public struct BrokerEvent: Codable, Hashable, Sendable, Identifiable {

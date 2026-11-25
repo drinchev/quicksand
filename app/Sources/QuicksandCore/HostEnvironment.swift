@@ -19,6 +19,15 @@ public enum HostEnvironment {
         return fallbackPath
     }
 
+    /// The first executable `tool` on `path`, or nil.
+    public static func find(_ tool: String, in path: String) -> String? {
+        for dir in path.split(separator: ":") where dir.hasPrefix("/") {
+            let candidate = "\(dir)/\(tool)"
+            if FileManager.default.isExecutableFile(atPath: candidate) { return candidate }
+        }
+        return nil
+    }
+
     /// The cached `loginShellPath()`, worked out on first use.
     public static let cachedLoginShellPath: String = loginShellPath()
 

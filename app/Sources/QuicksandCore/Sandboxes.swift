@@ -13,20 +13,18 @@ public struct SandboxStatus: Identifiable, Sendable, Equatable {
     public var processCount: Int { processes.count }
     /// Live session records in `_quicksand/sessions/`.
     public let sessionCount: Int
-    /// Brokers qs has set up for this sandbox (a rendered spec exists).
-    public let brokers: Set<BrokerKind>
+    /// `qs docker NAME` turned Docker on for this sandbox.
+    public let dockerEnabled: Bool
     /// Age of the staged GCP access token (they last about an hour).
     public let gcpTokenAge: TimeInterval?
     public let opTokenStaged: Bool
-    /// Brokers whose staged script predates the event log: their requests
-    /// won't show up until the sandbox is rebuilt (`qs build NAME`).
-    public let brokersWithoutEventLog: Set<BrokerKind>
-    /// Brokers still served by a per-sandbox LaunchAgent from a build before
-    /// the app; `qs build NAME` moves them over.
-    public let brokersOnLaunchAgents: Set<BrokerKind>
+    /// Files from before the brokers moved into the app (specs, staged bash
+    /// brokers, LaunchAgents). Docker set up that way isn't served until a
+    /// rebuild (`qs build NAME`) moves it to the marker.
+    public let oldBrokerFiles: [String]
 
-    /// Rebuilding would bring this sandbox's brokers up to date.
-    public var needsRebuild: Bool { !brokersWithoutEventLog.isEmpty || !brokersOnLaunchAgents.isEmpty }
+    /// Rebuilding would bring this sandbox's broker setup up to date.
+    public var needsRebuild: Bool { !oldBrokerFiles.isEmpty }
 
     public var isActive: Bool { !processes.isEmpty || sessionCount > 0 }
 }
@@ -63,7 +61,6 @@ public struct SandboxScanner: Sendable {
             .flatMap { $0[.modificationDate] as? Date }
             .map { now.timeIntervalSince($0) }
 
-        let brokers = Set(BrokerKind.allCases.filter { fm.fileExists(atPath: paths.spec($0, sandbox: name).path) })
         let programs = (uid.map(listProcesses) ?? [])
             .filter(ProcessTable.isActivity)
             .map { URL(fileURLWithPath: $0).lastPathComponent }
@@ -73,22 +70,11 @@ public struct SandboxScanner: Sendable {
             uid: uid,
             processes: programs.sorted(),
             sessionCount: liveSessions(in: priv.appendingPathComponent("sessions")),
-            brokers: brokers,
+            dockerEnabled: fm.fileExists(atPath: paths.dockerMarker(name).path),
             gcpTokenAge: gcpAge,
             opTokenStaged: fm.fileExists(atPath: priv.appendingPathComponent("op-token").path),
-            brokersWithoutEventLog: brokers.filter { !stagedBrokerLogsEvents($0, sandbox: name) },
-            brokersOnLaunchAgents: brokers.filter { paths.usesLaunchAgent($0, sandbox: name) }
+            oldBrokerFiles: paths.oldBrokerFiles(name).map(\.path).filter { fm.fileExists(atPath: $0) }
         )
-    }
-
-    /// The staged copy qs runs (`~/.config/quicksand/<kind>-broker-NAME.sh`)
-    /// carries the event-log block once the sandbox was rebuilt after the
-    /// brokers learned to log. A missing script counts as logging: there is
-    /// nothing to rebuild.
-    func stagedBrokerLogsEvents(_ kind: BrokerKind, sandbox: String) -> Bool {
-        let script = paths.installDir.appendingPathComponent("\(kind.rawValue)-broker-\(sandbox).sh")
-        guard let data = FileManager.default.contents(atPath: script.path) else { return true }
-        return data.range(of: Data("# --- event log:".utf8)) != nil
     }
 
     /// Session records are empty files named after a PID; a session that died

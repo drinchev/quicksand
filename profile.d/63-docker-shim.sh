@@ -1,6 +1,6 @@
 #!/bin/bash
 # Install the qs-docker client onto the sandbox PATH when this sandbox has
-# a host docker broker (see `qs docker` / config/qs-docker-broker). The
+# Docker on (see `qs docker`; Quicksand.app serves it on the host). The
 # client is staged into _quicksand/bin/ by `qs docker NAME`; absence means
 # the feature is off for this sandbox — do nothing.
 #

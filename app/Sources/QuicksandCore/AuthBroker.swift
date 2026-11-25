@@ -157,7 +157,7 @@ public final class AuthBroker: InProcessBroker, @unchecked Sendable {
         unlink(outPath)
         defer { close(outFD) }
 
-        var env = BrokerLauncher.baseEnvironment(eventTool: nil)
+        var env = BrokerLauncher.environment()
         env["PATH"] = hostPath()
         env["QS_SANDBOX_NAME"] = sandbox
         env["QS_PRIVATE_DIR"] = paths.privateDir(sandbox).path
@@ -170,26 +170,9 @@ public final class AuthBroker: InProcessBroker, @unchecked Sendable {
         posix_spawn_file_actions_addopen(&actions, 0, "/dev/null", O_RDONLY, 0)
         posix_spawn_file_actions_adddup2(&actions, outFD, 1)
         posix_spawn_file_actions_adddup2(&actions, outFD, 2)
-        var attr: posix_spawnattr_t?
-        posix_spawnattr_init(&attr)
-        defer { posix_spawnattr_destroy(&attr) }
-        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGDEF
-                                              | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETPGROUP))
-        posix_spawnattr_setpgroup(&attr, 0)
-        var all = sigset_t()
-        sigfillset(&all)
-        posix_spawnattr_setsigdefault(&attr, &all)
-        var none = sigset_t()
-        sigemptyset(&none)
-        posix_spawnattr_setsigmask(&attr, &none)
-
-        let args = [script.path, "refresh"]
-        let envList = env.map { "\($0.key)=\($0.value)" }.sorted()
-        var pid: pid_t = 0
-        let rc = withCStringArray(args) { argv in
-            withCStringArray(envList) { envp in posix_spawn(&pid, script.path, &actions, &attr, argv, envp) }
-        }
-        guard rc == 0 else { return (Data(), .notStarted) }
+        guard let pid = BrokerLauncher.spawn(script.path, [script.path, "refresh"], env: env,
+                                             actions: &actions, ownGroup: true)
+        else { return (Data(), .notStarted) }
 
         let outcome = Self.wait(pid, timeout: providerTimeout)
         var output = Data(count: Self.maxOutputBytes)

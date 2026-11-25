@@ -15,36 +15,15 @@ final class Fixture {
             usersDir: root.appendingPathComponent("Users"),
             sharedDir: root.appendingPathComponent("Shared"),
             installDir: root.appendingPathComponent("install"),
-            specDir: root.appendingPathComponent("agents"),
             socketDir: root.appendingPathComponent("sock")
         )
-        for dir in [paths.usersDir, paths.sharedDir, paths.installDir, paths.specDir] {
+        for dir in [paths.usersDir, paths.sharedDir, paths.installDir] {
             try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         }
         chmod(root.path, 0o755)
     }
 
     deinit { try? FileManager.default.removeItem(at: root) }
-
-    /// A broker script plus the plist that runs it, as qs would render them.
-    @discardableResult
-    func installBroker(_ kind: BrokerKind, sandbox: String, script: String,
-                       env: [String: String] = [:], label: String? = nil,
-                       args: [String]? = nil) throws -> URL {
-        let scriptURL = paths.installDir.appendingPathComponent("\(kind.rawValue)-broker-\(sandbox).sh")
-        try script.write(to: scriptURL, atomically: true, encoding: .utf8)
-        chmod(scriptURL.path, 0o755)
-        let plist: [String: Any] = [
-            "Label": label ?? kind.label(for: sandbox),
-            "ProgramArguments": args ?? ["/bin/bash", scriptURL.path, sandbox],
-            "EnvironmentVariables": env,
-        ]
-        let data = try PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0)
-        let url = paths.spec(kind, sandbox: sandbox)
-        try data.write(to: url)
-        chmod(url.path, 0o644)
-        return url
-    }
 }
 
 /// Maps uids to usernames from a table, so a test's own uid can play a

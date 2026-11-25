@@ -41,8 +41,6 @@ private func bashParse(_ args: [String], quicksandArgs: String? = nil) throws ->
         let line = stderr.split(separator: "\n").first { $0.hasPrefix("ERROR: ") }
         return "failure: " + (line.map { String($0.dropFirst(7)) } ?? "exit \(bash.terminationStatus): \(stderr)")
     }
-    if stdout.hasPrefix("qs version ") { return "version" }
-    if stdout.hasPrefix("quicksand ") { return "help" }
     return stdout
 }
 
@@ -69,7 +67,7 @@ private func describe(_ parse: QsParse) -> String {
     static let commandLines: [[String]] = [
         [], ["-r"], ["--help"], ["-h", "nosuch"], ["--version"], ["shell", "foo", "--version"],
         ["-q", "--version"], ["--version", "-q"], ["nosuch"], ["-rv"], ["-"],
-        ["list"], ["l"], ["list", "extra", "args"],
+        ["list"], ["l"], ["list", "extra", "args"], ["-v", "list"],
         ["shell", "foo"], ["s", "foo", "~/sub/dir"], ["claude", "work", "repo"], ["cl", "work"],
         ["claude", "work", "--", "-p", "a b", "", "--", "-x"], ["-x", "-r", "-n", "shell", "foo"],
         ["shell", "foo", "-x"], ["shell"], ["shell", ""], ["shell", "bad name"],
@@ -87,7 +85,20 @@ private func describe(_ parse: QsParse) -> String {
 
     @Test(arguments: commandLines)
     func parsesLikeQsBash(_ args: [String]) throws {
-        #expect(describe(QsCLI.parse(args)) == (try bashParse(args)))
+        let swift = QsCLI.parse(args), bash = try bashParse(args)
+        let answeredBySwift: Bool
+        switch swift {
+        case .help, .version: answeredBySwift = true
+        case .run(let a): answeredBySwift = a.command == .list
+        case .failure: answeredBySwift = false
+        }
+        if answeredBySwift {
+            // qs.bash no longer has these: the qs command answers them, and
+            // qs.bash refuses them when run directly.
+            #expect(bash.hasPrefix("failure: ") && bash.contains("is answered by the qs command"))
+        } else {
+            #expect(describe(swift) == bash)
+        }
     }
 
     @Test func quicksandArgsGoFirstAndKeepQuotedSpaces() throws {
@@ -106,23 +117,18 @@ private func describe(_ parse: QsParse) -> String {
         #expect(QsCLI.splitDefaults(#"-x  'a b' "c d" e\ f"#) == ["-x", "a b", "c d", "e f"])
     }
 
-    @Test func helpAndVersionMatchQsBash() throws {
-        let bash = { (arg: String) -> String in
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/bin/bash")
-            p.arguments = [repoRoot.appendingPathComponent("qs.bash").path, arg]
-            var env = ProcessInfo.processInfo.environment
-            env["QS_SESSION_ID"] = nil
-            p.environment = env
-            let out = Pipe()
-            p.standardOutput = out
-            try? p.run()
-            let s = String(decoding: out.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-            p.waitUntilExit()
-            return s
+    @Test func versionMatchesQsBash() throws {
+        // qs.bash's VERSION goes into every build's fingerprint.
+        let script = try String(contentsOf: repoRoot.appendingPathComponent("qs.bash"), encoding: .utf8)
+        #expect(script.contains("readonly VERSION=\"\(QsCLI.version)\"\n"))
+    }
+
+    @Test func helpCoversEveryCommandAndTheNameLimit() {
+        for command in QsArguments.Command.allCases {
+            #expect(QsCLI.helpText.contains("  qs \(command.rawValue)"), "help is missing \(command.rawValue)")
         }
-        #expect(QsCLI.helpText + "\n" == bash("--help"))
-        #expect("qs version \(QsCLI.version)\n" == bash("--version"))
+        #expect(QsCLI.helpText.hasPrefix("quicksand \(QsCLI.version) — "))
+        #expect(QsCLI.helpText.contains("Up to \(QsCLI.sandboxNameMaxLength) chars"))
     }
 }
 

@@ -62,7 +62,8 @@ public enum QsParse: Equatable, Sendable {
 }
 
 public enum QsCLI {
-    /// Must match VERSION in qs.bash (a test compares `--version`).
+    /// Must match VERSION in qs.bash, which goes into every build's
+    /// fingerprint (a test compares them).
     public static let version = "0.1.0"
     public static let sandboxNameMaxLength = 16
 

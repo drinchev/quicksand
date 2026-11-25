@@ -1,8 +1,8 @@
 import Foundation
 
 extension QsCLI {
-    /// `qs --help`. Must match show_help in qs.bash while both exist (a test
-    /// compares them).
+    /// `qs --help` (it replaced show_help in qs.bash). Update it when a
+    /// command or option changes.
     public static let helpText = #"""
     quicksand \#(version) — a macOS user-account sandbox.
 

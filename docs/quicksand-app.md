@@ -241,10 +241,11 @@ Step 2 (done): Swift parses every command line (`QsCLI.parse`, mirroring
 with the same zsh call) and refuses bad ones with qs.bash's own messages. It
 answers `--help`, `--version` and `list` itself (`SandboxList`, sorted by the
 locale's collation as bash sorts a glob) and hands everything else to
-`qs.bash` with the original arguments. While both exist, a Swift test runs
-qs.bash's `parse_args` on a table of command lines and requires the same
-result, and bats compares `--help`, `--version`, `list` and the error
-messages end to end.
+`qs.bash` with the original arguments. qs.bash no longer has `--help`,
+`--version` or `list`: run directly, it refuses them and points at `qs`.
+It keeps `parse_args`, because the commands still in bash need the values it
+sets; a Swift test runs it on a table of command lines and requires the same
+result as `QsCLI.parse`, and bats compares the error messages end to end.
 
 Next: commands move over one by one (`docker`, the credential commands,
 `clone`/`memory`/`ssh-auth`, `uninstall`, `build`, `shell`/`claude`), and

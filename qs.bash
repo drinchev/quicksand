@@ -4,10 +4,11 @@
 # under sandbox-exec with read/write restricted to its home and a shared
 # workspace.
 #
-# Users run the Swift `qs` (app/Sources/qs), which parses the command line,
-# answers --help, --version and list, and otherwise replaces itself with
-# `/bin/bash qs.bash ARGS...`; commands move from this script into Swift one
-# at a time. Running this file directly still works.
+# Users run the Swift `qs` (app/Sources/qs). It parses the command line,
+# answers --help, --version and list itself (this script no longer has
+# them), and replaces itself with `/bin/bash qs.bash ARGS...` for the rest.
+# Commands move from this script into Swift one at a time; until then,
+# running this file directly still works for every other command.
 #
 # Structure: prelude (runs at load) → helpers → parse_args →
 # derive_constants → shared helpers → cmd_* functions → main (at bottom).
@@ -159,140 +160,18 @@ validate_sandbox_name() {
         || abort "sandbox name must be ${SANDBOX_NAME_MAX_LEN} characters or fewer (got ${#name})"
 }
 
-# show_version, show_help, parse_args and cmd_list have Swift twins that the
-# qs command uses (app/Sources/QuicksandCore: QsCLI, SandboxList); tests fail
-# when the two differ, so change both together.
-show_version() { echo "qs version $VERSION"; exit 0; }
-
-show_help() {
-    cat <<EOF
-quicksand $VERSION — a macOS user-account sandbox.
-
-Usage:
-  qs build     NAME [-r]
-  qs shell     NAME [PATH] [-- args ...]
-  qs claude    NAME [PATH] [-- args ...]
-  qs clone     NAME URL_OR_PATH
-  qs gh-auth   NAME [OWNER/REPO]
-  qs memory    NAME OWNER/REPO
-  qs gcp-auth  NAME PROJECT [PROJECT ...]
-  qs gcp-token NAME
-  qs op-auth   NAME [--write]
-  qs docker    NAME [off]
-  qs ssh-auth  NAME [KEY.pub | off]
-  qs uninstall NAME
-  qs list
-
-NAME is required for everything except 'list'.
-Up to ${SANDBOX_NAME_MAX_LEN} chars, [A-Za-z0-9_-].
-
-PATH is where the session starts, inside the sandbox: relative paths
-(and ~/...) are resolved against the sandbox home, so 'qs claude NAME
-repo' starts in ~/repo — where 'qs clone' links each repo. Absolute
-paths are used as-is; omitted, the session starts in the sandbox home.
-
-'gh-auth' sets up a repository-scoped GitHub token so 'gh' works inside
-the sandbox (open PRs and comments, read commits, branches and CI). It
-opens a prefilled fine-grained PAT creation page and stores the token you
-paste back; git push/pull keeps using the deploy key. 'clone' offers this
-automatically. OWNER/REPO may be omitted when the sandbox has one clone.
-
-'memory' attaches a shared memory repo: a private GitHub repo of markdown
-notes cloned to the shared workspace with its own read-write deploy key,
-indexed by qmd inside the sandbox. Agents share knowledge across sandboxes
-by pushing a semantic branch (feat/..., fix/..., chore/..., docs/...) and
-opening a PR for you to merge — nothing propagates without your review,
-and commits are authored 'qs-NAME' so history shows which sandbox wrote
-what. Different sandboxes may attach
-different memory repos. For agents to open PRs, the sandbox's gh token
-must also select the memory repo (fine-grained PATs can cover several
-repositories — pick both when creating it, or edit its repository access).
-
-'gcp-auth' provisions a per-sandbox Google Cloud service account so
-'gcloud'/'gsutil' work inside the sandbox. PROJECT is the project to grant read
-access on; pass several to span e.g. the sandbox's own project and a separate
-shared Artifact Registry project. The service account's own (owner) project is
-prompted, defaulting to your active gcloud project. It creates the SA 'qs-NAME',
-grants roles/viewer + roles/artifactregistry.reader on each PROJECT (override
-with QS_GCP_ROLES), lets your host impersonate the SA, mints a short-lived
-access token into the sandbox, and pins the first PROJECT as the default.
-'uninstall' unbinds the roles and deletes the SA. Downloadable keys are
-intentionally not used (orgs commonly disable them); the token lasts ~1h, so
-'gcp-token' re-mints one without redoing the SA/role setup.
-
-'docker' lets the sandbox run containers on the host Docker engine (OrbStack,
-Docker Desktop) WITHOUT seeing the Docker socket — raw socket access would be
-host-user-equivalent (bind-mount any host path). Instead a host-side broker,
-loaded as a socket-activated LaunchAgent and staged where the sandbox can't
-edit it, accepts a constrained JSON request over a workspace socket and
-composes every docker invocation from a fixed hardened template: mounts are
-limited to the shared workspace, capabilities dropped, resources capped, and
-everything is labeled per sandbox so 'uninstall' can reap it. Inside the
-sandbox the 'qs-docker' client offers run/build/pull/ps/logs/stop; built
-image tags are forced under 'qs-NAME/'. 'qs docker NAME off' disables it.
-
-'ssh-auth' lets you SSH into the sandbox as its user ('ssh qs-NAME@host'),
-e.g. to use it as a remote environment for Claude Code. KEY.pub is a public
-key file (or a quoted 'ssh-ed25519 AAAA...' line) to authorize; each run adds
-one, and with none given the first run authorizes your own ~/.ssh/id_*.pub.
-Every SSH session — login shell, 'ssh host cmd', scp, sftp — is forced through
-a root-owned wrapper that enters the same sandbox-exec profile, environment
-and profile.d hooks as 'qs shell'. Authorized keys live in a root-owned file,
-so nothing inside the sandbox can grant itself access or shed the sandbox.
-Requires Remote Login to be on (System Settings > General > Sharing); qs does
-not switch it on for you. Credentials the host stages at launch (1Password
-token, GCP token) are fetched for SSH logins through a host-side broker, which
-needs you logged in to the Mac's desktop. 'qs ssh-auth NAME off'
-revokes all keys and removes the sshd configuration. A sandbox without
-'ssh-auth' accepts no SSH login at all: every build installs one sshd rule
-for all qs-* users that ignores their own ~/.ssh/authorized_keys.
-
-'op-auth' sets up per-sandbox app-secret access via 1Password. Using your own
-host 1Password (so it must be signed in), it creates a vault 'qs-NAME', a
-service account scoped to just that vault (read-only; '--write' also grants
-write), and stores the service-account token in that vault. On every launch the
-host reads the token from 1Password into a transient file the session exports as
-OP_SERVICE_ACCOUNT_TOKEN, so the sandbox fetches secrets on demand with
-'op read'/'op run' — they are never written to the sandbox disk, and the token
-never persists between sessions. 'uninstall' prints a reminder to revoke the
-token (1Password has no CLI revoke) and leaves the vault intact.
-
-Options:
-  -r, --rebuild        Rebuild configuration and file permissions/ACLs.
-  -n, --no-build       Refuse to make sandbox changes; error if any are needed.
-  -x, --no-sandbox     Disable sandbox-exec restrictions (still switches users).
-  --write              (qs op-auth) grant the service account write access too.
-  -v, --verbose        More output (-vv, -vvv for even more).
-  --version            Show version.
-  -h, --help           Show this help.
-
-Arguments after -- are passed to the spawned shell.
-
-Environment:
-  QUICKSAND_ARGS       Default arguments, prepended to the command line.
-
-Customization:
-  ~/.config/quicksand/custom/<subsystem>/
-                       Host-side personal additions, grouped by subsystem.
-                       Synced into the sandbox at build time. Recognised
-                       subdirs:
-                         profile.d/   .sh scripts run after the canonical
-                                      profile.d/ on every session entry
-                                      (use 50-99 prefixes to continue from
-                                      the 10-49 canonical range)
-                         logout.d/    .sh scripts run after the canonical
-                                      logout.d/ when the session ends
-                         oh-my-zsh/   themes/, plugins/, etc. copied into
-                                      the sandbox's ~/.oh-my-zsh/custom/
-                                      after install
-EOF
-    exit 0
+# --help, --version and `list` are answered by the Swift qs command
+# (app/Sources/qs), which never passes them to this script.
+answered_by_qs() {
+    abort "'${1:---help}' is answered by the qs command (Quicksand.app), not qs.bash — run: qs ${1:---help}"
 }
 
 
 ###############################################################################
 # Argument parsing — sets COMMAND, SANDBOX_NAME, CLONE_SOURCE, INITIAL_DIR,
-# COMMAND_ARGS and the option flags as globals.
+# COMMAND_ARGS and the option flags as globals. The Swift qs parses the same
+# command line first (QsCLI.parse in app/Sources/QuicksandCore) and passes it
+# here unchanged; a test requires both to agree, so change both together.
 ###############################################################################
 REBUILD=false
 NO_BUILD=false
@@ -334,8 +213,7 @@ parse_args() {
             -v|--verbose)    ((QS_VERBOSE++)) || true; shift ;;
             -vv)             ((QS_VERBOSE+=2)) || true; shift ;;
             -vvv)            ((QS_VERBOSE+=3)) || true; shift ;;
-            --version) show_version ;;
-            -h|--help) show_help ;;
+            --version|-h|--help) answered_by_qs "$1" ;;
             -*) abort "Unknown option: $1" ;;
             *)  new_args+=("$1"); shift ;;
         esac
@@ -343,11 +221,11 @@ parse_args() {
     if (( ${#new_args[@]} > 0 )); then set -- "${new_args[@]}"; else set --; fi
 
     # Form: qs COMMAND [NAME [PATH]]
-    [[ $# -ge 1 ]] || show_help
+    [[ $# -ge 1 ]] || answered_by_qs
 
     local needs_name=false
     case "$1" in
-        l|list)      COMMAND=list ;;
+        l|list)      answered_by_qs list ;;
         s|shell)     COMMAND=shell;  needs_name=true ;;
         cl|claude)   COMMAND=claude; needs_name=true ;;
         c|clone)     COMMAND=clone;  needs_name=true ;;
@@ -1464,55 +1342,6 @@ EOF
 ###############################################################################
 # Commands
 ###############################################################################
-# Print the OWNER/REPO recorded for ENTRY_NAME in MANIFEST (clone and
-# memory manifests share the NAME\tOWNER/REPO\tLOCAL format), or nothing
-# if the manifest or entry is missing / the clone wasn't from GitHub.
-manifest_owner_repo() {
-    local manifest="$1" entry_name="$2" line rest
-    [[ -f "$manifest" ]] || return 0
-    while IFS= read -r line; do
-        [[ "$line" == "$entry_name"$'\t'* ]] || continue
-        rest="${line#*$'\t'}"
-        printf '%s' "${rest%%$'\t'*}"
-        return 0
-    done < "$manifest"
-}
-
-cmd_list() {
-    echo "Sandboxes:"
-    # The roots are fixed on macOS; the QS_LIST_* overrides exist only so
-    # the tests can point cmd_list at a fixture tree.
-    local homes="${QS_LIST_HOMES_DIR:-/Users}"
-    local shared="${QS_LIST_SHARED_DIR:-/Users/Shared}"
-    local install_dir="$HOME/.config/quicksand"
-    local home name found=false repo repo_name owner_repo
-    shopt -s nullglob
-    for home in "$homes"/qs-*/; do
-        name="${home#"$homes"/qs-}"
-        name="${name%/}"
-        printf "  %s\n" "$name"
-        found=true
-        # Clones live in the shared workspace (they survive rebuilds);
-        # the host-side manifest adds the GitHub OWNER/REPO when known.
-        for repo in "$shared/qs-$name/repos"/*/; do
-            repo_name="$(basename "$repo")"
-            owner_repo="$(manifest_owner_repo "$install_dir/clones-$name" "$repo_name")"
-            printf "    %s%s\n" "$repo_name" "${owner_repo:+ ($owner_repo)}"
-        done
-        if [[ -d "$shared/qs-$name/memory/.git" ]]; then
-            # The memory manifest holds exactly one entry (see cmd_memory);
-            # its second field is the OWNER/REPO.
-            owner_repo=""
-            if [[ -f "$install_dir/memory-$name" ]]; then
-                IFS=$'\t' read -r _ owner_repo _ < "$install_dir/memory-$name" || true
-            fi
-            printf "    memory%s\n" "${owner_repo:+ ($owner_repo)}"
-        fi
-    done
-    shopt -u nullglob
-    [[ "$found" == "true" ]] || echo "  (none — run 'qs build <NAME>')"
-}
-
 cmd_uninstall() {
     info "Uninstalling sandbox '$SANDBOX_NAME'..."
 
@@ -1937,12 +1766,6 @@ cmd_launch() {
 ###############################################################################
 main() {
     parse_args "$@"
-
-    if [[ "$COMMAND" == "list" ]]; then
-        cmd_list
-        exit 0
-    fi
-
     derive_constants
 
     case "$COMMAND" in

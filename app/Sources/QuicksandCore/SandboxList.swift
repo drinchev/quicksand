@@ -2,7 +2,7 @@ import Darwin
 import Foundation
 
 /// `qs list`: every sandbox with the repos cloned into it and its memory
-/// repo. Same output as cmd_list in qs.bash.
+/// repo. (It replaced cmd_list in qs.bash; the output is unchanged.)
 public enum SandboxList {
     /// `homes` holds the sandbox users' homes (qs-NAME/), `shared` their
     /// workspaces, `installDir` qs's host-side manifests. `order` sorts the

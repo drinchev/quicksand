@@ -75,9 +75,10 @@ checkout's `qs.bash` directly; `--help` lists the rest. The app's menu also has
 
 `qs` is moving from bash to Swift one command at a time. Today the Swift `qs`
 parses the command line and answers `--help`, `--version` and `list` itself,
-and hands every other command to the bash script, `qs.bash`, unchanged; you can still
-run `/path/to/quicksand/qs.bash` directly (e.g. from a checkout while
-developing). Earlier installs that put the checkout on `PATH` or aliased
+and hands every other command to the bash script, `qs.bash`, unchanged. You can
+still run `/path/to/quicksand/qs.bash` directly for those other commands (e.g.
+from a checkout while developing); `--help`, `--version` and `list` exist only
+in `qs`. Earlier installs that put the checkout on `PATH` or aliased
 `/path/to/quicksand/qs` need to switch to one of the two.
 
 Requires macOS and admin rights (builds use `sudo` to create the sandbox

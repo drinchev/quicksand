@@ -1557,6 +1557,33 @@ lib_run() {
     [ "$output" == "$BATS_TEST_TMPDIR/Library/pnpm/bin/pnpm" ]
 }
 
+@test "qs_try_lock excludes a second holder and releases at exit" {
+    local lock="$BATS_TEST_TMPDIR/.cache/quicksand/locks/t.lock"
+    # A live holder (this test's shell) blocks the lock.
+    mkdir -p "${lock%/*}"
+    ln -s "$$" "$lock"
+    lib_run 'HOME="$BATS_TEST_TMPDIR"; qs_try_lock t'
+    [ "$status" -eq 1 ]
+    [ "$(readlink "$lock")" == "$$" ]
+    rm -f "$lock"
+    # Free lock: taken, then released when the holder exits.
+    lib_run 'HOME="$BATS_TEST_TMPDIR"; qs_try_lock t && readlink "$HOME/.cache/quicksand/locks/t.lock"'
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ ^[0-9]+$ ]]
+    [ ! -L "$lock" ]
+}
+
+@test "qs_try_lock takes over a lock left by a dead process" {
+    local lock="$BATS_TEST_TMPDIR/.cache/quicksand/locks/t.lock"
+    mkdir -p "${lock%/*}"
+    bash -c 'exit 0' & local dead=$!; wait "$dead"
+    ln -s "$dead" "$lock"
+    lib_run 'HOME="$BATS_TEST_TMPDIR"; qs_try_lock t && echo got'
+    [ "$status" -eq 0 ]
+    [ "$output" == "got" ]
+    [ ! -L "$lock" ]
+}
+
 @test "ensure_collection tolerates already-exists and propagates real errors" {
     make_stub qmd 'case "$*" in
         *dup*)  echo "collection already exists"; exit 1 ;;

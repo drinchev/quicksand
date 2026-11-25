@@ -36,6 +36,30 @@ find_pnpm() {
     return 1
 }
 
+# Take a per-user, cross-session lock named $1, released when the calling
+# script exits (this sets its EXIT trap). Returns 1 without waiting if a live
+# process already holds it. Every login runs the profile.d hooks, so without
+# this, sessions opened while a slow install is still running each start
+# their own copy (the desktop app opens two shells per SSH connection and
+# reconnects when a session is slow to come up), all downloading into the
+# same file.
+#
+# The lock is a symlink whose target is the holder's PID: creating it is
+# atomic and records the owner in one step. A lock left by a process that
+# died without its EXIT trap (SIGKILL) is detected by PID and taken over.
+qs_try_lock() {
+    local lock="$HOME/.cache/quicksand/locks/$1.lock" pid
+    mkdir -p "${lock%/*}"
+    if ! ln -s "$$" "$lock" 2>/dev/null; then
+        pid="$(readlink "$lock" 2>/dev/null || true)"
+        [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null && return 1
+        rm -f "$lock"
+        ln -s "$$" "$lock" 2>/dev/null || return 1
+    fi
+    # shellcheck disable=SC2064 # expand $lock now, not at exit
+    trap "rm -f '$lock'" EXIT
+}
+
 # Register a qmd collection, tolerating re-runs after a partial failure: a
 # collection that already exists is success, anything else is a real error
 # (reported, retried next session). The caller sets $QMD to the qmd binary.

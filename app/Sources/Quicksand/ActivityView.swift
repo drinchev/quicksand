@@ -148,7 +148,7 @@ struct ActivityView: View {
 
     private func outcome(_ c: BrokerConnection) -> String {
         switch c.outcome {
-        case .running(let pid): return "running (pid \(pid))"
+        case .running(let pid): return pid.map { "running (pid \($0))" } ?? "running in the app"
         case .finished(_, let status):
             // Raw wait status: exit code in the high byte, signal in the low bits.
             if status & 0x7f == 0 { return "exited \((status >> 8) & 0xff)" }

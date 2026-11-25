@@ -81,7 +81,10 @@ final class AppModel: ObservableObject {
         listenerError = nil
         var started: [BrokerListener] = []
         for kind in BrokerKind.allCases {
-            let listener = BrokerListener(kind: kind, paths: paths) { [weak self] conn in
+            // Speech runs inside the app; the other brokers are still bash
+            // scripts started from each sandbox's spec.
+            let listener = BrokerListener(kind: kind, paths: paths,
+                                          inProcess: kind == .say ? SayBroker(paths: paths) : nil) { [weak self] conn in
                 Task { @MainActor in self?.record(conn) }
             }
             do {

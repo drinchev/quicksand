@@ -42,8 +42,13 @@ public struct QuicksandPaths: Sendable {
         )
     }
 
-    /// One JSON line per broker request (written by the bash brokers).
+    /// One JSON line per broker request (written by the brokers).
     public var eventsLog: URL { installDir.appendingPathComponent("events.jsonl") }
+
+    /// Written by every `qs build NAME`: the sandbox is set up.
+    public func installMarker(_ sandbox: String) -> URL {
+        installDir.appendingPathComponent("install-\(sandbox)")
+    }
 
     public func workspace(_ sandbox: String) -> URL {
         sharedDir.appendingPathComponent("qs-\(sandbox)")

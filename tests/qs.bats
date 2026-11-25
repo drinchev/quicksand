@@ -305,10 +305,10 @@ qs_run() {
     [ "$output" != "$before" ]
 }
 
-@test "config_fingerprint changes when the speech broker changes" {
+@test "config_fingerprint changes when the speech client changes" {
     qs_run 'QS_CUSTOM_DIR=/nonexistent; config_fingerprint'
     local before="$output"
-    echo "# tweak" >> "$REPO_COPY/config/qs-say-broker"
+    echo "# tweak" >> "$REPO_COPY/config/qs-say"
     qs_run 'QS_CUSTOM_DIR=/nonexistent; config_fingerprint'
     [ "$output" != "$before" ]
 }
@@ -1414,22 +1414,25 @@ broker() {
             QS_DOCKER_LEGACY_PLIST="$WORK/LaunchAgents/docker.plist"
             QS_DOCKER_BROKER_STAGED="$WORK/install/docker-broker-work.sh"
             QS_SAY_LABEL=com.quicksand.say-broker.work
-            QS_SAY_PLIST="$WORK/install/brokers/say.plist"
+            QS_SAY_OLD_SPEC="$WORK/install/brokers/say.plist"
             QS_SAY_LEGACY_PLIST="$WORK/LaunchAgents/say.plist"
-            QS_SAY_BROKER_STAGED="$WORK/install/say-broker-work.sh"
+            QS_SAY_OLD_BROKER="$WORK/install/say-broker-work.sh"
             QS_AUTH_LABEL=com.quicksand.auth-broker.work
             QS_AUTH_PLIST="$WORK/install/brokers/auth.plist"
             QS_AUTH_LEGACY_PLIST="$WORK/LaunchAgents/auth.plist"
             QS_AUTH_BROKER_STAGED="$WORK/install/auth-broker-work.sh"
             docker_broker_install /host/bin/docker /host/bin/jq
-            say_broker_install
+            say_client_install
             auth_broker_install'
     [ "$status" -eq 0 ]
     for kind in docker say auth; do
         grep -q "launchctl bootout gui/$(id -u)/com.quicksand.$kind-broker.work" "$STUB_LOG"
         [ ! -e "$WORK/LaunchAgents/$kind.plist" ]
-        [ -f "$WORK/install/brokers/$kind.plist" ]
     done
+    [ -f "$WORK/install/brokers/docker.plist" ]
+    [ -f "$WORK/install/brokers/auth.plist" ]
+    # Speech runs inside the app: no spec.
+    [ ! -e "$WORK/install/brokers/say.plist" ]
     [ -z "$(ls -A "$WORK/LaunchAgents")" ]
     run find "$WORK/ws/_quicksand" -name '*.sock'
     [ -z "$output" ]
@@ -1666,53 +1669,9 @@ make_ls_prefs() {
 
 
 ###############################################################################
-# Speech: config/qs-say-broker, config/qs-say, profile.d/31-claude-say.sh,
-# say_broker_install / cleanup_say
+# Speech: config/qs-say, profile.d/31-claude-say.sh, say_client_install /
+# cleanup_say. The broker is in the app (SayBroker, tested in Swift).
 ###############################################################################
-
-# Run the broker as launchd would (request on stdin, socket = stdout) with
-# a stub `say` that records what it was given on stdin. HOME/lock/log are
-# pointed under the test tmpdir.
-say_broker() {
-    make_stub say 'printf "SAY:%s\n" "$(cat)" >> "$STUB_LOG"'
-    run bash -c "PATH=\"$STUBS:/usr/bin:/bin\" HOME=\"$BATS_TEST_TMPDIR\" \
-        QS_SAY_LOCK=\"$BATS_TEST_TMPDIR/lock\" QS_SAY_LOG=\"$BATS_TEST_TMPDIR/broker.log\" \
-        bash \"$REPO_COPY/config/qs-say-broker\" work <<< \"\$1\"" _ "$1"
-}
-
-@test "say broker speaks the line it was sent, via stdin, and logs it" {
-    say_broker "quicksand is waiting for your input"
-    [ "$status" -eq 0 ]
-    [ -z "$output" ]                                  # nothing goes back to the client
-    grep -qx "SAY:quicksand is waiting for your input" "$STUB_LOG"
-    grep -q "quicksand is waiting for your input" "$BATS_TEST_TMPDIR/broker.log"
-    [ ! -d "$BATS_TEST_TMPDIR/lock" ]                 # lock released
-}
-
-@test "say broker strips control characters and caps the length" {
-    say_broker "$(printf 'hi\033]0;pwned\007 there\t!')"
-    [ "$status" -eq 0 ]
-    grep -qx "SAY:hi]0;pwned there!" "$STUB_LOG"
-    say_broker "$(printf 'x%.0s' $(seq 1 400))"
-    [ "$status" -eq 0 ]
-    # BSD grep caps {n} at 255, so measure the spoken line instead.
-    [ "$(awk '/^SAY:x+$/ { print length($0) - 4 }' "$STUB_LOG")" == "300" ]
-}
-
-@test "say broker ignores an empty or whitespace-only message" {
-    say_broker "   "
-    [ "$status" -eq 0 ]
-    [ ! -e "$STUB_LOG" ] || ! grep -q "^SAY:" "$STUB_LOG"
-}
-
-@test "say broker only ever gives say a single argv-free line" {
-    make_stub say 'printf "ARGS:%d\n" "$#" >> "$STUB_LOG"; cat >/dev/null'
-    run bash -c "PATH=\"$STUBS:/usr/bin:/bin\" HOME=\"$BATS_TEST_TMPDIR\" \
-        QS_SAY_LOCK=\"$BATS_TEST_TMPDIR/lock\" QS_SAY_LOG=\"$BATS_TEST_TMPDIR/broker.log\" \
-        bash \"$REPO_COPY/config/qs-say-broker\" work <<< '-v Zarvox --rm -rf'"
-    [ "$status" -eq 0 ]
-    grep -qx "ARGS:0" "$STUB_LOG"
-}
 
 @test "qs-say says the app isn't running when there is no socket" {
     run env QS_SAY_SOCK="$BATS_TEST_TMPDIR/none.sock" "$REPO_COPY/config/qs-say" hello
@@ -1998,35 +1957,38 @@ JSON
     [ -x "$FAKE_HOME/.local/bin/qs-say" ]
 }
 
-@test "say_broker_install stages and renders the app's spec" {
+@test "say_client_install stages the client and removes the old bash broker" {
     make_stub launchctl 'echo "launchctl $*" >> "$STUB_LOG"'
     export WORK="$BATS_TEST_TMPDIR/work"
-    mkdir -p "$WORK"
+    mkdir -p "$WORK/install/brokers" "$WORK/LaunchAgents" "$WORK/ws/_quicksand"
+    # What a build with the bash speech broker left: its spec, staged
+    # script and log, plus a LaunchAgent and socket from before the app.
+    touch "$WORK/install/brokers/spec.plist" "$WORK/install/say-broker-work.sh" \
+          "$WORK/install/say-broker-work.log" "$WORK/LaunchAgents/agent.plist" \
+          "$WORK/ws/_quicksand/say.sock"
     qs_run 'PATH="$STUBS:$PATH"; SANDBOX_NAME=work
             SHARED_WORKSPACE="$WORK/ws"; QS_PRIVATE_DIR="$WORK/ws/_quicksand"
             INSTALL_DIR="$WORK/install"
             QS_SAY_LABEL=com.quicksand.say-broker.work
-            QS_SAY_PLIST="$WORK/install/brokers/spec.plist"
+            QS_SAY_OLD_SPEC="$WORK/install/brokers/spec.plist"
             QS_SAY_LEGACY_PLIST="$WORK/LaunchAgents/agent.plist"
-            QS_SAY_BROKER_STAGED="$WORK/install/say-broker-work.sh"
+            QS_SAY_OLD_BROKER="$WORK/install/say-broker-work.sh"
             HOME="$WORK"
-            say_broker_install'
+            say_client_install'
     [ "$status" -eq 0 ]
-    spec="$WORK/install/brokers/spec.plist"
-    [ -x "$WORK/install/say-broker-work.sh" ]
-    cmp "$REPO_COPY/config/qs-say-broker" "$WORK/install/say-broker-work.sh"
     [ -x "$WORK/ws/_quicksand/bin/qs-say" ]
-    grep -q "<string>com.quicksand.say-broker.work</string>" "$spec"
-    grep -q "<string>$WORK/install/say-broker-work.sh</string>" "$spec"
-    grep -q "<string>work</string>" "$spec"
-    plutil -lint "$spec"
-    run grep -E "Sockets|inetd" "$spec"
-    [ "$status" -ne 0 ]
-    run grep -q launchctl "$STUB_LOG"
+    cmp "$REPO_COPY/config/qs-say" "$WORK/ws/_quicksand/bin/qs-say"
+    [ ! -e "$WORK/install/brokers/spec.plist" ]
+    [ ! -e "$WORK/install/say-broker-work.sh" ]
+    [ ! -e "$WORK/install/say-broker-work.log" ]
+    [ ! -e "$WORK/LaunchAgents/agent.plist" ]
+    [ ! -e "$WORK/ws/_quicksand/say.sock" ]
+    grep -q "launchctl bootout gui/$(id -u)/com.quicksand.say-broker.work" "$STUB_LOG"
+    run grep -q "launchctl bootstrap" "$STUB_LOG"
     [ "$status" -ne 0 ]
 }
 
-@test "cleanup_say removes the spec, any old agent, and everything it staged" {
+@test "cleanup_say removes the client and anything the old broker left" {
     make_stub launchctl 'echo "launchctl $*" >> "$STUB_LOG"'
     export WORK="$BATS_TEST_TMPDIR/work"
     mkdir -p "$WORK/install" "$WORK/ws/_quicksand/bin"
@@ -2036,9 +1998,9 @@ JSON
             QS_PRIVATE_DIR="$WORK/ws/_quicksand"
             INSTALL_DIR="$WORK/install"
             QS_SAY_LABEL=com.quicksand.say-broker.work
-            QS_SAY_PLIST="$WORK/spec.plist"
+            QS_SAY_OLD_SPEC="$WORK/spec.plist"
             QS_SAY_LEGACY_PLIST="$WORK/agent.plist"
-            QS_SAY_BROKER_STAGED="$WORK/install/say-broker-work.sh"
+            QS_SAY_OLD_BROKER="$WORK/install/say-broker-work.sh"
             cleanup_say'
     [ "$status" -eq 0 ]
     grep -q "launchctl bootout gui/$(id -u)/com.quicksand.say-broker.work" "$STUB_LOG"
@@ -2882,9 +2844,9 @@ need_qs_swift() {
     [ ! -e "$BATS_TEST_TMPDIR/e.jsonl" ]
 }
 
-@test "event log block is identical in all three brokers" {
+@test "event log block is identical in both bash brokers" {
     local b first=""
-    for b in docker auth say; do
+    for b in docker auth; do
         sed -n '/^# --- event log:/,/^# --- end event log/p' \
             "$REPO_COPY/config/qs-$b-broker" > "$BATS_TEST_TMPDIR/block-$b"
         [ -s "$BATS_TEST_TMPDIR/block-$b" ]
@@ -2993,15 +2955,6 @@ need_qs_swift() {
     run_auth_broker refresh
     wait
     [ "$(last_event result "$WORK/install/events.jsonl")" == "shared" ]
-}
-
-@test "say broker logs what it spoke, stripped of bytes that aren't valid JSON text" {
-    need_qs_event
-    command -v jq >/dev/null 2>&1 || skip "jq not available"
-    say_broker $'hi \xff "there" \\ \x07done'
-    [ "$(last_event broker)" == "say" ]
-    [ "$(last_event result)" == "ok" ]
-    [ "$(last_event target)" == 'hi  "there" \ done' ]
 }
 
 @test "qs-docker says so when nothing answers on the socket" {

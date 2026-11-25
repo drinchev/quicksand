@@ -528,13 +528,13 @@ only when the last one exits.
 `app/` holds a status-bar app that runs the host-side brokers — Docker,
 credential refresh and speech — for every sandbox, like Docker Desktop runs
 its engine. It listens on three sockets in `/Users/Shared/quicksand/`, tells
-sandboxes apart by the uid of the connecting process, and starts the
-sandbox's bash broker for each request from the spec qs renders under
-`~/.config/quicksand/brokers/`. It also shows every sandbox (active or idle,
+sandboxes apart by the uid of the connecting process, and serves speech
+itself; for Docker and credentials it starts the sandbox's bash broker for
+each request from the spec qs renders under `~/.config/quicksand/brokers/`
+(those move into the app next). It also shows every sandbox (active or idle,
 sessions, Docker, token ages) and every broker request from
 `~/.config/quicksand/events.jsonl`. It posts a notification whenever anyone
-connects to a broker (who, and which broker; the app never reads the request
-itself), or with "Notify: Problems" only for refused and failed requests.
+connects to a broker (who, and which broker — not what was asked), or with "Notify: Problems" only for refused and failed requests.
 
 **Keep it running.** Without it, `qs-docker`, `qs-auth-refresh` and `qs-say`
 fail with "Quicksand.app isn't running on the host". Turn on "Open at login"
@@ -563,11 +563,12 @@ domain instead, the agent never appears there — not even when root asks —
 and `say` exits 0 having synthesized nothing (`say -o` writes a header with
 zero audio bytes). Notification Center has the same gap.
 
-So quicksand speaks from the host. Every build stages `config/qs-say-broker`
-under `~/.config/quicksand/`, and [Quicksand.app](#quicksandapp), running in
-*your* GUI session, the one place speech works, starts one short-lived broker
-per message on `/Users/Shared/quicksand/say.sock`, so nothing runs while
-idle. Inside the
+So quicksand speaks from the host. [Quicksand.app](#quicksandapp), running in
+*your* GUI session, the one place speech works, listens on
+`/Users/Shared/quicksand/say.sock` and speaks for every built sandbox itself:
+it reads one line, hangs up, drops control characters, caps the text at 300
+bytes and pipes it to `say` on stdin. Messages from all sandboxes queue, so
+they never talk over each other. Inside the
 sandbox, `profile.d/31-claude-say.sh` installs the `qs-say` client on the
 PATH and, once per sandbox, seeds two Claude Code `Notification` hooks into
 the sandbox's `~/.claude/settings.json`:
@@ -718,7 +719,7 @@ existing sandboxes automatically on next entry.
 | sshd `Match` block (`qs ssh-auth`) | `/etc/ssh/sshd_config.d/010-quicksand-qs-NAME.conf` |
 | sshd default rule for all sandboxes | `/etc/ssh/sshd_config.d/020-quicksand-default.conf` |
 | Broker sockets (Quicksand.app, all sandboxes) | `/Users/Shared/quicksand/docker.sock`, `auth.sock`, `say.sock` |
-| Broker specs | `~/.config/quicksand/brokers/com.quicksand.{docker,auth,say}-broker.NAME.plist` |
+| Broker specs | `~/.config/quicksand/brokers/com.quicksand.{docker,auth}-broker.NAME.plist` (speech needs none: it runs inside the app) |
 | Install marker, clone & GCP manifests, staged brokers & their logs | `~/.config/quicksand/` |
 | Broker event log (one JSON line per request, all sandboxes; written by `qs-event` inside Quicksand.app) | `~/.config/quicksand/events.jsonl` |
 

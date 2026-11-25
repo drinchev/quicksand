@@ -57,15 +57,27 @@ for your *files*, not an egress filter.
 
 ## Installation
 
+`qs` ships inside [Quicksand.app](#quicksandapp), together with the scripts it
+runs, so the app is the whole install:
+
 ```bash
-git clone https://github.com/drinchev/quicksand
-
-# Option 1: add qs to your PATH
-export PATH="$PATH:/path/to/quicksand"
-
-# Option 2: alias it
-echo 'alias qs="/path/to/quicksand/qs"' >> ~/.zshrc
+git clone https://github.com/drinchev/quicksand && cd quicksand
+app/scripts/install.sh
 ```
+
+`install.sh` builds the app, installs it to `~/Applications` (quitting and
+reopening a running copy), links `/usr/local/bin/qs` to
+`Quicksand.app/Contents/MacOS/qs` (with `sudo` if that folder isn't yours),
+and warns about an old `alias qs=...` that would hide the link. Re-run it after
+pulling to update. `--dev` links the debug build instead, which uses the
+checkout's `qs.bash` directly; `--help` lists the rest. The app's menu also has
+"Install qs command", which makes the same link.
+
+`qs` is moving from bash to Swift one command at a time. Today the Swift `qs`
+hands every command to the bash script, `qs.bash`, unchanged; you can still
+run `/path/to/quicksand/qs.bash` directly (e.g. from a checkout while
+developing). Earlier installs that put the checkout on `PATH` or aliased
+`/path/to/quicksand/qs` need to switch to one of the two.
 
 Requires macOS and admin rights (builds use `sudo` to create the sandbox
 user). `gh` is optional but recommended for automatic deploy-key handling.
@@ -527,7 +539,7 @@ fail with "Quicksand.app isn't running on the host". Turn on "Open at login"
 in its menu.
 
 ```bash
-app/scripts/bundle.sh && cp -R app/build/Quicksand.app ~/Applications/ && open ~/Applications/Quicksand.app
+app/scripts/install.sh
 ```
 
 Sandboxes built before the app had their own LaunchAgents

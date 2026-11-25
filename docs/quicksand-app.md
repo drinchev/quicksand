@@ -1,8 +1,9 @@
 # Quicksand.app: a status-bar app that runs the host brokers
 
-Status (2026-11-20): steps 1–3 are built: the brokers write an event log,
+Status (2026-11-25): steps 1–3 are built: the brokers write an event log,
 `app/` holds Quicksand.app, and a sandbox moves to the app's sockets on its
-next build. Step 4 (approvals) is next.
+next build. The app also ships the `qs` command (see "The qs command").
+Step 4 (approvals) is next.
 
 ## Goal
 
@@ -205,7 +206,7 @@ The per-sandbox free-text logs (`*-broker-NAME.log`) stay as they are.
 ```bash
 swift test --package-path app                      # incl. the real docker broker end to end
 app/scripts/bundle.sh                               # → app/build/Quicksand.app (ad-hoc signed)
-cp -R app/build/Quicksand.app ~/Applications/ && open ~/Applications/Quicksand.app
+app/scripts/install.sh                              # build + install to ~/Applications + link qs + open
 ```
 
 Inside a quicksand sandbox, add `--disable-sandbox` to `swift build`/`swift
@@ -214,6 +215,31 @@ app's UI can only run on the host (sandbox users have no GUI session).
 
 Sandboxes not rebuilt since step 3 still use their LaunchAgents: the app
 lists them, flagged, but doesn't serve their requests.
+
+## The qs command
+
+`qs` is moving from bash to Swift one command at a time, so there is always
+one working `qs`. Step 1 (done): the Swift `qs` (`app/Sources/qs`) finds the
+bash script and replaces itself with `/bin/bash qs.bash ARGS...` (`execv`,
+so the terminal, sudo prompts, Ctrl-C, interactive sessions and the exit code
+are the script's; arguments pass through as raw bytes). It looks for
+`qs.bash` in this order (`LegacyCLI.locateScript`):
+
+1. `$QS_BASH`, when set (tests, development);
+2. `Contents/Resources/quicksand/qs.bash` inside the app, where `bundle.sh`
+   copies it with `profile.d/`, `logout.d/`, `config/` and `libexec/`;
+3. the nearest directory above the executable holding `qs.bash` and
+   `profile.d/` — a checkout, for `app/.build/debug/qs`.
+
+`app/scripts/install.sh` builds the app, installs it to `~/Applications` and
+links `/usr/local/bin/qs` to its qs (`--dev`: to the debug build). The menu's
+"Install qs command" makes the same link through an admin prompt. Both
+replace only a missing link or one to another qs, never anything else.
+
+Next: Swift parses arguments and owns `--help`, `--version` and `list`, then
+takes over commands one by one (`docker`, the credential commands, `clone`/
+`memory`/`ssh-auth`, `uninstall`, `build`, `shell`/`claude`), and finally
+`qs.bash` goes away.
 
 ## Open questions
 

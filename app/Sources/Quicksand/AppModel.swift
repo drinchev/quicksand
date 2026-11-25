@@ -145,6 +145,38 @@ final class AppModel: ObservableObject {
         }
     }
 
+    // MARK: - qs command
+
+    @Published private(set) var commandToolError: String?
+
+    /// This app's qs, when it was bundled (not under `swift run`).
+    var bundledCommand: URL? {
+        let url = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/qs")
+        return Bundle.main.bundleIdentifier != nil && FileManager.default.isExecutableFile(atPath: url.path) ? url : nil
+    }
+
+    var commandToolStatus: CommandLineTool.Status? {
+        bundledCommand.map { CommandLineTool.status(target: $0) }
+    }
+
+    /// Link /usr/local/bin/qs to this app's qs; macOS asks for an admin
+    /// password. Never replaces something that isn't a Quicksand link.
+    func installCommandTool() {
+        guard let target = bundledCommand, let status = commandToolStatus else { return }
+        if case .foreign(let what) = status {
+            commandToolError = "\(CommandLineTool.defaultLink) already exists (\(what)) — remove it first."
+            return
+        }
+        var error: NSDictionary?
+        NSAppleScript(source: CommandLineTool.installScript(target: target))?.executeAndReturnError(&error)
+        if let error, (error[NSAppleScript.errorNumber] as? Int) != -128 {  // -128: the user cancelled
+            commandToolError = "Install qs command: \(error[NSAppleScript.errorMessage] ?? "failed")"
+        } else {
+            commandToolError = nil
+        }
+        objectWillChange.send()
+    }
+
     /// Show events.jsonl in Finder. Before any broker has logged, the file
     /// doesn't exist (and Finder silently does nothing), so open the folder
     /// it will appear in instead.

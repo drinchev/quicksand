@@ -4,20 +4,30 @@
 # directly with controlled globals; external commands are stubbed via
 # PATH where needed. Nothing here touches sudo or real sandboxes.
 
-# qs-event (app/Sources/qs-event) writes the broker event log; Quicksand.app
-# passes its path to every broker as QS_EVENT_BIN. Build it once so the
-# brokers log here as they do under the app. Without swift, the event-log
-# tests skip.
+# Two Swift commands are built once for the suite:
+# - qs-event (app/Sources/qs-event) writes the broker event log; Quicksand.app
+#   passes its path to every broker as QS_EVENT_BIN, so the brokers log here
+#   as they do under the app.
+# - qs (app/Sources/qs), the command users run, which hands everything to
+#   qs.bash.
+# Without swift, the tests that need them skip.
+bats_require_minimum_version 1.5.0
+
 setup_file() {
-    local app="$BATS_TEST_DIRNAME/../app" bin
-    QS_EVENT_BIN_BUILT=""
+    local app="$BATS_TEST_DIRNAME/../app" bin product
+    QS_EVENT_BIN_BUILT="" QS_SWIFT_BUILT=""
     if command -v swift >/dev/null 2>&1 \
-        && swift build --package-path "$app" --product qs-event --disable-sandbox \
-            > "$BATS_FILE_TMPDIR/qs-event-build.log" 2>&1 \
         && bin="$(swift build --package-path "$app" --disable-sandbox --show-bin-path)"; then
-        QS_EVENT_BIN_BUILT="$bin/qs-event"
+        for product in qs-event qs; do
+            swift build --package-path "$app" --product "$product" --disable-sandbox \
+                >> "$BATS_FILE_TMPDIR/swift-build.log" 2>&1 || continue
+            case "$product" in
+                qs-event) QS_EVENT_BIN_BUILT="$bin/qs-event" ;;
+                qs) QS_SWIFT_BUILT="$bin/qs" ;;
+            esac
+        done
     fi
-    export QS_EVENT_BIN_BUILT
+    export QS_EVENT_BIN_BUILT QS_SWIFT_BUILT
 }
 
 setup() {
@@ -30,12 +40,12 @@ setup() {
     unset QS_SESSION_ID
     REPO_COPY="$BATS_TEST_TMPDIR/repo"
     mkdir -p "$REPO_COPY"
-    cp "$BATS_TEST_DIRNAME/../qs" "$REPO_COPY/qs"
+    cp "$BATS_TEST_DIRNAME/../qs.bash" "$REPO_COPY/qs.bash"
     cp -R "$BATS_TEST_DIRNAME/../profile.d" "$REPO_COPY/profile.d"
     cp -R "$BATS_TEST_DIRNAME/../logout.d" "$REPO_COPY/logout.d"
     cp -R "$BATS_TEST_DIRNAME/../config" "$REPO_COPY/config"
     cp -R "$BATS_TEST_DIRNAME/../libexec" "$REPO_COPY/libexec"
-    QS="$REPO_COPY/qs"
+    QS="$REPO_COPY/qs.bash"
     STUBS="$BATS_TEST_TMPDIR/stubs"
     STUB_LOG="$BATS_TEST_TMPDIR/stub.log"
     mkdir -p "$STUBS"
@@ -2819,6 +2829,43 @@ need_qs_event() {
     [[ -n "${QS_EVENT_BIN:-}" ]] || skip "qs-event not built (needs swift)"
 }
 
+need_qs_swift() {
+    [[ -x "${QS_SWIFT_BUILT:-}" ]] || skip "the Swift qs not built (needs swift)"
+}
+
+@test "the Swift qs hands its arguments and exit code to qs.bash unchanged" {
+    need_qs_swift
+    local fake="$BATS_TEST_TMPDIR/fake-qs.bash"
+    printf '#!/bin/bash\nprintf "[%%s]\\n" "$0" "$@"\nexit 7\n' > "$fake"
+    QS_BASH="$fake" run "$QS_SWIFT_BUILT" claude work -- -p 'a b' ''
+    [ "$status" -eq 7 ]
+    [ "${lines[0]}" = "[$fake]" ]
+    [ "${lines[1]}" = "[claude]" ]
+    [ "${lines[4]}" = "[-p]" ]
+    [ "${lines[5]}" = "[a b]" ]
+    [ "${lines[6]}" = "[]" ]
+}
+
+@test "the Swift qs finds qs.bash in the checkout and prints what bash prints" {
+    need_qs_swift
+    run "$QS_SWIFT_BUILT" --version
+    [ "$status" -eq 0 ]
+    [ "$output" = "$(bash "$BATS_TEST_DIRNAME/../qs.bash" --version)" ]
+    run "$QS_SWIFT_BUILT" --help
+    [ "$status" -eq 0 ]
+    [ "$output" = "$(bash "$BATS_TEST_DIRNAME/../qs.bash" --help)" ]
+}
+
+@test "the Swift qs reports a missing qs.bash" {
+    need_qs_swift
+    local lone="$BATS_TEST_TMPDIR/bin/qs"
+    mkdir -p "$(dirname "$lone")"
+    cp "$QS_SWIFT_BUILT" "$lone"
+    run -127 "$lone" list
+    [ "$status" -eq 127 ]
+    [[ "$output" == *"can't find qs.bash"* ]]
+}
+
 @test "brokers work and log nothing without qs-event" {
     unset QS_EVENT_BIN
     broker '{"v":1,"verb":"ps"}'
@@ -2969,4 +3016,77 @@ need_qs_event() {
     rm -rf "$dir"
     [ "$status" -eq 125 ]
     [[ "$output" == *"no answer from Quicksand.app"* ]]
+}
+
+###############################################################################
+# app/scripts/install.sh
+###############################################################################
+# A checkout with a fake built app whose qs prints a version, so the
+# installer runs without swift, sudo or a GUI.
+fake_app_checkout() {
+    FAKE="$BATS_TEST_TMPDIR/checkout"
+    mkdir -p "$FAKE/app/scripts" "$FAKE/app/build/Quicksand.app/Contents/MacOS"
+    cp "$BATS_TEST_DIRNAME/../app/scripts/install.sh" "$FAKE/app/scripts/install.sh"
+    printf '#!/bin/bash\necho "qs version test"\n' > "$FAKE/app/build/Quicksand.app/Contents/MacOS/qs"
+    chmod +x "$FAKE/app/build/Quicksand.app/Contents/MacOS/qs"
+    APPS="$BATS_TEST_TMPDIR/Applications"
+    LINK="$BATS_TEST_TMPDIR/bin/qs"
+}
+
+install_app() {
+    HOME="$BATS_TEST_TMPDIR" run "$FAKE/app/scripts/install.sh" \
+        --no-build --no-open --dest "$APPS" --link "$LINK" "$@"
+}
+
+@test "install.sh installs the app and links qs into it" {
+    fake_app_checkout
+    install_app
+    [ "$status" -eq 0 ]
+    [ -x "$APPS/Quicksand.app/Contents/MacOS/qs" ]
+    [ "$(readlink "$LINK")" = "$APPS/Quicksand.app/Contents/MacOS/qs" ]
+    [[ "$output" == *"Done: qs version test"* ]]
+    # Again: nothing to relink.
+    install_app
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"already points at"* ]]
+}
+
+@test "install.sh replaces a link to another qs but nothing else" {
+    fake_app_checkout
+    mkdir -p "$(dirname "$LINK")"
+    ln -s /Old/Quicksand.app/Contents/MacOS/qs "$LINK"
+    install_app
+    [ "$status" -eq 0 ]
+    [ "$(readlink "$LINK")" = "$APPS/Quicksand.app/Contents/MacOS/qs" ]
+
+    rm "$LINK"; ln -s /opt/homebrew/bin/something "$LINK"
+    install_app
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"not to a qs"* ]]
+    [ "$(readlink "$LINK")" = /opt/homebrew/bin/something ]
+
+    rm "$LINK"; echo mine > "$LINK"
+    install_app
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"isn't a link"* ]]
+    [ "$(cat "$LINK")" = mine ]
+}
+
+@test "install.sh warns about an alias that would hide the link" {
+    fake_app_checkout
+    echo "alias qs=/path/to/quicksand/qs" > "$BATS_TEST_TMPDIR/.zshrc"
+    install_app
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"alias qs="*"unalias qs"* ]]
+}
+
+@test "install.sh refuses to run inside a sandbox and without a built app" {
+    fake_app_checkout
+    QS_SESSION_ID=x install_app
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"on the host"* ]]
+    rm -rf "$FAKE/app/build"
+    install_app
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"build it first"* ]]
 }

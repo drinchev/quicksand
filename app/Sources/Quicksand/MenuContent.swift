@@ -126,10 +126,20 @@ struct MenuContent: View {
                 Text("Notifications are off for Quicksand in System Settings → Notifications.")
                     .font(.caption).foregroundStyle(.orange)
             }
-            Toggle("Open at login", isOn: Binding(get: { model.opensAtLogin },
-                                                  set: { model.opensAtLogin = $0 }))
-                .controlSize(.small)
+            HStack {
+                Toggle("Open at login", isOn: Binding(get: { model.opensAtLogin },
+                                                      set: { model.opensAtLogin = $0 }))
+                Spacer()
+                if let status = model.commandToolStatus, status != .installed {
+                    Button("Install qs command") { model.installCommandTool() }
+                        .help("Link \(CommandLineTool.defaultLink) to the qs inside this app (asks for an admin password)")
+                }
+            }
+            .controlSize(.small)
             if let error = model.loginItemError {
+                Text(error).font(.caption).foregroundStyle(.red)
+            }
+            if let error = model.commandToolError {
                 Text(error).font(.caption).foregroundStyle(.red)
             }
         }

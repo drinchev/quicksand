@@ -4,36 +4,24 @@
 # directly with controlled globals; external commands are stubbed via
 # PATH where needed. Nothing here touches sudo or real sandboxes.
 
-# Two Swift commands are built once for the suite:
-# - qs-event (app/Sources/qs-event) writes the broker event log; Quicksand.app
-#   passes its path to every broker as QS_EVENT_BIN, so the brokers log here
-#   as they do under the app.
-# - qs (app/Sources/qs), the command users run, which hands everything to
-#   qs.bash.
-# Without swift, the tests that need them skip.
+# The Swift qs (app/Sources/qs), the command users run, is built once for
+# the suite; it hands everything but help, version and list to qs.bash.
+# Without swift, the tests that need it skip.
 bats_require_minimum_version 1.5.0
 
 setup_file() {
-    local app="$BATS_TEST_DIRNAME/../app" bin product
-    QS_EVENT_BIN_BUILT="" QS_SWIFT_BUILT=""
+    local app="$BATS_TEST_DIRNAME/../app" bin
+    QS_SWIFT_BUILT=""
     if command -v swift >/dev/null 2>&1 \
-        && bin="$(swift build --package-path "$app" --disable-sandbox --show-bin-path)"; then
-        for product in qs-event qs; do
-            swift build --package-path "$app" --product "$product" --disable-sandbox \
-                >> "$BATS_FILE_TMPDIR/swift-build.log" 2>&1 || continue
-            case "$product" in
-                qs-event) QS_EVENT_BIN_BUILT="$bin/qs-event" ;;
-                qs) QS_SWIFT_BUILT="$bin/qs" ;;
-            esac
-        done
+        && bin="$(swift build --package-path "$app" --disable-sandbox --show-bin-path)" \
+        && swift build --package-path "$app" --product qs --disable-sandbox \
+            > "$BATS_FILE_TMPDIR/swift-build.log" 2>&1; then
+        QS_SWIFT_BUILT="$bin/qs"
     fi
-    export QS_EVENT_BIN_BUILT QS_SWIFT_BUILT
+    export QS_SWIFT_BUILT
 }
 
 setup() {
-    if [[ -x "${QS_EVENT_BIN_BUILT:-}" ]]; then
-        export QS_EVENT_BIN="$QS_EVENT_BIN_BUILT"
-    fi
     # qs refuses to load inside a quicksand session (its nested-sandbox
     # guard); drop the marker so the suite runs in a sandbox too — where
     # agents develop quicksand itself.
@@ -1219,133 +1207,6 @@ op_provision_stub() {
 
 
 ###############################################################################
-# docker broker — config/qs-docker-broker run directly against a stub docker
-###############################################################################
-
-# Run the broker as `launchd` would (request on stdin, reply on stdout) with
-# the workspace at $WS and a stub docker that prints its argv. Tests that
-# need custom docker behavior overwrite the stub before calling this.
-broker() {
-    command -v jq >/dev/null 2>&1 || skip "jq not available"
-    [[ -x "$STUBS/docker" ]] \
-        || make_stub docker 'printf "DOCKER:"; printf " %s" "$@"; printf "\n"'
-    # Resolved path: $BATS_TEST_TMPDIR sits under the /var → /private/var
-    # symlink, and the broker canonicalizes its workspace argument.
-    mkdir -p "$BATS_TEST_TMPDIR/ws"
-    WS="$(cd "$BATS_TEST_TMPDIR/ws" && pwd -P)"
-    run bash -c "HOME=\"$BATS_TEST_TMPDIR\" \
-        bash \"$REPO_COPY/config/qs-docker-broker\" work \"$WS\" \
-        \"$STUBS/docker\" \"\$(command -v jq)\" <<< '$1'"
-}
-
-@test "docker broker run composes the hardened template" {
-    broker '{"v":1,"verb":"run","image":"node:20","cmd":["node","-e","x"],"env":{"FOO":"bar baz"}}'
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"DOCKER: run --rm -i --label quicksand.sandbox=work --cap-drop ALL"* ]]
-    [[ "$output" == *"-v $WS:$WS -w $WS"* ]]         # default workdir = workspace
-    # _quicksand masked by an empty anonymous volume (no tokens, no socket)
-    [[ "$output" == *"-w $WS -v $WS/_quicksand"* ]]
-    [[ "$output" == *"-e FOO=bar baz node:20 node -e x"* ]]
-    [[ "$output" == *"@@qs-docker-exit:0@@"* ]]
-}
-
-@test "docker broker rejects a workdir outside the workspace" {
-    mkdir -p "$BATS_TEST_TMPDIR/elsewhere"
-    broker "{\"v\":1,\"verb\":\"run\",\"image\":\"node:20\",\"workdir\":\"$BATS_TEST_TMPDIR/elsewhere\"}"
-    [[ "$output" == *"workdir must be under"* ]]
-    [[ "$output" != *"DOCKER:"* ]]
-    [[ "$output" == *"@@qs-docker-exit:125@@"* ]]
-}
-
-@test "docker broker resolves ../ traversal before the workspace check" {
-    mkdir -p "$BATS_TEST_TMPDIR/evil"
-    broker "{\"v\":1,\"verb\":\"run\",\"image\":\"node:20\",\"workdir\":\"$BATS_TEST_TMPDIR/ws/../evil\"}"
-    [[ "$output" == *"workdir must be under"* ]]
-    [[ "$output" != *"DOCKER:"* ]]
-}
-
-@test "docker broker rejects flag injection via the image field" {
-    broker '{"v":1,"verb":"run","image":"--privileged"}'
-    [[ "$output" == *"bad image ref"* ]]
-    [[ "$output" != *"DOCKER:"* ]]
-}
-
-@test "docker broker rejects malformed env names" {
-    broker '{"v":1,"verb":"run","image":"node:20","env":{"BAD NAME":"x"}}'
-    [[ "$output" == *"bad env name"* ]]
-    [[ "$output" != *"DOCKER:"* ]]
-}
-
-@test "docker broker forces build tags into the sandbox namespace" {
-    broker '{"v":1,"verb":"build","tag":"innocent/app","context":"/tmp"}'
-    [[ "$output" == *"tag must live under qs-work/"* ]]
-    [[ "$output" != *"DOCKER:"* ]]
-}
-
-@test "docker broker builds with an in-workspace context" {
-    mkdir -p "$BATS_TEST_TMPDIR/ws/proj"
-    broker "{\"v\":1,\"verb\":\"build\",\"tag\":\"qs-work/app\",\"context\":\"$BATS_TEST_TMPDIR/ws/proj\"}"
-    [[ "$output" == *"DOCKER: build --label quicksand.sandbox=work -t qs-work/app $WS/proj"* ]]
-    [[ "$output" == *"@@qs-docker-exit:0@@"* ]]
-}
-
-@test "docker broker rejects a build context outside the workspace" {
-    broker '{"v":1,"verb":"build","tag":"qs-work/app","context":"/etc"}'
-    [[ "$output" == *"context must be under"* ]]
-    [[ "$output" != *"DOCKER:"* ]]
-}
-
-@test "docker broker rejects the workspace root as build context" {
-    broker "{\"v\":1,\"verb\":\"build\",\"tag\":\"qs-work/app\",\"context\":\"$BATS_TEST_TMPDIR/ws\"}"
-    [[ "$output" == *"not its root"* ]]
-    [[ "$output" != *"DOCKER:"* ]]
-}
-
-@test "docker broker rejects a build context under _quicksand" {
-    mkdir -p "$BATS_TEST_TMPDIR/ws/_quicksand"
-    broker "{\"v\":1,\"verb\":\"build\",\"tag\":\"qs-work/app\",\"context\":\"$BATS_TEST_TMPDIR/ws/_quicksand\"}"
-    [[ "$output" == *"must not be under _quicksand"* ]]
-    [[ "$output" != *"DOCKER:"* ]]
-}
-
-@test "docker broker refuses verbs outside the allowlist" {
-    broker '{"v":1,"verb":"exec","id":"whatever"}'
-    [[ "$output" == *"unknown verb 'exec'"* ]]
-    [[ "$output" != *"DOCKER:"* ]]
-}
-
-@test "docker broker rejects command injection in container ids" {
-    broker '{"v":1,"verb":"logs","id":"$(rm -rf /)"}'
-    [[ "$output" == *"bad container id"* ]]
-    [[ "$output" != *"DOCKER:"* ]]
-}
-
-@test "docker broker refuses containers owned by another sandbox" {
-    make_stub docker '[[ "$1" == "inspect" ]] && { echo "other"; exit 0; }
-        printf "DOCKER:"; printf " %s" "$@"; printf "\n"'
-    broker '{"v":1,"verb":"stop","id":"abc123"}'
-    [[ "$output" == *"no such container"* ]]
-    [[ "$output" != *"DOCKER: stop"* ]]
-}
-
-@test "docker broker rejects a non-JSON request" {
-    broker 'not json at all'
-    [[ "$output" == *"unparseable request"* ]]
-    [[ "$output" != *"DOCKER:"* ]]
-}
-
-@test "docker broker puts the docker CLI's directory on PATH (credential helpers)" {
-    # docker resolves docker-credential-* helpers via $PATH; under launchd's
-    # bare PATH a pull would fail even for public images.
-    make_stub docker 'printf "PATH:%s\n" "$PATH"'
-    broker '{"v":1,"verb":"pull","image":"postgres:17-alpine"}'
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"PATH:$STUBS:"* ]]
-    [[ "$output" == *":/usr/local/bin:"* ]]
-}
-
-
-###############################################################################
 # qs docker — CLI plumbing and host-side helpers
 ###############################################################################
 
@@ -1361,6 +1222,56 @@ broker() {
     [[ "$output" == *"accepts 'off' or nothing"* ]]
 }
 
+@test "docker_enable writes the marker, stages the client and removes the old bash broker" {
+    make_stub launchctl 'echo "launchctl $*" >> "$STUB_LOG"'
+    export WORK="$BATS_TEST_TMPDIR/work"
+    mkdir -p "$WORK/install/brokers" "$WORK/LaunchAgents" "$WORK/ws/_quicksand"
+    touch "$WORK/install/brokers/spec.plist" "$WORK/install/docker-broker-work.sh" \
+          "$WORK/install/docker-broker-work.log" "$WORK/LaunchAgents/agent.plist" \
+          "$WORK/ws/_quicksand/docker-broker.sock"
+    qs_run 'PATH="$STUBS:$PATH"; SANDBOX_NAME=work; umask 0002
+            SHARED_WORKSPACE="$WORK/ws"; QS_PRIVATE_DIR="$WORK/ws/_quicksand"
+            INSTALL_DIR="$WORK/install"; HOME="$WORK"
+            QS_DOCKER_MARKER="$WORK/install/docker-work"
+            QS_DOCKER_LABEL=com.quicksand.docker-broker.work
+            QS_DOCKER_OLD_SPEC="$WORK/install/brokers/spec.plist"
+            QS_DOCKER_LEGACY_PLIST="$WORK/LaunchAgents/agent.plist"
+            QS_DOCKER_OLD_BROKER="$WORK/install/docker-broker-work.sh"
+            docker_enable'
+    [ "$status" -eq 0 ]
+    # The app trusts the marker only if nobody else could have written it.
+    [ -f "$WORK/install/docker-work" ] && [ ! -s "$WORK/install/docker-work" ]
+    [ "$(stat -f %Lp "$WORK/install/docker-work")" = 644 ]
+    cmp "$REPO_COPY/config/qs-docker" "$WORK/ws/_quicksand/bin/qs-docker"
+    [ -x "$WORK/ws/_quicksand/bin/qs-docker" ]
+    [ ! -e "$WORK/install/brokers/spec.plist" ]
+    [ ! -e "$WORK/install/docker-broker-work.sh" ]
+    [ ! -e "$WORK/install/docker-broker-work.log" ]
+    [ ! -e "$WORK/LaunchAgents/agent.plist" ]
+    [ ! -e "$WORK/ws/_quicksand/docker-broker.sock" ]
+    run grep -q "launchctl bootstrap" "$STUB_LOG"
+    [ "$status" -ne 0 ]
+}
+
+@test "qs docker NAME off removes the marker and the client" {
+    make_stub launchctl 'true'
+    export WORK="$BATS_TEST_TMPDIR/work"
+    mkdir -p "$WORK/install" "$WORK/ws/_quicksand/bin"
+    touch "$WORK/install/docker-work" "$WORK/ws/_quicksand/bin/qs-docker"
+    qs_run 'PATH="$STUBS:/usr/bin:/bin"; SANDBOX_NAME=work; COMMAND_ARGS=(); DOCKER_ACTION=off
+            QS_PRIVATE_DIR="$WORK/ws/_quicksand"; INSTALL_DIR="$WORK/install"
+            QS_DOCKER_MARKER="$WORK/install/docker-work"
+            QS_DOCKER_LABEL=com.quicksand.docker-broker.work
+            QS_DOCKER_OLD_SPEC="$WORK/install/brokers/spec.plist"
+            QS_DOCKER_LEGACY_PLIST="$WORK/agent.plist"
+            QS_DOCKER_OLD_BROKER="$WORK/install/docker-broker-work.sh"
+            cmd_docker'
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Docker disabled for '''work'''"* ]]
+    [ ! -e "$WORK/install/docker-work" ]
+    [ ! -e "$WORK/ws/_quicksand/bin/qs-docker" ]
+}
+
 @test "cmd_docker aborts when docker is missing on the host" {
     qs_run 'PATH="/usr/bin:/bin"; COMMAND_ARGS=(); DOCKER_ACTION=on
             SANDBOX_NAME=work; cmd_docker'
@@ -1368,38 +1279,7 @@ broker() {
     [[ "$output" == *"docker CLI not found on host"* ]]
 }
 
-@test "docker_broker_install stages and renders the app's spec" {
-    command -v jq >/dev/null 2>&1 || skip "jq not available"
-    make_stub launchctl 'echo "launchctl $*" >> "$STUB_LOG"'
-    export WORK="$BATS_TEST_TMPDIR/work"
-    mkdir -p "$WORK"
-    qs_run 'PATH="$STUBS:$PATH"; SANDBOX_NAME=work; umask 0002
-            SHARED_WORKSPACE="$WORK/ws"; QS_PRIVATE_DIR="$WORK/ws/_quicksand"
-            INSTALL_DIR="$WORK/install"
-            QS_DOCKER_LABEL=com.quicksand.docker-broker.work
-            QS_DOCKER_PLIST="$WORK/install/brokers/spec.plist"
-            QS_DOCKER_LEGACY_PLIST="$WORK/LaunchAgents/agent.plist"
-            QS_DOCKER_BROKER_STAGED="$WORK/install/docker-broker-work.sh"
-            HOME="$WORK"
-            docker_broker_install /host/bin/docker /host/bin/jq'
-    [ "$status" -eq 0 ]
-    spec="$WORK/install/brokers/spec.plist"
-    [ -x "$WORK/install/docker-broker-work.sh" ]
-    [ -x "$WORK/ws/_quicksand/bin/qs-docker" ]
-    grep -q "<string>/host/bin/docker</string>" "$spec"
-    grep -q "<string>$WORK/install/docker-broker-work.sh</string>" "$spec"
-    plutil -lint "$spec"
-    # The app refuses a spec others could edit, whatever the umask.
-    [ "$(stat -f %Lp "$spec")" = 644 ]
-    # The app owns the socket now; launchd isn't involved.
-    run grep -E "Sockets|inetd|_quicksand/docker-broker.sock" "$spec"
-    [ "$status" -ne 0 ]
-    run grep -q launchctl "$STUB_LOG"
-    [ "$status" -ne 0 ]
-}
-
 @test "broker installs retire the LaunchAgent a pre-app build loaded" {
-    command -v jq >/dev/null 2>&1 || skip "jq not available"
     make_stub launchctl 'echo "launchctl $*" >> "$STUB_LOG"'
     export WORK="$BATS_TEST_TMPDIR/work"
     mkdir -p "$WORK/LaunchAgents" "$WORK/ws/_quicksand"
@@ -1409,10 +1289,11 @@ broker() {
     qs_run 'PATH="$STUBS:$PATH"; SANDBOX_NAME=work
             SHARED_WORKSPACE="$WORK/ws"; QS_PRIVATE_DIR="$WORK/ws/_quicksand"
             INSTALL_DIR="$WORK/install"; HOME="$WORK"
+            QS_DOCKER_MARKER="$WORK/install/docker-work"
             QS_DOCKER_LABEL=com.quicksand.docker-broker.work
-            QS_DOCKER_PLIST="$WORK/install/brokers/docker.plist"
+            QS_DOCKER_OLD_SPEC="$WORK/install/brokers/docker.plist"
             QS_DOCKER_LEGACY_PLIST="$WORK/LaunchAgents/docker.plist"
-            QS_DOCKER_BROKER_STAGED="$WORK/install/docker-broker-work.sh"
+            QS_DOCKER_OLD_BROKER="$WORK/install/docker-broker-work.sh"
             QS_SAY_LABEL=com.quicksand.say-broker.work
             QS_SAY_OLD_SPEC="$WORK/install/brokers/say.plist"
             QS_SAY_LEGACY_PLIST="$WORK/LaunchAgents/say.plist"
@@ -1421,7 +1302,7 @@ broker() {
             QS_AUTH_OLD_SPEC="$WORK/install/brokers/auth.plist"
             QS_AUTH_LEGACY_PLIST="$WORK/LaunchAgents/auth.plist"
             QS_AUTH_OLD_BROKER="$WORK/install/auth-broker-work.sh"
-            docker_broker_install /host/bin/docker /host/bin/jq
+            docker_enable
             say_client_install
             auth_client_install'
     [ "$status" -eq 0 ]
@@ -1429,8 +1310,9 @@ broker() {
         grep -q "launchctl bootout gui/$(id -u)/com.quicksand.$kind-broker.work" "$STUB_LOG"
         [ ! -e "$WORK/LaunchAgents/$kind.plist" ]
     done
-    [ -f "$WORK/install/brokers/docker.plist" ]
-    # Speech and credentials run inside the app: no spec.
+    # Every broker runs inside the app: no specs, Docker is a marker.
+    [ -f "$WORK/install/docker-work" ]
+    [ ! -e "$WORK/install/brokers/docker.plist" ]
     [ ! -e "$WORK/install/brokers/say.plist" ]
     [ ! -e "$WORK/install/brokers/auth.plist" ]
     [ -z "$(ls -A "$WORK/LaunchAgents")" ]
@@ -1450,16 +1332,19 @@ broker() {
     export WORK="$BATS_TEST_TMPDIR/work"
     mkdir -p "$WORK/install" "$WORK/ws/_quicksand/bin"
     touch "$WORK/spec.plist" "$WORK/agent.plist" "$WORK/install/docker-broker-work.sh" \
+          "$WORK/install/docker-work" \
           "$WORK/ws/_quicksand/bin/qs-docker" "$WORK/ws/_quicksand/docker-broker.sock"
     qs_run 'PATH="$STUBS:/usr/bin:/bin"; SANDBOX_NAME=work
             QS_PRIVATE_DIR="$WORK/ws/_quicksand"
             INSTALL_DIR="$WORK/install"
+            QS_DOCKER_MARKER="$WORK/install/docker-work"
             QS_DOCKER_LABEL=com.quicksand.docker-broker.work
-            QS_DOCKER_PLIST="$WORK/spec.plist"
+            QS_DOCKER_OLD_SPEC="$WORK/spec.plist"
             QS_DOCKER_LEGACY_PLIST="$WORK/agent.plist"
-            QS_DOCKER_BROKER_STAGED="$WORK/install/docker-broker-work.sh"
+            QS_DOCKER_OLD_BROKER="$WORK/install/docker-broker-work.sh"
             cleanup_docker'
     [ "$status" -eq 0 ]
+    [ ! -f "$WORK/install/docker-work" ]
     grep -q "launchctl bootout gui/$(id -u)/com.quicksand.docker-broker.work" "$STUB_LOG"
     [ ! -f "$WORK/spec.plist" ]
     [ ! -f "$WORK/agent.plist" ]
@@ -2625,22 +2510,8 @@ hooks_fixture() {
 }
 
 ###############################################################################
-# broker event log — one JSON line per request in events.jsonl
-# (docs/quicksand-app.md). The docker and say harnesses set HOME to
-# $BATS_TEST_TMPDIR; the auth broker writes next to its install dir.
+# the Swift qs (app/Sources/qs) in front of qs.bash
 ###############################################################################
-
-# last_event FIELD [FILE] — that field of the newest event, via jq (which
-# also proves the line is valid JSON).
-last_event() {
-    local file="${2:-$BATS_TEST_TMPDIR/.config/quicksand/events.jsonl}"
-    tail -n 1 "$file" | jq -er ".$1"
-}
-
-# need_qs_event — skip when qs-event couldn't be built (no swift).
-need_qs_event() {
-    [[ -n "${QS_EVENT_BIN:-}" ]] || skip "qs-event not built (needs swift)"
-}
 
 need_qs_swift() {
     [[ -x "${QS_SWIFT_BUILT:-}" ]] || skip "the Swift qs not built (needs swift)"
@@ -2739,87 +2610,6 @@ need_qs_swift() {
     run -127 "$lone" build foo
     [ "$status" -eq 127 ]
     [[ "$output" == *"can't find qs.bash"* ]]
-}
-
-@test "brokers work and log nothing without qs-event" {
-    unset QS_EVENT_BIN
-    broker '{"v":1,"verb":"ps"}'
-    [[ "$output" == *"@@qs-docker-exit:0@@"* ]]
-    [ ! -e "$BATS_TEST_TMPDIR/.config/quicksand/events.jsonl" ]
-}
-
-@test "qs-event refuses field names a broker shouldn't use" {
-    need_qs_event
-    run "$QS_EVENT_BIN" --log "$BATS_TEST_TMPDIR/e.jsonl" --broker docker --sandbox work \
-        -- run ok sandbox other
-    [ "$status" -eq 2 ]
-    [[ "$output" == *"field name"* ]]
-    [ ! -e "$BATS_TEST_TMPDIR/e.jsonl" ]
-}
-
-@test "docker broker logs a finished run without its cmd or env" {
-    need_qs_event
-    broker '{"v":1,"verb":"run","image":"node:20","cmd":["node","-e","secret-arg"],"env":{"FOO":"bar baz"}}'
-    [ "$(last_event sandbox)" == "work" ]
-    [ "$(last_event broker)" == "docker" ]
-    [ "$(last_event verb)" == "run" ]
-    [ "$(last_event result)" == "ok" ]
-    [ "$(last_event exit)" == "0" ]
-    [ "$(last_event target)" == "node:20" ]
-    [[ "$(last_event ts)" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9:]{8}Z$ ]]
-    ! grep -qE 'secret-arg|bar baz|FOO' "$BATS_TEST_TMPDIR/.config/quicksand/events.jsonl"
-}
-
-@test "docker broker logs a policy rejection with what was attempted" {
-    need_qs_event
-    broker '{"v":1,"verb":"run","image":"--privileged"}'
-    [ "$(last_event result)" == "rejected" ]
-    [ "$(last_event exit)" == "125" ]
-    [ "$(last_event target)" == "--privileged" ]
-    [ "$(last_event reason)" == "run: bad image ref" ]
-}
-
-@test "docker broker logs a failing docker command as an error" {
-    need_qs_event
-    make_stub docker 'exit 3'
-    broker '{"v":1,"verb":"pull","image":"nope:1"}'
-    [[ "$output" == *"@@qs-docker-exit:3@@"* ]]
-    [ "$(last_event result)" == "error" ]
-    [ "$(last_event exit)" == "3" ]
-}
-
-@test "docker broker logs a misconfigured host as an error, not a rejection" {
-    need_qs_event
-    command -v jq >/dev/null 2>&1 || skip "jq not available"
-    mkdir -p "$BATS_TEST_TMPDIR/ws"
-    run bash -c "HOME=\"$BATS_TEST_TMPDIR\" bash \"$REPO_COPY/config/qs-docker-broker\" \
-        work \"$BATS_TEST_TMPDIR/ws\" /nonexistent/docker \"\$(command -v jq)\" <<< '{}'"
-    [ "$(last_event result)" == "error" ]
-    [[ "$(last_event reason)" == "docker CLI not executable"* ]]
-}
-
-@test "docker broker keeps hostile verbs as escaped, valid JSON" {
-    need_qs_event
-    command -v jq >/dev/null 2>&1 || skip "jq not available"
-    # Piped directly: broker()'s double-quoted bash -c would eat the
-    # backslashes this request is about.
-    mkdir -p "$BATS_TEST_TMPDIR/ws"
-    printf '%s\n' '{"v":1,"verb":"ex\"ec\\x\u0007y"}' > "$BATS_TEST_TMPDIR/req"
-    HOME="$BATS_TEST_TMPDIR" bash "$REPO_COPY/config/qs-docker-broker" work \
-        "$BATS_TEST_TMPDIR/ws" /usr/bin/true "$(command -v jq)" \
-        < "$BATS_TEST_TMPDIR/req" > /dev/null
-    [ "$(last_event result)" == "rejected" ]
-    [ "$(last_event verb)" == 'ex"ec\xy' ]
-}
-
-@test "docker broker rotates the event log past its size cap" {
-    need_qs_event
-    mkdir -p "$BATS_TEST_TMPDIR/.config/quicksand"
-    printf 'old\n' > "$BATS_TEST_TMPDIR/.config/quicksand/events.jsonl"
-    QS_EVENTS_MAX_BYTES=1 broker '{"v":1,"verb":"ps"}'
-    [ "$(cat "$BATS_TEST_TMPDIR/.config/quicksand/events.jsonl.1")" == "old" ]
-    [ "$(wc -l < "$BATS_TEST_TMPDIR/.config/quicksand/events.jsonl")" -eq 1 ]
-    [ "$(last_event verb)" == "ps" ]
 }
 
 @test "qs-docker says so when nothing answers on the socket" {

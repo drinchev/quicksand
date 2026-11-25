@@ -1,7 +1,6 @@
 #!/bin/bash
-# Build Quicksand.app from this package: a release build of the app, of
-# qs-event (the brokers' event-log writer) and of the qs command, wrapped in
-# a minimal bundle (status-bar only, no Dock icon) and signed ad hoc for this
+# Build Quicksand.app from this package: a release build of the app and of
+# the qs command, wrapped in a minimal bundle (status-bar only, no Dock icon) and signed ad hoc for this
 # Mac. The bash qs (qs.bash) and the directories it reads are copied into
 # Contents/Resources/quicksand/, so the app is a complete install: link
 # Contents/MacOS/qs onto your PATH (the menu's "Install qs command" does).
@@ -25,7 +24,6 @@ BIN_DIR="$(swift build -c release --package-path "$APP_DIR" --show-bin-path "$@"
 rm -rf "$OUT"
 mkdir -p "$OUT/Contents/MacOS"
 cp "$BIN_DIR/Quicksand" "$OUT/Contents/MacOS/Quicksand"
-cp "$BIN_DIR/qs-event" "$OUT/Contents/MacOS/qs-event"
 cp "$BIN_DIR/qs" "$OUT/Contents/MacOS/qs"
 
 # What qs.bash reads next to itself (see its QS_REPO_DIR).
@@ -52,7 +50,6 @@ cat > "$OUT/Contents/Info.plist" <<PLIST
 </dict>
 </plist>
 PLIST
-codesign --force --sign - "$OUT/Contents/MacOS/qs-event"
 codesign --force --sign - "$OUT/Contents/MacOS/qs"
 codesign --force --sign - "$OUT"
 echo "Built $OUT"

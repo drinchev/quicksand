@@ -1,6 +1,6 @@
 #!/bin/bash
-# qs-docker — sandbox-side client for the host docker broker (see
-# config/qs-docker-broker for the security model). Staged into
+# qs-docker — sandbox-side client for Docker on the host (see
+# app/Sources/QuicksandCore/DockerPolicy.swift for the security model). Staged into
 # _quicksand/bin/ by `qs docker NAME` and installed onto the sandbox PATH
 # by profile.d/63-docker-shim.sh.
 #

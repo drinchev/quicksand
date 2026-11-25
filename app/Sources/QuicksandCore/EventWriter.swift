@@ -1,9 +1,9 @@
 import Darwin
 import Foundation
 
-/// Writes one line of the broker event log (`events.jsonl`). Used by the
-/// `qs-event` command the bash brokers call; the app only reads the log
-/// (`EventLogReader`).
+/// Writes one line of the broker event log (`events.jsonl`): each in-app
+/// broker records every request it finished. `EventLogReader` reads it back
+/// for the menu and the Activity window.
 ///
 /// Values a sandbox sent are untrusted: invalid UTF-8 and control
 /// characters are dropped and everything is JSON-escaped, so each line is

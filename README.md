@@ -320,15 +320,15 @@ prevent that.
 
 `qs docker NAME` takes a different route: a **command-level broker**. The
 sandbox never sees a Docker API; instead a `qs-docker` client sends a small
-JSON request (verb plus a few values) over a Unix socket in `_quicksand/`,
-and a host-side broker composes every `docker` invocation itself from a fixed
-hardened template — the client cannot supply a single flag. That keeps the
-security-critical surface ~150 auditable lines instead of a Docker-API
+JSON request (verb plus a few values) over Quicksand.app's socket, and the
+app composes every `docker` invocation itself from a fixed hardened template
+— the client cannot supply a single flag. That keeps the security-critical
+surface one small, unit-tested Swift file (`DockerPolicy.swift`) instead of a Docker-API
 payload filter, where one missed field (`Binds` vs `Mounts`, `docker cp`,
 volume remounts, image `load`) is a host compromise.
 
 ```bash
-qs docker work        # enable — needs docker + jq on the host
+qs docker work        # enable — needs docker on the host
 qs docker work off    # disable again
 ```
 
@@ -364,14 +364,16 @@ The policy, enforced entirely host-side:
   updated. Build-time resource use (CPU, disk) is also uncapped; a hostile
   build can waste resources, not read files.
 
-The broker script is staged under `~/.config/quicksand/`, and
-[Quicksand.app](#quicksandapp) runs it: the app owns the socket
-(`/Users/Shared/quicksand/docker.sock`) and starts one short-lived broker per
-connection, so nothing runs while idle — and the code executing as your user
-lives host-side where the sandbox can't edit it. The `docker`/`jq` binary
-paths are pinned into the broker's spec
-(`~/.config/quicksand/brokers/com.quicksand.docker-broker.NAME.plist`) at
-install time. Containers themselves are confined by your
+[Quicksand.app](#quicksandapp) runs the broker itself: it owns the socket
+(`/Users/Shared/quicksand/docker.sock`), checks the policy
+(`app/Sources/QuicksandCore/DockerPolicy.swift`) and runs the one `docker`
+command it allows, with the connection as the container's output (and, for
+`run`, its input) — so the code executing as your user lives in the app,
+where the sandbox can't edit it. `qs docker NAME` only writes an empty
+`~/.config/quicksand/docker-NAME` (the app serves Docker to sandboxes that
+have it) and stages the `qs-docker` client; `docker` itself is found on your
+login shell's `PATH`, so a newly installed engine needs an app restart.
+Containers themselves are confined by your
 engine's VM, not by `sandbox-exec`; container network egress is unrestricted,
 matching quicksand's "files, not egress" model.
 
@@ -531,10 +533,8 @@ only when the last one exits.
 `app/` holds a status-bar app that runs the host-side brokers — Docker,
 credential refresh and speech — for every sandbox, like Docker Desktop runs
 its engine. It listens on three sockets in `/Users/Shared/quicksand/`, tells
-sandboxes apart by the uid of the connecting process, and serves speech and
-credential refresh itself; for Docker it starts the sandbox's bash broker for
-each request from the spec qs renders under `~/.config/quicksand/brokers/`
-(that moves into the app next). It also shows every sandbox (active or idle,
+sandboxes apart by the uid of the connecting process, and serves every
+broker itself, in Swift: Docker, credential refresh and speech. It also shows every sandbox (active or idle,
 sessions, Docker, token ages) and every broker request from
 `~/.config/quicksand/events.jsonl`. It posts a notification whenever anyone
 connects to a broker (who, and which broker — not what was asked), or with "Notify: Problems" only for refused and failed requests.
@@ -640,7 +640,7 @@ Hooks are not part of the template — the merge is top-level only, and the
 
 The install marker stores a fingerprint of everything a build bakes into a
 sandbox: the qs version, the `sandbox-exec` profile template, `profile.d/`,
-`logout.d/`, the `quicksand.md` and `claude-settings.json` assets, the speech and credential refresh clients, the Docker broker assets, the SSH session wrapper and sshd templates, and your personal overlay — contents, names, and file modes. When any of it
+`logout.d/`, the `quicksand.md` and `claude-settings.json` assets, the speech, credential refresh and Docker clients, the SSH session wrapper and sshd templates, and your personal overlay — contents, names, and file modes. When any of it
 changes (a `git pull` of this repo, an edit to your overlay), the next
 `qs shell`/`qs claude` rebuilds the sandbox automatically and tells you why.
 
@@ -724,9 +724,9 @@ existing sandboxes automatically on next entry.
 | sshd `Match` block (`qs ssh-auth`) | `/etc/ssh/sshd_config.d/010-quicksand-qs-NAME.conf` |
 | sshd default rule for all sandboxes | `/etc/ssh/sshd_config.d/020-quicksand-default.conf` |
 | Broker sockets (Quicksand.app, all sandboxes) | `/Users/Shared/quicksand/docker.sock`, `auth.sock`, `say.sock` |
-| Broker specs | `~/.config/quicksand/brokers/com.quicksand.docker-broker.NAME.plist` (speech and credentials need none: they run inside the app) |
-| Install marker, clone & GCP manifests, staged brokers & their logs | `~/.config/quicksand/` |
-| Broker event log (one JSON line per request, all sandboxes; written by `qs-event` inside Quicksand.app) | `~/.config/quicksand/events.jsonl` |
+| Docker on for a sandbox (`qs docker`) | `~/.config/quicksand/docker-NAME` (empty) |
+| Install marker, clone & GCP manifests | `~/.config/quicksand/` |
+| Broker event log (one JSON line per request, all sandboxes; written by Quicksand.app) | `~/.config/quicksand/events.jsonl` |
 
 Sandbox names: up to 16 characters, `[A-Za-z0-9_-]+`.
 

@@ -49,8 +49,8 @@ final class AppModel: ObservableObject {
     /// Something worth a red icon: the brokers couldn't start, or requests
     /// failed or were rejected in the last hour.
     var needsAttention: Bool { listenerError != nil || stats.problems > 0 }
-    /// Sandboxes whose brokers predate the app (their own LaunchAgents, no
-    /// event log): a rebuild moves them over.
+    /// Sandboxes with files from the old bash brokers: a rebuild cleans them
+    /// up (and moves Docker to its marker).
     var sandboxesNeedingRebuild: [String] {
         sandboxes.filter(\.needsRebuild).map(\.name)
     }
@@ -84,14 +84,12 @@ final class AppModel: ObservableObject {
         listenerError = nil
         var started: [BrokerListener] = []
         for kind in BrokerKind.allCases {
-            // Speech and credentials run inside the app; Docker is still a
-            // bash broker started from each sandbox's spec.
-            let inProcess: InProcessBroker? = switch kind {
+            let broker: InProcessBroker = switch kind {
             case .say: SayBroker(paths: paths)
             case .auth: AuthBroker(paths: paths)
-            case .docker: nil
+            case .docker: DockerBroker(paths: paths)
             }
-            let listener = BrokerListener(kind: kind, paths: paths, inProcess: inProcess) { [weak self] conn in
+            let listener = BrokerListener(kind: kind, paths: paths, broker: broker) { [weak self] conn in
                 Task { @MainActor in self?.record(conn) }
             }
             do {

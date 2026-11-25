@@ -70,16 +70,16 @@ qs_run() {
 # CLI smoke (executed, not sourced)
 ###############################################################################
 
-@test "qs --help exits 0 and prints usage" {
-    run "$QS" --help
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"Usage:"* ]]
-}
-
-@test "qs --version prints the version" {
-    run "$QS" --version
-    [ "$status" -eq 0 ]
-    [[ "$output" == "qs version "* ]]
+@test "qs.bash points --help, --version and list at the qs command" {
+    local arg
+    for arg in --help --version list; do
+        run "$QS" "$arg"
+        [ "$status" -eq 1 ]
+        [[ "$output" == *"'$arg' is answered by the qs command"*"run: qs $arg"* ]]
+    done
+    run "$QS"
+    [ "$status" -eq 1 ]
+    [[ "$output" == *"run: qs --help"* ]]
 }
 
 @test "unknown command fails" {
@@ -98,56 +98,6 @@ qs_run() {
     qs_run 'type cmd_launch >/dev/null && echo sourced-ok'
     [ "$status" -eq 0 ]
     [[ "$output" == "sourced-ok" ]]
-}
-
-
-###############################################################################
-# cmd_list (fixture roots via the QS_LIST_* test seams)
-###############################################################################
-
-@test "cmd_list shows each sandbox's clones and memory repo" {
-    mkdir -p "$BATS_TEST_TMPDIR/homes/qs-work" \
-             "$BATS_TEST_TMPDIR/homes/qs-toy" \
-             "$BATS_TEST_TMPDIR/shared/qs-work/repos/proj" \
-             "$BATS_TEST_TMPDIR/shared/qs-work/repos/tools" \
-             "$BATS_TEST_TMPDIR/shared/qs-work/memory/.git" \
-             "$BATS_TEST_TMPDIR/fakehome/.config/quicksand"
-    printf 'proj\tme/proj\t\n'  > "$BATS_TEST_TMPDIR/fakehome/.config/quicksand/clones-work"
-    printf 'tools\t\t/l/tools\n' >> "$BATS_TEST_TMPDIR/fakehome/.config/quicksand/clones-work"
-    printf 'agent-memory\tme/agent-memory\t\n' \
-        > "$BATS_TEST_TMPDIR/fakehome/.config/quicksand/memory-work"
-    qs_run 'HOME="$BATS_TEST_TMPDIR/fakehome"
-            QS_LIST_HOMES_DIR="$BATS_TEST_TMPDIR/homes"
-            QS_LIST_SHARED_DIR="$BATS_TEST_TMPDIR/shared"
-            cmd_list'
-    [ "$status" -eq 0 ]
-    [ "${lines[0]}" == "Sandboxes:" ]
-    [ "${lines[1]}" == "  toy" ]
-    [ "${lines[2]}" == "  work" ]
-    [ "${lines[3]}" == "    proj (me/proj)" ]
-    [ "${lines[4]}" == "    tools" ]
-    [ "${lines[5]}" == "    memory (me/agent-memory)" ]
-}
-
-@test "cmd_list survives a missing workspace and manifests" {
-    mkdir -p "$BATS_TEST_TMPDIR/homes/qs-bare" "$BATS_TEST_TMPDIR/shared" \
-             "$BATS_TEST_TMPDIR/fakehome"
-    qs_run 'HOME="$BATS_TEST_TMPDIR/fakehome"
-            QS_LIST_HOMES_DIR="$BATS_TEST_TMPDIR/homes"
-            QS_LIST_SHARED_DIR="$BATS_TEST_TMPDIR/shared"
-            cmd_list'
-    [ "$status" -eq 0 ]
-    [ "${lines[1]}" == "  bare" ]
-    [ "${#lines[@]}" -eq 2 ]
-}
-
-@test "cmd_list prints the none hint when no sandboxes exist" {
-    mkdir -p "$BATS_TEST_TMPDIR/homes"
-    qs_run 'QS_LIST_HOMES_DIR="$BATS_TEST_TMPDIR/homes"
-            QS_LIST_SHARED_DIR="$BATS_TEST_TMPDIR/shared"
-            cmd_list'
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"(none — run 'qs build <NAME>')"* ]]
 }
 
 
@@ -470,8 +420,8 @@ qs_run() {
     [ "$output" == "claude" ]
     qs_run 'parse_args b foo; echo "$COMMAND"'
     [ "$output" == "build" ]
-    qs_run 'parse_args l; echo "$COMMAND"'
-    [ "$output" == "list" ]
+    qs_run 'parse_args u foo; echo "$COMMAND"'
+    [ "$output" == "uninstall" ]
 }
 
 @test "parse_args collects everything after -- into COMMAND_ARGS" {
@@ -1411,12 +1361,6 @@ broker() {
     [[ "$output" == *"accepts 'off' or nothing"* ]]
 }
 
-@test "qs --help documents qs docker" {
-    run "$QS" --help
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"qs docker    NAME [off]"* ]]
-}
-
 @test "cmd_docker aborts when docker is missing on the host" {
     qs_run 'PATH="/usr/bin:/bin"; COMMAND_ARGS=(); DOCKER_ACTION=on
             SANDBOX_NAME=work; cmd_docker'
@@ -2187,12 +2131,6 @@ EOF
     [[ "$output" == *"quote a pasted key line"* ]]
 }
 
-@test "help lists the ssh-auth command" {
-    run "$QS" --help
-    [ "$status" -eq 0 ]
-    [[ "$output" == *"qs ssh-auth  NAME [KEY.pub | off]"* ]]
-}
-
 @test "config_fingerprint changes when the SSH session wrapper or sshd template changes" {
     qs_run 'QS_CUSTOM_DIR=/nonexistent; config_fingerprint'
     before="$output"
@@ -2846,14 +2784,76 @@ need_qs_swift() {
     [ "${lines[6]}" = "[]" ]
 }
 
-@test "the Swift qs finds qs.bash in the checkout and prints what bash prints" {
+@test "the Swift qs finds qs.bash in the checkout above it" {
     need_qs_swift
-    run "$QS_SWIFT_BUILT" --version
+    local checkout="$BATS_TEST_TMPDIR/checkout"
+    mkdir -p "$checkout/profile.d" "$checkout/app/.build/debug"
+    printf '#!/bin/bash\necho "checkout qs.bash: $*"\n' > "$checkout/qs.bash"
+    cp "$QS_SWIFT_BUILT" "$checkout/app/.build/debug/qs"
+    run "$checkout/app/.build/debug/qs" build foo
     [ "$status" -eq 0 ]
-    [ "$output" = "$(bash "$BATS_TEST_DIRNAME/../qs.bash" --version)" ]
-    run "$QS_SWIFT_BUILT" --help
+    [ "$output" = "checkout qs.bash: build foo" ]
+}
+
+@test "the Swift qs answers --help and --version itself" {
+    need_qs_swift
+    QS_BASH=/nonexistent run "$QS_SWIFT_BUILT" --version
     [ "$status" -eq 0 ]
-    [ "$output" = "$(bash "$BATS_TEST_DIRNAME/../qs.bash" --help)" ]
+    # The fingerprint qs.bash bakes into every build uses its VERSION.
+    [ "$output" = "qs version $(sed -n 's/^readonly VERSION="\(.*\)"$/\1/p' "$QS")" ]
+    QS_BASH=/nonexistent run "$QS_SWIFT_BUILT" --help
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"Usage:"* ]]
+    [[ "$output" == *"qs docker    NAME [off]"* ]]
+    [[ "$output" == *"qs ssh-auth  NAME [KEY.pub | off]"* ]]
+}
+
+@test "the Swift qs lists sandboxes itself" {
+    need_qs_swift
+    mkdir -p "$BATS_TEST_TMPDIR/homes/qs-work" "$BATS_TEST_TMPDIR/homes/qs-Toy" \
+             "$BATS_TEST_TMPDIR/homes/qs-_x" "$BATS_TEST_TMPDIR/homes/qs-1" \
+             "$BATS_TEST_TMPDIR/shared/qs-work/repos/proj" \
+             "$BATS_TEST_TMPDIR/shared/qs-work/memory/.git" \
+             "$BATS_TEST_TMPDIR/fakehome/.config/quicksand"
+    printf 'proj\tme/proj\t\n' > "$BATS_TEST_TMPDIR/fakehome/.config/quicksand/clones-work"
+    printf 'mem\tme/mem\t\n' > "$BATS_TEST_TMPDIR/fakehome/.config/quicksand/memory-work"
+    export HOME="$BATS_TEST_TMPDIR/fakehome" \
+        QS_LIST_HOMES_DIR="$BATS_TEST_TMPDIR/homes" QS_LIST_SHARED_DIR="$BATS_TEST_TMPDIR/shared"
+    # QS_BASH points nowhere: list must not need the bash script.
+    QS_BASH=/nonexistent run "$QS_SWIFT_BUILT" list
+    [ "$status" -eq 0 ]
+    # Sorted by locale collation, as a bash glob of the homes sorts.
+    local expected
+    expected="Sandboxes:"
+    local home name
+    for home in "$QS_LIST_HOMES_DIR"/qs-*/; do
+        name="${home#"$QS_LIST_HOMES_DIR"/qs-}"
+        expected+=$'\n'"  ${name%/}"
+        [[ "${name%/}" == work ]] && expected+=$'\n'"    proj (me/proj)"$'\n'"    memory (me/mem)"
+    done
+    [ "$output" = "$expected" ]
+}
+
+@test "the Swift qs rejects bad command lines with qs.bash's messages" {
+    need_qs_swift
+    local args
+    for args in "nosuch" "-q build foo" "shell" "clone foo" "docker foo maybe" "shell bad/name"; do
+        # shellcheck disable=SC2086 # word-splitting the cases is the point
+        QS_BASH=/nonexistent run "$QS_SWIFT_BUILT" $args
+        [ "$status" -eq 1 ]
+        local swift_out="$output"
+        # shellcheck disable=SC2086
+        run bash "$QS" $args
+        [ "$status" -eq 1 ]
+        [ "$swift_out" = "$(grep '^ERROR: ' <<<"$output")" ]
+    done
+}
+
+@test "the Swift qs refuses to run inside a sandbox, like qs.bash" {
+    need_qs_swift
+    QS_SESSION_ID=x QS_BASH=/nonexistent run "$QS_SWIFT_BUILT" --version
+    [ "$status" -eq 1 ]
+    [ "$output" = "ERROR: already inside a quicksand sandbox" ]
 }
 
 @test "the Swift qs reports a missing qs.bash" {
@@ -2861,7 +2861,7 @@ need_qs_swift() {
     local lone="$BATS_TEST_TMPDIR/bin/qs"
     mkdir -p "$(dirname "$lone")"
     cp "$QS_SWIFT_BUILT" "$lone"
-    run -127 "$lone" list
+    run -127 "$lone" build foo
     [ "$status" -eq 127 ]
     [[ "$output" == *"can't find qs.bash"* ]]
 }

@@ -3,34 +3,37 @@ import Foundation
 import Testing
 @testable import QuicksandCore
 
-/// The speech broker inside the app, through a real socket, with a stub
-/// `say` that records its arguments and what it read on stdin.
+/// Records what it was asked to say instead of speaking (the sandbox has no
+/// speech services; the real voice is checked on the host).
+final class FakeSpeaker: Speaker, @unchecked Sendable {
+    private let lock = NSLock()
+    private var said: [String] = []
+    let succeeds: Bool
+
+    init(succeeds: Bool = true) { self.succeeds = succeeds }
+
+    func speak(_ text: String, timeout: TimeInterval) -> Bool {
+        lock.withLock { said.append(text) }
+        return succeeds
+    }
+
+    var spoken: [String] { lock.withLock { said } }
+}
+
+/// The speech broker inside the app, through a real socket, with a fake
+/// speaker.
 @Suite(.serialized) struct SayBrokerTests {
     let me = getuid()
-
-    /// A stub `say` writing "ARGS:<count>" and then its stdin to `out`.
-    func stubSay(_ fx: Fixture, exit status: Int = 0) throws -> (say: URL, out: URL) {
-        let out = fx.root.appendingPathComponent("said")
-        let say = fx.root.appendingPathComponent("say")
-        try """
-        #!/bin/bash
-        printf 'ARGS:%d\\n' "$#" >> '\(out.path)'
-        cat >> '\(out.path)'
-        exit \(status)
-        """.write(to: say, atomically: true, encoding: .utf8)
-        chmod(say.path, 0o755)
-        return (say, out)
-    }
 
     func markBuilt(_ fx: Fixture, _ sandbox: String) {
         FileManager.default.createFile(atPath: fx.paths.installMarker(sandbox).path, contents: Data("fp\n".utf8))
         chmod(fx.paths.installMarker(sandbox).path, 0o644)
     }
 
-    func run(_ fx: Fixture, say: URL, request: String?, user: String = "qs-work") throws
+    func run(_ fx: Fixture, speaker: FakeSpeaker, request: String?, user: String = "qs-work") throws
         -> (reply: String?, done: BrokerConnection?) {
         let updates = Updates()
-        let broker = SayBroker(paths: fx.paths, sayCommand: say.path)
+        let broker = SayBroker(paths: fx.paths, speaker: speaker)
         let l = BrokerListener(kind: .say, paths: fx.paths, users: FakeUsers(byUID: [me: user]),
                                inProcess: broker) { updates.add($0) }
         try l.start()
@@ -50,16 +53,16 @@ import Testing
         return text.split(separator: "\n").compactMap { BrokerEvent.decode(line: Data($0.utf8)) }
     }
 
-    @Test func speaksTheLineOnStdinWithNoArgumentsAndLogsIt() throws {
+    @Test func speaksTheFirstLineAsPlainTextAndLogsIt() throws {
         let fx = try Fixture()
         markBuilt(fx, "work")
-        let stub = try stubSay(fx)
-        let (reply, done) = try run(fx, say: stub.say, request: "-v Zarvox --rm -rf\nignored\n")
+        let speaker = FakeSpeaker()
+        let (reply, done) = try run(fx, speaker: speaker, request: "-v Zarvox --rm -rf\nignored\n")
 
         #expect(reply == "")                    // nothing goes back to the client
         let finished = try #require(done)
         #expect(finished.outcome == .finished(pid: nil, status: 0))
-        #expect(try String(contentsOf: stub.out, encoding: .utf8) == "ARGS:0\n-v Zarvox --rm -rf\n")
+        #expect(speaker.spoken == ["-v Zarvox --rm -rf"])
         let event = try #require(events(fx).last)
         #expect(event.broker == "say" && event.sandbox == "work" && event.verb == "say")
         #expect(event.result == "ok")
@@ -68,41 +71,40 @@ import Testing
 
     @Test func aSandboxThatIsntBuiltIsRefused() throws {
         let fx = try Fixture()
-        let stub = try stubSay(fx)
-        let (_, done) = try run(fx, say: stub.say, request: "hello\n")
+        let speaker = FakeSpeaker()
+        let (_, done) = try run(fx, speaker: speaker, request: "hello\n")
         guard case .rejected(let why) = try #require(done).outcome else {
             Issue.record("expected a refusal"); return
         }
         #expect(why.contains("qs build work"))
-        #expect(!FileManager.default.fileExists(atPath: stub.out.path))
+        #expect(speaker.spoken.isEmpty)
     }
 
     @Test func callersThatArentSandboxesAreRefused() throws {
         let fx = try Fixture()
-        let stub = try stubSay(fx)
-        let (_, done) = try run(fx, say: stub.say, request: "hello\n", user: "drinchev")
+        let speaker = FakeSpeaker()
+        let (_, done) = try run(fx, speaker: speaker, request: "hello\n", user: "drinchev")
         guard case .rejected = try #require(done).outcome else { Issue.record("expected a refusal"); return }
-        #expect(!FileManager.default.fileExists(atPath: stub.out.path))
+        #expect(speaker.spoken.isEmpty)
     }
 
-    @Test func aFailingSayIsAnErrorEvent() throws {
+    @Test func speechThatFailsIsAnErrorEvent() throws {
         let fx = try Fixture()
         markBuilt(fx, "work")
-        let stub = try stubSay(fx, exit: 3)
-        let (_, done) = try run(fx, say: stub.say, request: "hello\n")
+        let (_, done) = try run(fx, speaker: FakeSpeaker(succeeds: false), request: "hello\n")
         #expect(try #require(done).outcome == .finished(pid: nil, status: 1 << 8))
         let event = try #require(events(fx).last)
         #expect(event.result == "error")
-        #expect(event.reason == "say failed")
+        #expect(event.reason == "not spoken")
     }
 
     @Test func blankRequestsSayNothing() throws {
         let fx = try Fixture()
         markBuilt(fx, "work")
-        let stub = try stubSay(fx)
-        let (_, done) = try run(fx, say: stub.say, request: "   \u{7}\t \n")
+        let speaker = FakeSpeaker()
+        let (_, done) = try run(fx, speaker: speaker, request: "   \u{7}\t \n")
         #expect(try #require(done).outcome == .finished(pid: nil, status: 0))
-        #expect(!FileManager.default.fileExists(atPath: stub.out.path))
+        #expect(speaker.spoken.isEmpty)
         #expect(events(fx).isEmpty)
     }
 

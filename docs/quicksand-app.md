@@ -236,10 +236,12 @@ no pid.
 `~/.config/quicksand/install-NAME`, which every build writes) may speak. It
 reads one line (at most 4096 bytes, within 10 s) and closes the connection
 before speaking, drops control bytes, caps the text at 300 bytes without
-splitting a character, and pipes it to `/usr/bin/say` on stdin, never as an
-argument. One queue serves all sandboxes, so messages never overlap (a
-message waits at most 20 s for the one before it); a `say` running past 60 s
-is stopped. Builds no longer stage a speech broker or render a speech spec,
+splitting a character, and hands it to the app's `Speaker`: one
+`AVSpeechSynthesizer` for the whole app (`SystemSpeaker`), driven from the
+main thread, which queues messages from all sandboxes so they never
+overlap. A request waits up to 90 s for its message (including those queued
+before it) and is logged as an error if it wasn't spoken by then. Tests use
+a fake speaker; the real voice can only be heard on the host. Builds no longer stage a speech broker or render a speech spec,
 and the next build of each sandbox removes what earlier builds left
 (`say-broker-NAME.sh`, its spec and log, or a pre-app LaunchAgent).
 
